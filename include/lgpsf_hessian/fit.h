@@ -87,6 +87,8 @@ typedef struct lgh_fit_opts
   int        mu_pinned;         /* 1: pin the PSF center to the node       */
   double     tau_assemble;      /* sparsity truncation radius (sigma units)*/
   lgh_wsym_t wsym;              /* symmetrization convention               */
+  int        verbose;           /* 1 (default): print ladder rungs to
+                                   stderr on rank 0                        */
 }
 lgh_fit_opts_t;
 
@@ -132,7 +134,11 @@ void       lgh_fit_destroy (lgh_fit_t *fit);
  * covariances, sigma[i*dim*dim + a*dim + b], symmetric positive definite,
  * squared length units — your a-priori estimate of each row's PSF extent
  * (see lgh_sigma_isotropic below for the simplest construction).
- * Fills *report; returns 0 on success. */
+ * Fills *report; returns 0 on success.  Nonzero codes: 2 = LEGACY probes
+ * at comm size > 1; 3 = unwhitened fit probes with a multi-rung ladder;
+ * 4 = REFERENCE symmetrization at comm size > 1; 6 = the fit came back
+ * globally empty (probe pool below what the per-row fitter needs —
+ * production pools start at k0 ~ 15). */
 int lgh_fit_hessian (lgh_fit_t *fit, lgh_hessian_fn hessian_apply, void *ctx,
                      const double *sigma, const lgh_fit_opts_t *opts,
                      lgh_fit_report_t *report);

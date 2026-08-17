@@ -19,9 +19,11 @@
 #include "lgpsf_hessian/impl/glr_scalapack_impl.h"
 #endif
 #include "lgpsf_hessian/impl/zsolve_impl.h"
-
-/* Arriving with slice E:
- * #include "lgpsf_hessian/impl/fit_impl.hpp"           (lgpsf fit stage)
- */
+#ifdef LGH_HAVE_LGPSF /* defined by the lgpsf_hessian::fit CMake target;
+                         fit-only consumers may instead include
+                         impl/fit_impl.hpp directly (it is self-contained,
+                         MPI + lgpsf only) */
+#include "lgpsf_hessian/impl/fit_impl.hpp"
+#endif
 
 #endif /* LGPSF_HESSIAN_IMPL_HPP */

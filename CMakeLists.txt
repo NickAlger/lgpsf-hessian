@@ -24,6 +24,8 @@ option(LGH_BUILD_TESTS "Build lgpsf-hessian tests" ${_lgh_standalone})
 option(LGH_BUILD_EXAMPLES "Build lgpsf-hessian examples" ${_lgh_standalone})
 option(LGH_WITH_SCALAPACK
        "Enable the distributed (ScaLAPACK) eigensolver backend" ON)
+option(LGH_FETCH_LGPSF
+       "FetchContent lgpsf when find_package misses" OFF)
 
 # ---- dependencies -----------------------------------------------------------
 
@@ -50,12 +52,30 @@ if(LGH_WITH_SCALAPACK)
 endif()
 
 # lgpsf (header-only; brings ellipsoid_tree and Eigen) — needed by the fit
-# component only.  find_package first; FetchContent pin to follow with CI.
+# component only.  find_package first, then a pinned FetchContent fallback;
+# local checkouts via -DFETCHCONTENT_SOURCE_DIR_LGPSF=/path/to/lgpsf (and
+# -DFETCHCONTENT_SOURCE_DIR_ELLIPSOID_TREE for its dependency).
 find_package(lgpsf 0.1 QUIET CONFIG)
+set(_lgh_lgpsf_vendored OFF)
+if(NOT lgpsf_FOUND AND LGH_FETCH_LGPSF)
+  include(FetchContent)
+  FetchContent_Declare(lgpsf
+    GIT_REPOSITORY https://github.com/NickAlger/lgpsf.git
+    GIT_TAG        v0.1.0)
+  set(LGPSF_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(LGPSF_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  FetchContent_MakeAvailable(lgpsf)
+  set(lgpsf_FOUND ON)
+  set(_lgh_lgpsf_vendored ON)   # vendored targets cannot be re-exported:
+                                # the fit component is usable in-tree but
+                                # not installed (lgpsf's own policy)
+endif()
 if(NOT lgpsf_FOUND)
   message(STATUS
     "lgpsf not found: the fit component (lgpsf_hessian::fit) is unavailable. "
-    "Set lgpsf_DIR (or CMAKE_PREFIX_PATH) to an installed lgpsf to enable it.")
+    "Set lgpsf_DIR/CMAKE_PREFIX_PATH to an installed lgpsf, or configure "
+    "with -DLGH_FETCH_LGPSF=ON (optionally with FETCHCONTENT_SOURCE_DIR_"
+    "LGPSF pointing at a local checkout).")
 endif()
 
 # ---- targets ----------------------------------------------------------------
@@ -85,6 +105,9 @@ if(lgpsf_FOUND)
   target_link_libraries(lgpsf_hessian_fit INTERFACE
     lgpsf::lgpsf MPI::MPI_CXX)
   target_compile_features(lgpsf_hessian_fit INTERFACE cxx_std_17)
+  # impl.hpp includes the (Eigen-heavy) fit implementation only when this
+  # macro is present, so glr-only TUs stay light to compile.
+  target_compile_definitions(lgpsf_hessian_fit INTERFACE LGH_HAVE_LGPSF)
 
   # The umbrella: the whole pipeline.
   add_library(lgpsf_hessian INTERFACE)
@@ -113,9 +136,13 @@ include(CMakePackageConfigHelpers)
 install(DIRECTORY include/lgpsf_hessian
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(TARGETS lgpsf_hessian_glr EXPORT lgpsf_hessianTargets)
-if(lgpsf_FOUND)
+if(lgpsf_FOUND AND NOT _lgh_lgpsf_vendored)
   install(TARGETS lgpsf_hessian_fit lgpsf_hessian
           EXPORT lgpsf_hessianTargets)
+elseif(_lgh_lgpsf_vendored)
+  message(STATUS
+    "lgpsf is vendored (FetchContent): installing the glr component only; "
+    "install lgpsf properly to install the fit component.")
 endif()
 install(EXPORT lgpsf_hessianTargets
         NAMESPACE lgpsf_hessian::
