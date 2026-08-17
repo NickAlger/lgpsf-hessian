@@ -33,6 +33,9 @@ find_package(MPI REQUIRED COMPONENTS C CXX)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PETSC REQUIRED IMPORTED_TARGET PETSc)
 
+# The GLR engines call BLAS/LAPACK directly (dgemm/dtrsm/dsyevd/dpotrf).
+find_package(LAPACK REQUIRED)
+
 # ScaLAPACK: commonly built by PETSc (--download-scalapack) into its lib dir.
 if(LGH_WITH_SCALAPACK)
   find_library(LGH_SCALAPACK_LIBRARY
@@ -64,7 +67,7 @@ target_include_directories(lgpsf_hessian_glr INTERFACE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
 target_link_libraries(lgpsf_hessian_glr INTERFACE
-  PkgConfig::PETSC MPI::MPI_C)
+  PkgConfig::PETSC MPI::MPI_C ${LAPACK_LIBRARIES})
 target_compile_features(lgpsf_hessian_glr INTERFACE c_std_99)
 if(LGH_WITH_SCALAPACK)
   target_link_libraries(lgpsf_hessian_glr INTERFACE ${LGH_SCALAPACK_LIBRARY})

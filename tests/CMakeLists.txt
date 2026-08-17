@@ -1,10 +1,15 @@
-# Tests land with migration slices B-E:
-#   - GLR engine gates on synthetic known-spectrum operators (BCGS2
-#     orthonormality; pdsyevd vs replicated dsyevd; backend cross-checks by
-#     invariants; spectral-function/factor identities; extend-vs-oneshot;
-#     FLIP on an indefinite operator; logdet vs dense reference)
-#   - fit gates in d=2 and d=3 (+ the n=1 legacy-probes bitwise gate)
-#   - prior: Chebyshev vs KSP reference; blocked == loop
-# MPI variants run at n=1,2,4 via ${MPIEXEC_EXECUTABLE}.
+# GLR engine gates (dense-LAPACK oracles, run at n = 1, 2, 4).  Fit and
+# prior/zsolve tests arrive with slices D-E.
 #
-# Build memory: each test TU that includes impl.hpp peaks ~3 GB; keep -j <= 2.
+# Build memory: each test TU that includes impl.hpp will become Eigen-heavy
+# once the fit stage lands (~3 GB peak); keep -j <= 2.
+
+add_executable(test_glr_replicated test_glr_replicated.cpp)
+target_link_libraries(test_glr_replicated PRIVATE lgpsf_hessian::glr)
+
+add_test(NAME glr_replicated_n1 COMMAND test_glr_replicated)
+foreach(np 2 4)
+  add_test(NAME glr_replicated_n${np}
+           COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${np}
+                   $<TARGET_FILE:test_glr_replicated>)
+endforeach()
