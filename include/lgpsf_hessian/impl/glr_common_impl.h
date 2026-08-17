@@ -75,6 +75,9 @@ lgh_randn_at (unsigned long seed, PetscInt i, PetscInt j)
 /* ================================================================== */
 /* the prior object                                                    */
 
+struct lgh_zs_ctx;                  /* Z-solve machinery for the Mat path
+                                       (impl/zsolve_impl.h)              */
+
 struct lgh_prior
 {
   int                   refs;       /* lgh_glr_t holds a reference       */
@@ -83,13 +86,23 @@ struct lgh_prior
   Vec                   minvsqrt;   /* 1/sqrt(mass)                      */
   Vec                   work;       /* scratch, same layout              */
   lgh_prior_callbacks_t cb;         /* the callbacks path                */
-  Mat                   Z;          /* the Mat path (slice D)            */
+  /* Mat path (lgh_prior_create_mat): the callbacks above are wired to
+   * internal adapters over these.                                       */
+  Mat                   Z;          /* referenced                        */
+  KSP                   zksp;       /* owned CG + AMG solver for Z       */
+  struct lgh_zs_ctx    *zs;         /* blocked-solve machinery           */
 };
+
+/* defined in impl/zsolve_impl.h (same TU, included after) */
+static void lgh_zs_prior_teardown (lgh_prior_t *p);
 
 lgh_prior_mat_opts_t
 lgh_prior_mat_opts_default (void)
 {
   lgh_prior_mat_opts_t o;
+  o.ksp_rtol = 1e-12;
+  o.blocked_mode = 0;
+  o.tile = 64;
   o.cheb_rtol = 1e-10;
   o.verbose = 0;
   return o;
@@ -129,15 +142,8 @@ lgh_prior_create_callbacks (Vec mass_lumps,
   return PETSC_SUCCESS;
 }
 
-int
-lgh_prior_create_mat (Mat Z, Vec mass_lumps,
-                      const lgh_prior_mat_opts_t *opts, lgh_prior_t **prior)
-{
-  (void) Z; (void) mass_lumps; (void) opts; (void) prior;
-  SETERRQ (PETSC_COMM_SELF, PETSC_ERR_SUP,
-           "lgh_prior_create_mat arrives with the Z-solve migration "
-           "(slice D); use lgh_prior_create_callbacks meanwhile");
-}
+/* lgh_prior_create_mat is defined in impl/zsolve_impl.h (it owns the
+ * Z-solver machinery); same TU.                                          */
 
 static void
 lgh_prior_ref (lgh_prior_t *p)
@@ -149,6 +155,7 @@ void
 lgh_prior_destroy (lgh_prior_t *prior)
 {
   if (prior == NULL || --prior->refs > 0) return;
+  lgh_zs_prior_teardown (prior);    /* Mat-path machinery, if any */
   (void) VecDestroy (&prior->msqrt);
   (void) VecDestroy (&prior->minvsqrt);
   (void) VecDestroy (&prior->work);

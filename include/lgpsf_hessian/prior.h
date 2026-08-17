@@ -61,12 +61,23 @@ int lgh_prior_create_callbacks (Vec mass_lumps,
                                 const lgh_prior_callbacks_t *callbacks,
                                 lgh_prior_t **prior);
 
-/* Solver tuning for the Mat path.  Defaults reproduce the validated
- * production configuration.  (Field set to be finalized when the solver
- * machinery lands — kept small deliberately.) */
+/* Solver tuning for the Mat path.  The library creates a CG + AMG solver
+ * for Z internally (PETSc options prefix "lgh_prior_" for overrides).
+ * blocked_mode selects how the engine's BLOCK solves are performed:
+ *   0 (default) — per-column KSP solves: robust, no setup cost;
+ *   2 — blocked fixed-count Chebyshev with the AMG preconditioner applied
+ *       through PCMatApply (BLAS-3 across the block);
+ *   3 — blocked Chebyshev around a block V-cycle on the harvested AMG
+ *       hierarchy (the at-scale configuration: all smoothing is blocked).
+ * Modes 2/3 estimate the preconditioned spectral interval once at create
+ * time (deterministic probe) and derive the fixed iteration count from
+ * cheb_rtol; single-vector solves always use the KSP path. */
 typedef struct lgh_prior_mat_opts
 {
-  double cheb_rtol;   /* Chebyshev solve tolerance                        */
+  double ksp_rtol;     /* per-column KSP solve tolerance (default 1e-12) */
+  int    blocked_mode; /* 0 (default) | 2 | 3, see above                 */
+  int    tile;         /* block width for modes 2/3 (default 64)         */
+  double cheb_rtol;    /* Chebyshev accuracy target (default 1e-10)      */
   int    verbose;
 }
 lgh_prior_mat_opts_t;
