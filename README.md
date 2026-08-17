@@ -51,13 +51,19 @@ double ld = lgh_glr_logdet(glr, c);               /* prior-weighted, truncation-
 ```
 
 See `include/lgpsf_hessian/{fit,prior,glr}.h` for the full API — the headers are the
-reference documentation. `examples/` will contain a complete heat-equation
+reference documentation. Deeper reading in `docs/`: `architecture.md` (design
+rationale, math↔function table, integration guide), `glr-distributed-design.tex` /
+`glr-woodbury-formulas.tex` (the engine's design records), and `platform-notes.md`
+(operational gotchas). `examples/` will contain a complete heat-equation
 source-inversion example with scattered point observations.
 
 ## Status
 
-**API-review stage.** The public headers are complete; the implementation (validated in
-a large-scale ice-sheet inversion) is being migrated in.
+Core implementation migrated from its originating production deployment (a
+large-scale ice-sheet inversion) and gated by the test suite at communicator sizes
+1, 2, 4: both GLR backends against dense-LAPACK oracles, the prior's three Z-solve
+tiers against CG references, and the fit stage on synthetic 2D and 3D PSF
+operators. Example in progress.
 
 ## Building
 
@@ -74,6 +80,14 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j 2        # NOTE: -j 2, see below
 ctest --test-dir build
 ```
+
+PETSc is found via pkg-config (`PKG_CONFIG_PATH=$PETSC_DIR/$PETSC_ARCH/lib/pkgconfig`);
+if the system carries more than one MPI, point CMake at PETSc's
+(`-DMPI_C_COMPILER/-DMPI_CXX_COMPILER/-DMPIEXEC_EXECUTABLE`, see
+`docs/platform-notes.md`). lgpsf is found via `find_package`, with a pinned
+FetchContent fallback: `-DLGH_FETCH_LGPSF=ON`, plus
+`-DFETCHCONTENT_SOURCE_DIR_LGPSF=/path/to/lgpsf` (and
+`..._ELLIPSOID_TREE`) to use local checkouts.
 
 **Build memory warning:** translation units that include `impl.hpp` are Eigen-heavy and
 peak around **3 GB of memory each** at `-O2`. Use a low parallel job count — `-j 2` is

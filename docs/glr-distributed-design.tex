@@ -1,0 +1,214 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\newcommand{\Hd}{\widetilde{H}_d}
+\newcommand{\Ht}{\widetilde{H}}
+\begin{document}
+\begin{center}
+\textbf{Distributed GLR: factorization, spectral operations, and memory layouts}\\[2pt]
+\small Design record for the GLR engine of \texttt{lgpsf-hessian} (the
+\texttt{lgh\_glr\_*} API; ScaLAPACK backend).  Originally written 2026-08-16 as the
+design record of the engine's first production deployment, a large-scale ice-sheet
+inversion; the outer factors $Z, M$ are the library's prior interface
+($R = Z M^{-1} Z$, \texttt{lgh\_prior\_t}).  Supersedes the replicated-$T$ structure
+documented in \texttt{glr-woodbury-formulas.pdf} (which the library keeps as its
+replicated backend).
+\end{center}
+
+\section{Operators and factorization}
+
+$N$ dofs, distributed by the application's spatially-local mesh partition over $P$
+ranks.  $M$ = diagonal lumped mass.  $Z$ = the prior's square-root factor (e.g.\ a
+shifted Laplacian at a reference regularization scale); $Z^{-1}$ available as a
+linear operator (multigrid-preconditioned Chebyshev, \texttt{lgh\_prior\_create\_mat}).
+Prior precision $H_r = Z M^{-1} Z$ (bilaplacian-like).  $\Hd$ = symmetrized lgpsf
+approximation of the misfit Hessian (stage 1, \texttt{lgh\_fit\_*}), available
+through matvecs on mesh-partitioned vectors.  $c$ = regularization /
+Levenberg--Marquardt weight.
+\begin{align}
+\Ht(c) &= \Hd + c\,H_r
+        = Z M^{-1/2}\left( F + cI \right) M^{-1/2} Z,\\
+F &= M^{1/2} Z^{-1} \Hd\, Z^{-1} M^{1/2} = F^T
+        \qquad (\text{whitened prior-preconditioned misfit Hessian; never formed}).
+\end{align}
+
+\emph{Keep $c$ and the regularization scale $\alpha$ explicit; do not absorb them
+into $Z$.}  Reasons: (i) one eigendecomposition of $F$ serves every $c$ through the
+spectral filters below (the library's operations all take $c$ per call), whereas $c$
+absorbed into $Z$ would force a rebuild per shift; (ii) for the bilaplacian with
+$Z = \alpha A$, changing $\alpha$ rescales eigenvalues exactly with unchanged
+eigenvectors, $F(\alpha') = (\alpha/\alpha')^2 F(\alpha)$ --- a free update, visible
+only if $\alpha$ is a scalar in the code.
+
+\section{Target operations}
+
+\begin{enumerate}
+\item Remove spurious negative eigenvalues of $F$ (approximation artifacts):
+      FLIP treatment $\lambda_i \leftarrow |\lambda_i|$
+      (\texttt{LGH\_TREAT\_FLIP}, the default).  Do not discard large-magnitude
+      negatives --- they are genuine flipped-curvature modes, and clipping them to
+      zero leaves $\mathcal{O}(1+|\lambda|)$ outliers in the preconditioned spectrum.
+\item Solves with the (positively modified) $\Ht$: the deterministic MAP phase
+      (\texttt{lgh\_glr\_solve}).
+\item Square-root and inverse-square-root \emph{factor} actions for MCMC sampling
+      (\texttt{lgh\_glr\_factor}, \texttt{lgh\_glr\_sample}).
+\item Log-determinant differences $\log\det\Ht_1 - \log\det\Ht_2$ for detailed
+      balance with location-dependent proposal precision (\texttt{lgh\_glr\_logdet}).
+\end{enumerate}
+
+\section{Randomized eigendecomposition of $F$}
+
+Sketch width $\ell$ (target rank $r \le \ell$ after truncation; continental-scale
+expectation in the originating application $r \sim 10^4$--$2\times 10^4$, must scale
+to $5\times 10^4$+).
+\begin{align}
+\Omega_{ij} &= \mathrm{hashnormal}(\mathrm{seed}, i, j)
+   \quad (\text{drawn locally from global index; partition-independent})\\
+Y &\leftarrow F\,\Omega; \qquad
+   \text{for } p = 1,\dots,q: \ \ Q \leftarrow \mathrm{orth}(Y),\ Y \leftarrow FQ\\
+Q &\leftarrow \mathrm{orth}(Y) \qquad
+   (\text{panel-blocked BCGS2; no } \ell\times\ell \text{ Gram is ever materialized})\\
+T &= \mathrm{sym}(Q^T F Q) \qquad
+   (\text{formed in column panels, reduced directly into 2D block-cyclic layout})\\
+T &= V \Lambda_{\mathrm{raw}} V^T \qquad
+   (\text{distributed dense eigensolver: ScaLAPACK \texttt{pdsyevd}, ELPA later;}\\
+&\qquad\quad V \text{ \emph{stays in place}, block-cyclic; } \Lambda \text{ replicated})\notag\\
+U &= Q V_{:,\mathcal{K}} \quad \text{\emph{implicit}: } Uw = Q(Vw),\ \ U^T x = V^T(Q^T x);
+   \qquad \lambda_i = |\lambda_{\mathrm{raw},i}| > \tau \ \ (\text{FLIP + cut})
+\end{align}
+$U^T U = I_r$; $F \approx U \Lambda U^T$.  The coefficient traffic per $U$-apply is
+$\mathcal{O}(\ell)$ numbers --- negligible.  At large $\ell$ the implicit form is
+forced, not merely elegant: materializing $U = QV$ with block-cyclic $V$ would
+require either replicating $V$ ($8\ell^2$ bytes per rank; 20\,GB at
+$\ell = 5\times 10^4$) or a heavyweight mixed-layout distributed GEMM.
+
+\emph{Incremental rank growth (first-class operation: \texttt{lgh\_glr\_extend}).}
+Since $r$ is not known a priori: extend by a block of $k_{\mathrm{new}}$ fresh
+hashed columns (global column index continues past the current $\ell$, so the
+extension is deterministic and partition-independent), apply $F$,
+BCGS2-orthogonalize against the existing $Q$, border $T$ with
+$Q^T (F Q_{\mathrm{new}})$, re-eigensolve.  Stop when the sketch's smallest
+$|\lambda|$ (reported as \texttt{next\_abs}) falls below the truncation cut $\tau$
+with margin --- the unknown rank becomes a stopping criterion instead of a gamble on
+$\ell$.  (Evidence this matters: in the originating application, a Pine Island
+Glacier sketch at $\ell = 2200$ was rank-limited --- 2136 of 2200 modes survived
+the cut.)
+
+\section{Spectral operations}
+
+With the truncated tail of $F$ treated as $0$ (the GLR model itself), any spectral
+function acts as
+\begin{equation}
+f(F + cI) \;=\; U\!\left[ f(\Lambda + cI) - f(c)\,I_r \right]\! U^T \;+\; f(c)\, I
+\qquad (\texttt{lgh\_glr\_filter}).
+\label{eq:specfun}
+\end{equation}
+Only the actions of $U$ and $U^T$ are required.
+
+\paragraph{Solve (MAP phase).}  $f(x) = 1/x$ in \eqref{eq:specfun} gives
+\begin{equation}
+\Ht(c)^{-1} = Z^{-1} M^{1/2}
+  \tfrac{1}{c}\!\left( I - U D_c U^T \right) M^{1/2} Z^{-1},
+\qquad D_c = \mathrm{diag}\!\left( \frac{\lambda_i}{\lambda_i + c} \right),
+\end{equation}
+(\texttt{lgh\_glr\_solve}), which at $c = 1$ is exactly the Woodbury apply of the
+engine's originating production code (continuity check).  The inverse is the one
+case where the whitened spectral function composes exactly with the outer factors,
+because it is the inverse of a product.
+
+\paragraph{Square-root factors (MCMC).}  The sandwich is \emph{not} a similarity
+transform, so the symmetric square root $\Ht^{1/2}$ is not cheaply available --- and
+is not needed.  Sampling requires a factor:
+\begin{equation}
+G = Z M^{-1/2} (F + cI)^{1/2}, \qquad \Ht(c) = G\,G^T,
+\end{equation}
+with $(F+cI)^{\pm 1/2}$ from \eqref{eq:specfun}.  All four factor actions
+($G,\ G^T,\ G^{-1},\ G^{-T}$; \texttt{lgh\_glr\_factor}) reduce to $U$/$U^T$
+applies, $M^{\pm 1/2}$ scalings, and $Z$ matvecs or solves.  A draw from the
+proposal $\mathcal{N}(m, \Ht^{-1})$ is $x = m + G^{-T}\xi$,
+$\ G^{-T} = Z^{-1} M^{1/2} (F + cI)^{-1/2}$, $\ \xi \sim \mathcal{N}(0, I)$
+(\texttt{lgh\_glr\_sample}).
+
+\paragraph{Log-determinant differences.}  $Z$ and $M$ are state-independent and
+cancel between two builds:
+\begin{equation}
+\log\det \Ht_1(c) - \log\det \Ht_2(c)
+  = \sum_k \log\!\big(\lambda^{(1)}_k + c\big) - \sum_k \log\!\big(\lambda^{(2)}_k + c\big)
+\end{equation}
+where the per-build quantity to compute (\texttt{lgh\_glr\_logdet}) is
+$\sum_k [\log(\lambda_k + c) - \log c]$ over the \emph{kept, treated} eigenvalues:
+truncated modes contribute $0$, so the sum is finite and truncation-consistent, and
+the common $Nc$-dependent constant cancels in the difference.
+\emph{Detailed-balance consistency:} Metropolis--Hastings needs the log-determinant
+of the proposal precision \emph{actually sampled from}.  Sampling and
+log-determinant both read the same treated $\Lambda$, so truncation and FLIP do not
+threaten correctness --- they only affect proposal quality (acceptance rate).
+
+\section{Shapes and memory layouts}
+
+Feature-space principle: the reduced space $\mathbb{R}^\ell$ is distinct from the
+function space $\mathbb{R}^N_M$ and its dual, and owns its own partition --- by
+feature index (2D block-cyclic), never by mesh geometry.  Small feature-space
+objects ($\Lambda$, filter diagonals) are replicated; that is a storage convention,
+not a leak between spaces.
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+Symbol & Shape & Space & Layout \\
+\midrule
+$v, x, w_{\mathrm{full}}$ & $N$ & function / dual & mesh partition ($N_p$ per rank) \\
+$M^{\pm 1/2}$ & $N$ (diag) & --- & mesh partition \\
+$Z$ & $N \times N$ sparse & dual $\leftarrow$ function & mesh partition; $Z^{-1}$ via MG-Chebyshev \\
+$\Hd$ & $N \times N$ sparse & dual $\leftarrow$ function & mesh partition (MPIAIJ) \\
+$\Omega, Y, Q$ & $N \times \ell$ dense & whitened & mesh-partitioned row slabs ($N_p \times \ell$) \\
+BCGS2 coefficients & $\ell \times b$ & --- & transient, replicated per panel (discarded) \\
+$T$ & $\ell \times \ell$ & feature & 2D block-cyclic on $p_r \times p_c$ grid; never replicated \\
+$V$ & $\ell \times \ell$ & feature & block-cyclic, \emph{stays in place} after eig \\
+$\Lambda$, $D_c$, filters & $r$ (diag) & feature & replicated (small) \\
+$U = Q V_{:,\mathcal{K}}$ & $N \times r$ & whitened $\leftarrow$ feature & \emph{implicit composition; never formed} \\
+$w$ (reduced vectors) & $\ell$ or $r$ & feature & conformal with $T$'s layout; \\
+ & & & gathered ($\mathcal{O}(\ell)$ traffic) inside $U$-applies \\
+$c, \alpha, \tau$ & scalars & --- & replicated \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Memory at the ambition point ($N = 10^7$, $\ell = 5\times 10^4$, $P = 100$ nodes):
+$T, V$ are $20\,$GB \emph{aggregate} ($\sim$0.2\,GB/node, block-cyclic) --- no longer
+a constraint.  The tall blocks dominate: $Q$ is $4\,$TB aggregate ($40\,$GB/node),
+and the sweep buffers must be managed (overwrite in place, panel the $F$ sweeps).
+At $N = 10^6$ everything is comfortable.
+
+\section{Design rationale (brief)}
+
+\begin{itemize}
+\item \textbf{All three $\ell\times\ell$ objects go distributed, not just $T$.}
+  The orthogonalization Gram matrix has the same $\mathcal{O}(\ell^2)$ replicated
+  footprint as $T$; panel-blocked BCGS2 avoids materializing it at all, is more
+  robust than CholQR for power-iterated (ill-conditioned) blocks, and makes
+  incremental column-block extension natural.
+\item \textbf{$T$ is formed directly into its block-cyclic home}, in column panels
+  (transient $\ell \times b$ per rank), never assembled replicated.
+\item \textbf{Implicit $U$} avoids both the $N\ell r$ materialization GEMM and any
+  replication of $V$; per-apply cost is essentially unchanged (GEMV over $\ell$
+  columns of $Q$ vs.\ $r$ columns of $U$, plus $\mathcal{O}(\ell)$ coefficient
+  traffic).
+\item \textbf{Incremental growth} turns unknown rank into a stopping criterion;
+  supporting $r \gtrsim 5\times 10^4$ cheaply is a core advantage of lgpsf-based
+  approximation over conventional low-rank methods and must not be blocked by a
+  fixed-$\ell$ pipeline.
+\item \textbf{Eigensolver}: ScaLAPACK \texttt{pdsyevd} first (ships with MKL on
+  large clusters; reference build available everywhere via PETSc), ELPA/SLATE
+  behind the same seam when $\ell \gtrsim 3\times 10^4$ makes it pay.  Eigenvector
+  signs / near-degenerate rotations depend on the process grid, so cross-$P$ (and
+  cross-backend) comparisons use invariants only ($\Lambda$, operator applies,
+  logdet).
+\item \textbf{Determinism}: hashed $\Omega$ (and hashed extension columns) keep the
+  sketch partition-independent; a dedicated study of $T$ on the originating problem
+  showed it is a generic dense symmetric matrix (no banding, no hierarchical
+  structure, full-rank off-diagonal blocks), so a dense distributed eigensolver is
+  the right primitive --- there is nothing to exploit by compression.
+\end{itemize}
+\end{document}

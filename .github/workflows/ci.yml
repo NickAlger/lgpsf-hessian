@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: dependency hygiene
+        run: python3 tools/check_dependencies.py
+
+  build-test:
+    runs-on: ubuntu-latest
+    env:
+      # OpenMPI: allow n=4 tests on 2-core runners
+      OMPI_MCA_rmaps_base_oversubscribe: "1"
+      PRTE_MCA_rmaps_default_mapping_policy: ":oversubscribe"
+    steps:
+      - uses: actions/checkout@v4
+      - name: dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config petsc-dev \
+            libscalapack-openmpi-dev liblapack-dev libopenmpi-dev
+      - name: configure
+        run: |
+          PKG_CONFIG_PATH=$(dirname $(find /usr/lib -name "PETSc.pc" | head -1)) \
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DLGH_FETCH_LGPSF=ON
+      - name: build (-j 2 — Eigen-heavy TUs, see docs/platform-notes.md)
+        run: cmake --build build -j 2
+      - name: test
+        run: ctest --test-dir build --output-on-failure

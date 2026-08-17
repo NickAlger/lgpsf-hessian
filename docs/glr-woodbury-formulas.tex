@@ -1,0 +1,103 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\begin{document}
+\begin{center}\textbf{GLR formulas as implemented (replicated backend)}\\[2pt]
+\small The step-by-step apply/solve recipe of \texttt{lgpsf-hessian}'s
+\texttt{LGH\_GLR\_REPLICATED} backend.  The ScaLAPACK backend generalizes the
+layouts (see \texttt{glr-distributed-design.pdf}); the mathematics is identical.
+\end{center}
+
+Definitions: $M$ lumped mass (diagonal); $Z$ the prior's ($\alpha$-scaled)
+square-root factor (e.g.\ a shifted Laplacian); prior precision $R = Z M^{-1} Z$;
+$\widetilde{H}_d$ assembled lgpsf misfit-Hessian approximation (sparse,
+weighted-symmetrized); $c$ regularization/LM shift; $\ell$ sketch size;
+$r$ kept rank; $P$ ranks, rank $p$ owns $N_p$ mesh rows.
+
+\section*{1. Low-rank eigendecomposition of the whitened misfit Hessian}
+\begin{align}
+F &:= M^{1/2} Z^{-1} \widetilde{H}_d Z^{-1} M^{1/2}
+      \qquad (F = F^T \in \mathbb{R}^{N\times N},\ \text{never formed})\\
+\Omega_{ij} &= \mathrm{hashnormal}(\mathrm{seed}, i, j)
+      \qquad i \in \{1,\dots,N\} \text{ global},\ j \in \{1,\dots,\ell\}\\
+Y &\leftarrow F\,\Omega\\
+&\text{for } p = 1,\dots,q:\quad
+      Q \leftarrow \mathrm{cholqr2}(Y), \qquad Y \leftarrow F\,Q\\
+Q &\leftarrow \mathrm{cholqr2}(Y), \qquad Y \leftarrow F\,Q\\
+T &\leftarrow \tfrac{1}{2}\left(Q^T Y + (Q^T Y)^T\right)
+      \qquad (\text{local GEMM} + \text{one allreduce})\\
+T &= V \Lambda_{\mathrm{raw}} V^T \qquad (\texttt{dsyevd},\ \text{redundant on every rank})\\
+\mathcal{K} &= \{\,i : |\lambda_{\mathrm{raw},i}| > \tau\,\},\quad r = |\mathcal{K}|
+      \qquad (\text{sorted by } |\lambda| \text{ descending})\\
+U &= Q\, V_{:,\mathcal{K}}, \qquad
+      \lambda_i = |\lambda_{\mathrm{raw},i}| \ \ (\text{flip}), \qquad
+      F \approx U \Lambda U^T,\quad U^T U = I_r
+\end{align}
+with
+\begin{align}
+\mathrm{cholqr2}(X):\quad
+G &= X^T X = \textstyle\sum_{p} X_p^T X_p \quad (\text{one allreduce});\quad
+G = \widehat{R}^T \widehat{R};\quad
+X \leftarrow X \widehat{R}^{-1}; \quad \text{repeat once.}
+\end{align}
+
+\section*{2. GLR Hessian apply}
+\begin{align}
+\widetilde{H} &:= Z M^{-1/2} \left( cI + U \Lambda U^T \right) M^{-1/2} Z
+      \ \approx\ \widetilde{H}_d + cR\\
+\widetilde{H} v:\quad
+v_1 &= Z v \qquad (\text{sparse matvec})\\
+v_2 &= M^{-1/2} v_1\\
+w   &= U^T v_2 \qquad (w \in \mathbb{R}^r)\\
+v_3 &= c\, v_2 + U (\Lambda w)\\
+v_4 &= M^{-1/2} v_3\\
+\widetilde{H} v &= Z v_4
+\end{align}
+(\texttt{lgh\_glr\_apply} computes the exact $\widetilde H_d v + cRv$ instead ---
+no truncation error --- but this spectral route is what \texttt{lgh\_glr\_filter}
+generalizes.)
+
+\section*{3. GLR Hessian solve (Woodbury via orthonormality)}
+\begin{align}
+\left( cI + U \Lambda U^T \right)^{-1}
+  &= \tfrac{1}{c}\left( I - U D U^T \right),
+  \qquad D = \mathrm{diag}\!\left( \frac{\lambda_i}{\lambda_i + c} \right)\\
+\widetilde{H}^{-1} r:\quad
+r_1 &= Z^{-1} r \qquad (\text{iterative Z-solve: Chebyshev/V-cycle})\\
+r_2 &= M^{1/2} r_1\\
+w   &= U^T r_2\\
+r_3 &= \tfrac{1}{c}\left( r_2 - U (D w) \right)\\
+r_4 &= M^{1/2} r_3\\
+\widetilde{H}^{-1} r &= Z^{-1} r_4
+\end{align}
+This is \texttt{lgh\_glr\_solve}.
+
+\section*{Symbol shapes and memory distribution}
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+Symbol & Shape & Space & Memory layout \\
+\midrule
+$v, r, v_i, r_i$ & $N$ & function / dual & distributed by mesh partition ($N_p$ per rank) \\
+$M^{\pm 1/2}$ & $N$ (diag) & --- & distributed by mesh partition \\
+$Z$ & $N \times N$ sparse & dual $\leftarrow$ function & distributed rows; applied matrix-free (AMG/Cheb.) \\
+$\widetilde{H}_d$ & $N \times N$ sparse & dual $\leftarrow$ function & distributed rows (MPIAIJ) \\
+$\Omega, Y, Q$ & $N \times \ell$ dense & whitened & distributed rows: contiguous $N_p \times \ell$ slab \\
+ & & & ($\Omega$ hashed from (seed, global $i$, $j$): drawn locally) \\
+$G, \widehat{R}$ & $\ell \times \ell$ & feature & replicated (one allreduce); redundant Cholesky \\
+$T$ & $\ell \times \ell$ & feature & replicated (one allreduce); redundant \texttt{dsyevd} \\
+$V$ & $\ell \times \ell$ & feature & replicated \\
+$\lambda, D$ & $r$ (diag) & feature & replicated \\
+$U$ & $N \times r$ dense & whitened $\leftarrow$ feature & distributed rows: $N_p \times r$ slab \\
+$w$ & $r$ & feature & replicated coefficient array \\
+ & & & (local GEMV + one allreduce inside $U^T x$) \\
+$c, \tau, \alpha$ & scalar & --- & replicated \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Representative production build from the engine's originating application (a warm
+build on a $\sim$10k-dof mesh): $N = 10371$, $\ell = 2200$, $q = 1$, $\tau = 1.0$,
+$r = 2136$.
+\end{document}
