@@ -18,6 +18,7 @@
 #endif
 
 #define LGH_BLAS_DGEMM    LGH_F77_FUNC (dgemm, DGEMM)
+#define LGH_BLAS_DGEMV    LGH_F77_FUNC (dgemv, DGEMV)
 #define LGH_BLAS_DTRSM    LGH_F77_FUNC (dtrsm, DTRSM)
 #define LGH_LAPACK_DSYEVD LGH_F77_FUNC (dsyevd, DSYEVD)
 #define LGH_LAPACK_DPOTRF LGH_F77_FUNC (dpotrf, DPOTRF)
@@ -32,6 +33,10 @@ extern void LGH_BLAS_DGEMM (const char *transa, const char *transb,
                             const double *alpha, const double *a,
                             const int *lda, const double *b, const int *ldb,
                             const double *beta, double *c, const int *ldc);
+extern void LGH_BLAS_DGEMV (const char *trans, const int *m, const int *n,
+                            const double *alpha, const double *a,
+                            const int *lda, const double *x, const int *incx,
+                            const double *beta, double *y, const int *incy);
 extern void LGH_BLAS_DTRSM (const char *side, const char *uplo,
                             const char *transa, const char *diag,
                             const int *m, const int *n, const double *alpha,

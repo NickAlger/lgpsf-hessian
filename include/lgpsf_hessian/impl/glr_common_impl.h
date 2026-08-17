@@ -236,6 +236,9 @@ lgh_prior_apply (lgh_prior_t *prior, Vec x, Vec y)
 /* ================================================================== */
 /* the GLR object                                                      */
 
+struct lgh_glrd_state;              /* ScaLAPACK backend state (impl/
+                                       glr_scalapack_impl.h)            */
+
 struct lgh_glr
 {
   MPI_Comm            comm;
@@ -243,15 +246,31 @@ struct lgh_glr
   Mat                 B;            /* referenced                       */
   lgh_prior_t        *prior;        /* referenced                      */
   lgh_glr_opts_t      opts;         /* resolved (backend concrete)     */
-  /* build product (replicated backend: U materialized) */
-  Mat                 U;            /* N x kept MPIDENSE               */
-  PetscReal          *lam;          /* treated, |lam|-descending       */
+  /* build product.  Both backends expose the same primitives:
+   * UTmult (w = U^T x, replicated array) / Umult (y (+)= U w).
+   * REPLICATED materializes U as an N x kept row slab; SCALAPACK keeps
+   * U implicit (Q row slab + block-cyclic V) in `dist`.                */
+  Mat                 U;            /* replicated backend only          */
+  struct lgh_glrd_state *dist;      /* scalapack backend only           */
+  PetscReal          *lam;          /* treated, |lam|-descending        */
   PetscInt            kept;
   /* scratch */
-  Vec                 w1, w2;       /* full-space work                 */
-  Vec                 wr;           /* reduced (kept) work             */
-  double             *fbuf;         /* kept-sized filter values        */
+  Vec                 w1, w2;       /* full-space work                  */
+  double             *wbuf;         /* kept-sized coefficient work      */
+  double             *wbuf2;        /* kept-sized local reduction stage */
+  double             *fbuf;         /* kept-sized filter values         */
 };
+
+#ifdef LGH_WITH_SCALAPACK
+/* defined in impl/glr_scalapack_impl.h (same TU, included after) */
+static PetscErrorCode lgh_glrd_build (lgh_glr_t *g, lgh_glr_report_t *rep);
+static PetscErrorCode lgh_glrd_extend_incr (lgh_glr_t *g, int k_new,
+                                            lgh_glr_report_t *rep);
+static void           lgh_glrd_destroy_state (lgh_glr_t *g);
+static PetscErrorCode lgh_glrd_UTmult (lgh_glr_t *g, Vec x, double *w);
+static PetscErrorCode lgh_glrd_Umult (lgh_glr_t *g, const double *w, Vec y,
+                                      PetscBool add);
+#endif
 
 lgh_glr_opts_t
 lgh_glr_opts_default (void)
@@ -572,13 +591,15 @@ lgh_glr_build_replicated (lgh_glr_t *g, lgh_glr_report_t *rep)
 static PetscErrorCode
 lgh_glr_setup_scratch (lgh_glr_t *g)
 {
-  PetscCall (VecDestroy (&g->wr));
+  PetscCall (PetscFree (g->wbuf));
+  PetscCall (PetscFree (g->wbuf2));
   PetscCall (PetscFree (g->fbuf));
   if (g->w1 == NULL) {
     PetscCall (MatCreateVecs (g->B, &g->w1, NULL));
     PetscCall (MatCreateVecs (g->B, &g->w2, NULL));
   }
-  PetscCall (MatCreateVecs (g->U, &g->wr, NULL));
+  PetscCall (PetscMalloc1 (PetscMax (g->kept, 1), &g->wbuf));
+  PetscCall (PetscMalloc1 (PetscMax (g->kept, 1), &g->wbuf2));
   PetscCall (PetscMalloc1 (PetscMax (g->kept, 1), &g->fbuf));
   return PETSC_SUCCESS;
 }
@@ -612,18 +633,27 @@ lgh_glr_compute (Mat B, lgh_prior_t *prior, const lgh_glr_opts_t *opts,
               "lgh_glr_compute: need 0 < ell (%d) <= N (%d)",
               (int) g->opts.ell, (int) Nglob);
 
-  if (g->opts.backend == LGH_GLR_DEFAULT) {
-    /* SCALAPACK once that backend lands (slice C); replicated meanwhile */
+#ifdef LGH_WITH_SCALAPACK
+  if (g->opts.backend == LGH_GLR_DEFAULT)
+    g->opts.backend = LGH_GLR_SCALAPACK;
+#else
+  if (g->opts.backend == LGH_GLR_DEFAULT)
     g->opts.backend = LGH_GLR_REPLICATED;
-  }
-  PetscCheck (g->opts.backend == LGH_GLR_REPLICATED, g->comm, PETSC_ERR_SUP,
-              "lgh_glr_compute: the SCALAPACK backend arrives with slice C");
+  PetscCheck (g->opts.backend != LGH_GLR_SCALAPACK, g->comm, PETSC_ERR_SUP,
+              "lgh_glr_compute: this build has no ScaLAPACK backend "
+              "(configure with LGH_WITH_SCALAPACK=ON)");
+#endif
 
   g->B = B;
   PetscCall (PetscObjectReference ((PetscObject) B));
   g->prior = prior;
   lgh_prior_ref (prior);
 
+#ifdef LGH_WITH_SCALAPACK
+  if (g->opts.backend == LGH_GLR_SCALAPACK)
+    PetscCall (lgh_glrd_build (g, &local_rep));
+  else
+#endif
   PetscCall (lgh_glr_build_replicated (g, &local_rep));
   PetscCall (lgh_glr_setup_scratch (g));
   if (report != NULL) *report = local_rep;
@@ -639,18 +669,26 @@ lgh_glr_extend (lgh_glr_t *glr, int k_new, lgh_glr_report_t *report)
   /* The hashed sketch makes extension EXACTLY "the build you would have
    * done at ell + k_new" (columns are a pure function of (seed, i, j), so
    * the first ell columns of the wider sketch are the same draws).  The
-   * replicated backend currently realizes those semantics by recomputing
-   * at the wider ell — correct, not incremental-cost.  The ScaLAPACK
-   * backend (slice C) reuses the existing Q and borders T.              */
+   * ScaLAPACK backend realizes it incrementally (reuses Q, borders T);
+   * the replicated backend recomputes at the wider ell — correct, not
+   * incremental-cost.                                                   */
   PetscCheck (k_new > 0, glr->comm, PETSC_ERR_ARG_OUTOFRANGE,
               "lgh_glr_extend: k_new must be positive");
-  glr->opts.ell += k_new;
-  PetscCheck (glr->opts.ell <= glr->Nglob, glr->comm,
+  PetscCheck (glr->opts.ell + k_new <= glr->Nglob, glr->comm,
               PETSC_ERR_ARG_OUTOFRANGE,
               "lgh_glr_extend: extended ell (%d) exceeds N (%d)",
-              (int) glr->opts.ell, (int) glr->Nglob);
-  PetscCall (lgh_glr_teardown_build (glr));
-  PetscCall (lgh_glr_build_replicated (glr, &local_rep));
+              (int) glr->opts.ell + k_new, (int) glr->Nglob);
+#ifdef LGH_WITH_SCALAPACK
+  if (glr->opts.backend == LGH_GLR_SCALAPACK) {
+    PetscCall (lgh_glrd_extend_incr (glr, k_new, &local_rep));
+  }
+  else
+#endif
+  {
+    glr->opts.ell += k_new;
+    PetscCall (lgh_glr_teardown_build (glr));
+    PetscCall (lgh_glr_build_replicated (glr, &local_rep));
+  }
   PetscCall (lgh_glr_setup_scratch (glr));
   if (report != NULL) *report = local_rep;
   return PETSC_SUCCESS;
@@ -661,10 +699,14 @@ lgh_glr_destroy (lgh_glr_t *glr)
 {
   if (glr == NULL) return;
   (void) MatDestroy (&glr->U);
+#ifdef LGH_WITH_SCALAPACK
+  lgh_glrd_destroy_state (glr);
+#endif
   (void) PetscFree (glr->lam);
   (void) VecDestroy (&glr->w1);
   (void) VecDestroy (&glr->w2);
-  (void) VecDestroy (&glr->wr);
+  (void) PetscFree (glr->wbuf);
+  (void) PetscFree (glr->wbuf2);
   (void) PetscFree (glr->fbuf);
   (void) MatDestroy (&glr->B);
   lgh_prior_destroy (glr->prior);
@@ -674,28 +716,98 @@ lgh_glr_destroy (lgh_glr_t *glr)
 /* ================================================================== */
 /* downstream operations                                               */
 
+/* Implicit-U primitives, replicated backend: U is an N x kept row slab,
+ * so U^T x is a local GEMV + one allreduce of kept doubles, and U w is a
+ * purely local GEMV.  (Same interface as the ScaLAPACK backend's
+ * Q(V w) / V^T(Q^T x) primitives — the op layer dispatches.)            */
+static PetscErrorCode
+lgh_glre_UTmult (lgh_glr_t *g, Vec x, double *w)
+{
+  const PetscScalar  *ua, *xa;
+  PetscInt            nloc, lda;
+  double             *wl = g->wbuf2;
+  PetscInt            i;
+
+  PetscCall (MatGetLocalSize (g->U, &nloc, NULL));
+  PetscCall (MatDenseGetLDA (g->U, &lda));
+  PetscCall (MatDenseGetArrayRead (g->U, &ua));
+  PetscCall (VecGetArrayRead (x, &xa));
+  if (nloc > 0) {
+    int                 bm = (int) nloc, bk = (int) g->kept;
+    int                 blda = (int) lda, ione = 1;
+    double              one = 1.0, zero = 0.0;
+    LGH_BLAS_DGEMV ("T", &bm, &bk, &one, ua, &blda, (const double *) xa,
+                    &ione, &zero, wl, &ione);
+  }
+  else { for (i = 0; i < g->kept; i++) wl[i] = 0.; }
+  PetscCall (VecRestoreArrayRead (x, &xa));
+  PetscCall (MatDenseRestoreArrayRead (g->U, &ua));
+  PetscCallMPI (MPI_Allreduce (wl, w, (int) g->kept, MPI_DOUBLE, MPI_SUM,
+                               g->comm));
+  return PETSC_SUCCESS;
+}
+
+static PetscErrorCode
+lgh_glre_Umult (lgh_glr_t *g, const double *w, Vec y, PetscBool add)
+{
+  const PetscScalar  *ua;
+  PetscScalar        *ya;
+  PetscInt            nloc, lda;
+
+  PetscCall (MatGetLocalSize (g->U, &nloc, NULL));
+  PetscCall (MatDenseGetLDA (g->U, &lda));
+  PetscCall (MatDenseGetArrayRead (g->U, &ua));
+  PetscCall (VecGetArray (y, &ya));
+  if (nloc > 0) {
+    int                 bm = (int) nloc, bk = (int) g->kept;
+    int                 blda = (int) lda, ione = 1;
+    double              one = 1.0, beta = add ? 1.0 : 0.0;
+    LGH_BLAS_DGEMV ("N", &bm, &bk, &one, ua, &blda, w, &ione, &beta, ya,
+                    &ione);
+  }
+  PetscCall (VecRestoreArray (y, &ya));
+  PetscCall (MatDenseRestoreArrayRead (g->U, &ua));
+  return PETSC_SUCCESS;
+}
+
+static PetscErrorCode
+lgh_glr_UTmult (lgh_glr_t *g, Vec x, double *w)
+{
+#ifdef LGH_WITH_SCALAPACK
+  if (g->opts.backend == LGH_GLR_SCALAPACK)
+    return lgh_glrd_UTmult (g, x, w);
+#endif
+  return lgh_glre_UTmult (g, x, w);
+}
+
+static PetscErrorCode
+lgh_glr_Umult (lgh_glr_t *g, const double *w, Vec y, PetscBool add)
+{
+#ifdef LGH_WITH_SCALAPACK
+  if (g->opts.backend == LGH_GLR_SCALAPACK)
+    return lgh_glrd_Umult (g, w, y, add);
+#endif
+  return lgh_glre_Umult (g, w, y, add);
+}
+
 /* out = f_c in + U diag(f_lam - f_c) U^T in  (the master formula).     */
 static PetscErrorCode
 lgh_glr_filter_core (lgh_glr_t *g, const double *f_lam, double f_c,
                      Vec in, Vec out)
 {
+  PetscInt            k;
+
   if (g->kept == 0) {
     PetscCall (VecCopy (in, out));
     PetscCall (VecScale (out, f_c));
     return PETSC_SUCCESS;
   }
-  PetscCall (MatMultTranspose (g->U, in, g->wr));
-  {
-    PetscScalar        *wa;
-    PetscInt            rstart, rend, i;
-    PetscCall (VecGetOwnershipRange (g->wr, &rstart, &rend));
-    PetscCall (VecGetArray (g->wr, &wa));
-    for (i = rstart; i < rend; i++)
-      wa[i - rstart] *= f_lam[i] - f_c;
-    PetscCall (VecRestoreArray (g->wr, &wa));
-  }
-  PetscCall (MatMult (g->U, g->wr, out));
-  PetscCall (VecAXPY (out, f_c, in));
+  PetscCall (lgh_glr_UTmult (g, in, g->wbuf));
+  for (k = 0; k < g->kept; k++)
+    g->wbuf[k] *= f_lam[k] - f_c;
+  PetscCall (VecCopy (in, out));
+  PetscCall (VecScale (out, f_c));
+  PetscCall (lgh_glr_Umult (g, g->wbuf, out, PETSC_TRUE));
   return PETSC_SUCCESS;
 }
 

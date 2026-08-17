@@ -1,5 +1,6 @@
-/* test_glr_replicated.cpp — dense-LAPACK oracle gates for the replicated
- * GLR backend, runnable at any communicator size (registered at n=1,2,4).
+/* test_glr.cpp — dense-LAPACK oracle gates for BOTH GLR backends
+ * (replicated and, when compiled in, ScaLAPACK), runnable at any
+ * communicator size (registered at n=1,2,4).
  *
  * Problem: N = 120, B = sum_k s_k a_k a_k^T with rank r = 10 (exact-rank
  * scenarios so the GLR model is exact and identities hold to solver
@@ -155,7 +156,7 @@ rel_diff (Vec a, Vec b, Vec scratch, double *out)
 /* one scenario -------------------------------------------------------- */
 
 static PetscErrorCode
-run_scenario (int spd)
+run_scenario (int spd, lgh_glr_backend_t backend)
 {
   const double        c = 0.7;
   Mat                 B;
@@ -208,7 +209,9 @@ run_scenario (int spd)
   go.q_power = 1;
   go.trunc_abs = 0.;
   go.trunc_rel = 1e-8;
-  go.backend = LGH_GLR_REPLICATED;
+  go.backend = backend;
+  go.nb = 8;         /* small blocks: exercise real block-cyclic layout */
+  go.panel = 16;
   go.check = 1;
   PetscCall (lgh_glr_compute (B, prior, &go, &glr, &rep));
 
@@ -229,8 +232,12 @@ run_scenario (int spd)
   }
   check (rep.next_abs < 1e-6 * rep.lam_abs_max, "next_abs ~ 0 at exact rank",
          rep.next_abs);
-  check (rep.resid_max < 1e-7 * rep.lam_abs_max, "residual gate",
-         rep.resid_max);
+  if (backend == LGH_GLR_REPLICATED)   /* eigen-residual check */
+    check (rep.resid_max < 1e-7 * rep.lam_abs_max, "residual gate",
+           rep.resid_max);
+  else                                 /* pdsyevd-vs-dsyevd rel |dlam| */
+    check (rep.resid_max < 1e-12, "pdsyevd cross-check gate",
+           rep.resid_max);
   if (!spd)
     check (rep.n_negative_raw >= RANK_B / 2, "negatives present pre-FLIP",
            (double) rep.n_negative_raw);
@@ -321,14 +328,96 @@ run_scenario (int spd)
   return PETSC_SUCCESS;
 }
 
+/* cross-backend invariants: same problem, both engines, compare solve
+ * outputs directly (spectra are compared through the shared oracle).    */
+#ifdef LGH_WITH_SCALAPACK
+static PetscErrorCode
+run_cross_backend (void)
+{
+  const double        c = 0.7;
+  Mat                 B;
+  Vec                 mass, zdiag, v, x1, x2, s1;
+  test_prior_ctx      pctx;
+  lgh_prior_t        *prior;
+  lgh_prior_callbacks_t cb;
+  lgh_glr_t          *g1, *g2;
+  lgh_glr_opts_t      go = lgh_glr_opts_default ();
+  PetscInt            rstart, rend;
+  double              rd;
+
+  PetscCall (MatCreateDense (PETSC_COMM_WORLD, PETSC_DECIDE, PETSC_DECIDE,
+                             N_GLOBAL, N_GLOBAL, NULL, &B));
+  PetscCall (MatGetOwnershipRange (B, &rstart, &rend));
+  {
+    PetscScalar        *ba;
+    PetscInt            lda;
+    PetscCall (MatDenseGetLDA (B, &lda));
+    PetscCall (MatDenseGetArrayWrite (B, &ba));
+    for (PetscInt j = 0; j < N_GLOBAL; j++)
+      for (PetscInt i = rstart; i < rend; i++)
+        ba[(i - rstart) + j * lda] = b_entry ((int) i, (int) j, 1);
+    PetscCall (MatDenseRestoreArrayWrite (B, &ba));
+  }
+  PetscCall (MatAssemblyBegin (B, MAT_FINAL_ASSEMBLY));
+  PetscCall (MatAssemblyEnd (B, MAT_FINAL_ASSEMBLY));
+  PetscCall (MatCreateVecs (B, &mass, NULL));
+  PetscCall (VecDuplicate (mass, &zdiag));
+  PetscCall (VecDuplicate (mass, &v));
+  PetscCall (VecDuplicate (mass, &x1));
+  PetscCall (VecDuplicate (mass, &x2));
+  PetscCall (VecDuplicate (mass, &s1));
+  PetscCall (fill_vec (mass, m_entry));
+  PetscCall (fill_vec (zdiag, z_entry));
+  PetscCall (fill_vec (v, probe_entry));
+  pctx.zdiag = zdiag;
+  cb.applyZ = cb_applyZ; cb.applyZt = NULL;
+  cb.solveZ = cb_solveZ; cb.solveZt = NULL;
+  cb.solveZ_blocked = NULL; cb.solveZt_blocked = NULL;
+  cb.ctx = &pctx;
+  PetscCall (lgh_prior_create_callbacks (mass, &cb, &prior));
+
+  go.ell = 40; go.trunc_rel = 1e-8; go.nb = 8; go.panel = 16; go.check = 0;
+  go.backend = LGH_GLR_REPLICATED;
+  PetscCall (lgh_glr_compute (B, prior, &go, &g1, NULL));
+  go.backend = LGH_GLR_SCALAPACK;
+  PetscCall (lgh_glr_compute (B, prior, &go, &g2, NULL));
+
+  PetscCall ((PetscErrorCode) lgh_glr_solve (g1, c, v, x1));
+  PetscCall ((PetscErrorCode) lgh_glr_solve (g2, c, v, x2));
+  PetscCall (rel_diff (x1, x2, s1, &rd));
+  check (rd < 1e-8, "cross-backend solve agreement", rd);
+  check (fabs (lgh_glr_logdet (g1, c) - lgh_glr_logdet (g2, c))
+         < 1e-9 * fabs (lgh_glr_logdet (g1, c)),
+         "cross-backend logdet agreement",
+         lgh_glr_logdet (g1, c) - lgh_glr_logdet (g2, c));
+
+  lgh_glr_destroy (g1);
+  lgh_glr_destroy (g2);
+  lgh_prior_destroy (prior);
+  PetscCall (VecDestroy (&mass));
+  PetscCall (VecDestroy (&zdiag));
+  PetscCall (VecDestroy (&v));
+  PetscCall (VecDestroy (&x1));
+  PetscCall (VecDestroy (&x2));
+  PetscCall (VecDestroy (&s1));
+  PetscCall (MatDestroy (&B));
+  return PETSC_SUCCESS;
+}
+#endif
+
 int
 main (int argc, char **argv)
 {
   PetscCall (PetscInitialize (&argc, &argv, NULL, NULL));
-  PetscCall (run_scenario (1));   /* SPD: full op-identity battery */
-  PetscCall (run_scenario (0));   /* indefinite: FLIP battery      */
+  PetscCall (run_scenario (1, LGH_GLR_REPLICATED));
+  PetscCall (run_scenario (0, LGH_GLR_REPLICATED));
+#ifdef LGH_WITH_SCALAPACK
+  PetscCall (run_scenario (1, LGH_GLR_SCALAPACK));
+  PetscCall (run_scenario (0, LGH_GLR_SCALAPACK));
+  PetscCall (run_cross_backend ());
+#endif
   if (n_fail == 0)
-    PetscCall (PetscPrintf (PETSC_COMM_WORLD, "PASS test_glr_replicated\n"));
+    PetscCall (PetscPrintf (PETSC_COMM_WORLD, "PASS test_glr\n"));
   PetscCall (PetscFinalize ());
   return n_fail == 0 ? 0 : 1;
 }

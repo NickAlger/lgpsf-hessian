@@ -15,9 +15,11 @@
 #define LGPSF_HESSIAN_IMPL_HPP
 
 #include "lgpsf_hessian/impl/glr_common_impl.h"
+#ifdef LGH_WITH_SCALAPACK
+#include "lgpsf_hessian/impl/glr_scalapack_impl.h"
+#endif
 
 /* Arriving with later migration slices:
- * #include "lgpsf_hessian/impl/glr_scalapack_impl.h"   (LGH_WITH_SCALAPACK)
  * #include "lgpsf_hessian/impl/zsolve_impl.h"          (prior Mat path)
  * #include "lgpsf_hessian/impl/fit_impl.hpp"           (lgpsf fit stage)
  */
