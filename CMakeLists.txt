@@ -59,19 +59,12 @@ find_package(lgpsf 0.1 QUIET CONFIG)
 set(_lgh_lgpsf_vendored OFF)
 if(NOT lgpsf_FOUND AND LGH_FETCH_LGPSF)
   include(FetchContent)
-  # The lgpsf commit pinned below still pins ellipsoid_tree v0.2.0, which
-  # predates box_forest.hpp — a header lgpsf's MPI layer includes (lgpsf's
-  # own CI builds without MPI and never notices; we compile that layer).
-  # First-declaration-wins: declaring ellipsoid_tree here overrides lgpsf's
-  # pin.  Drop this once the lgpsf pin below moves past its v0.3.0 bump.
-  FetchContent_Declare(ellipsoid_tree
-    URL https://github.com/NickAlger/ellipsoid_tree/archive/refs/tags/v0.3.0.tar.gz
-    URL_HASH SHA256=3ff1756630faf9897317900c066e747354bdba5223fb1cdeb468aed19cfde8b9)
   FetchContent_Declare(lgpsf
     GIT_REPOSITORY https://github.com/NickAlger/lgpsf.git
-    # pinned commit (lgpsf main as validated with this repo's test suite);
-    # move to a release tag when lgpsf cuts one
-    GIT_TAG        572c935258644ab2d5c980278932d5271bada745)
+    # pinned commit (lgpsf main as validated with this repo's test suite;
+    # carries the ellipsoid_tree v0.3.0 pin its MPI layer needs); move to
+    # a release tag when lgpsf cuts one
+    GIT_TAG        9d3cd866d06878fe9ce003881f47aec432022251)
   set(LGPSF_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   set(LGPSF_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(lgpsf)
