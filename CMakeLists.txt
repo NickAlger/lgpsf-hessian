@@ -99,6 +99,11 @@ target_include_directories(lgpsf_hessian_glr INTERFACE
 target_link_libraries(lgpsf_hessian_glr INTERFACE
   PkgConfig::PETSC MPI::MPI_C ${LAPACK_LIBRARIES})
 target_compile_features(lgpsf_hessian_glr INTERFACE c_std_99)
+# In C++ TUs, Ubuntu's OpenMPI mpi.h auto-includes the deprecated MPI C++
+# bindings, adding a libmpi_cxx link dependency that MPI::MPI_C does not
+# carry ("DSO missing from command line" at link).  We use only the C API.
+target_compile_definitions(lgpsf_hessian_glr INTERFACE
+  OMPI_SKIP_MPICXX=1 MPICH_SKIP_MPICXX=1)
 if(LGH_WITH_SCALAPACK)
   target_link_libraries(lgpsf_hessian_glr INTERFACE ${LGH_SCALAPACK_LIBRARY})
   target_compile_definitions(lgpsf_hessian_glr INTERFACE LGH_WITH_SCALAPACK)
