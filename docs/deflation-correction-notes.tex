@@ -1,0 +1,151 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\begin{document}
+\begin{center}\textbf{The deflation correction as implemented}\\[2pt]
+\small The formulas behind \texttt{lgh\_glr\_correct} /
+\texttt{lgh\_glr\_correct\_probes} (stage 2.5 of \texttt{lgpsf-hessian}).
+Companions: \texttt{glr-woodbury-formulas.pdf} (the base representation),
+\texttt{glr-distributed-design.pdf} (layouts).
+\end{center}
+
+Definitions: $M$ lumped mass (diagonal); $Z$ the prior's square-root factor,
+prior precision $R = Z M^{-1} Z$; $H_d$ the \emph{true} misfit Hessian
+(matvecs only); $\widetilde{H}_d$ the sparse lgpsf approximation; the GLR
+build holds $U \Lambda U^T \approx F := M^{1/2} Z^{-1} \widetilde{H}_d
+Z^{-1} M^{1/2}$ (treated, truncated, $U^T U = I_r$).  The approximated and
+true operators at shift $c$:
+\begin{align}
+\widetilde{H}(c) &= Z M^{-1/2}\,(U \Lambda U^T + cI)\,M^{-1/2} Z, &
+H(c) &= H_d + c R = Z M^{-1/2}\,(F_{\mathrm{true}} + cI)\,M^{-1/2} Z,
+\end{align}
+with $F_{\mathrm{true}} := M^{1/2} Z^{-1} H_d Z^{-1} M^{1/2}$ (never formed;
+one true apply per column).
+
+\section*{1. The error eigenvalue problem}
+
+At a reference shift $c_0 > 0$, the correction targets the dominant
+eigenpairs of the generalized problem
+\begin{equation}
+\bigl(H(c_0) - \widetilde{H}(c_0)\bigr)\, v \;=\; d\; \widetilde{H}(c_0)\, v ,
+\qquad H(c_0) - \widetilde{H}(c_0) = H_d - \widetilde{H}_d^{\,\mathrm{glr}}
+\ \ (\text{the regularization cancels}).
+\label{eq:gevp}
+\end{equation}
+In prior-whitened coordinates, with
+$S^{\pm} := (U \Lambda U^T + c_0 I)^{\pm 1/2}$ (one filter apply each via
+the master formula,
+$S^{\pm} = U\bigl[(\Lambda + c_0 I)^{\pm 1/2} - c_0^{\pm 1/2} I\bigr]U^T
++ c_0^{\pm 1/2} I$, i.e.\ \texttt{lgh\_glr\_pow}$(c_0, \pm\tfrac12)$),
+\eqref{eq:gevp} is the ordinary symmetric problem for the whitened error
+operator
+\begin{equation}
+E \;=\; S^-\,(F_{\mathrm{true}} + c_0 I)\,S^- \;-\; I
+   \;=\; S^-\,\bigl(F_{\mathrm{true}} - U \Lambda U^T\bigr)\,S^- .
+\label{eq:Ew}
+\end{equation}
+Facts used by the implementation: (i) the eigenvalues $d$ of $E$ are those of
+\eqref{eq:gevp} (congruence); (ii)
+$\mathrm{eig}\bigl(\widetilde{H}^{-1} H\bigr) = 1 + d$; (iii) if $H(c_0)$ is
+PD then $1 + d > 0$ exactly, so any Rayleigh estimate below
+$-1+\varepsilon$ is estimation noise and is clamped there
+(\texttt{clamp\_eps}, default $0.05$; clamps are counted, not hidden).
+
+\section*{2. The correction and its $c$-independence}
+
+With $(V, D)$ the kept eigenpairs of $E$ ($V^T V = I$, $D$ diagonal,
+$|d|$-descending, clamped),
+\begin{equation}
+F_{\mathrm{true}} \;\approx\; U \Lambda U^T + \widehat{V} D \widehat{V}^T,
+\qquad \widehat{V} := S^{+} V,
+\label{eq:corr}
+\end{equation}
+and hence, for \emph{every} shift $c$ (the stored object approximates the
+$c$-free error $F_{\mathrm{true}} - U\Lambda U^T$; $c_0$ enters only as the
+metric selecting which modes dominate),
+\begin{equation}
+H(c) \;\approx\; Z M^{-1/2} \bigl(U \Lambda U^T
+  + \widehat{V} D \widehat{V}^T + cI\bigr) M^{-1/2} Z .
+\end{equation}
+
+\section*{3. Value pass (probe reuse; \texttt{lgh\_glr\_correct\_probes})}
+
+Given the fit stage's probe pairs $(\Omega,\ Y = H_d \Omega)$, $k_f$ columns
+after holding out the trailing $n_{qc}$:
+\begin{align}
+X &= M^{-1/2} Z^T \Omega \quad (\text{cheap applies}), &
+F_{\mathrm{true}} X &= M^{1/2} Z^{-1} Y \quad (\text{blocked $Z$ solves}),\\
+R_w &= F_{\mathrm{true}} X - U \Lambda U^T X, &
+E\,(S^{+} X) &= S^- R_w \quad (\text{zero new true applies}).
+\end{align}
+An \emph{energy-ordered} orthonormal basis of the free images: eigendecompose
+the Gram matrix $G = (S^- R_w)^T (S^- R_w) = W \Sigma W^T$, drop
+$\sigma_i \le \texttt{drop\_tol}\cdot\sigma_{\max}$, set
+$Q = (S^- R_w)\, W_+ \Sigma_+^{-1/2}$ (columns in descending energy).
+The apply budget $m$ then prices directions exactly:
+\begin{equation}
+T \;=\; \mathrm{sym}\bigl(Q_m^T\, E\, Q_m\bigr), \qquad
+E Q_m = S^-\bigl((F_{\mathrm{true}} + c_0 I)(S^- Q_m)\bigr) - Q_m
+\quad (\text{$m$ true applies}),
+\end{equation}
+$T = V_s D V_s^T$, $V = Q_m V_s$.  If budget remains beyond the basis
+dimension, one power step: orthogonalize $E Q_m$ against $Q_m$, take the
+energy basis of the remainder, price it with the remaining applies, and
+assemble $T$ on the combined block.
+
+\section*{4. Fresh sketch (\texttt{lgh\_glr\_correct})}
+
+Without probe data: a hashed Gaussian test block $\Omega_E$
+($m_r = \lfloor m / (2 + q) \rfloor$ columns), images $E\,\Omega_E$
+($m_r$ true applies per pass, $q$ optional power passes through the energy
+basis), then the same Rayleigh pricing on the final basis --- $\approx 2m_r$
+applies for a rank-$m_r$ correction.
+
+\section*{5. Graft}
+
+The correction is folded into the representation, after which every
+downstream operation (solve, apply, sample, factor, logdet, pow, filter)
+serves the corrected operator through the unchanged master formula:
+\begin{align}
+C_U &= U^T \widehat{V}, \qquad
+Q_V = \mathrm{orth}_{\mathrm{energy}}\bigl((I - U U^T)\widehat{V}\bigr), \qquad
+C_Q = Q_V^T \widehat{V},\\
+T_2 &= \begin{pmatrix} \Lambda + C_U D C_U^T & C_U D C_Q^T\\
+                       C_Q D C_U^T & C_Q D C_Q^T \end{pmatrix}
+     = W_2 \Lambda' W_2^T \qquad (\text{dense symmetric, } r + r_2),\\
+U' &= [\,U \ \ Q_V\,]\, W_2 \quad (\text{truncated by } |\lambda'| \text{ with
+the object's rules; \textbf{signed} --- no treatment}).
+\end{align}
+Validity of shift-taking operations becomes the exact scalar condition
+\begin{equation}
+c \;>\; \mathrm{floor} \;=\; \max(0,\ -\min_i \lambda'_i)
+\qquad (\text{reported; } \mathrm{floor} < c_0 \text{ guaranteed by the
+clamp}).
+\end{equation}
+After a graft the sketch no longer represents the operator:
+\texttt{lgh\_glr\_extend} is refused (order: compute $\to$ extend $\to$
+correct last), \texttt{lgh\_glr\_apply} switches from the exact sparse
+action to the corrected low-rank action, and ScaLAPACK-built objects first
+materialize the implicit $U = Q V_{\mathrm{kept}}$ (panel-wise) and drop the
+sketch state.
+
+\section*{6. Cost summary}
+
+Per column of width-$m$ blocks; ``true apply'' means one $H_d$ matvec
+(typically a forward $+$ adjoint PDE solve).
+
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+ & true applies & blocked $Z$ solves & dense work \\
+\midrule
+value-pass basis            & $0$        & $O(k_f)$ & Gram eig $k_f$ \\
+value-pass pricing (rank $m$) & $m$      & $O(m)$   & eig $m$ \\
+fresh sketch (rank $m_r$)   & $(2{+}q)\,m_r$ & $O((2{+}q)m_r)$ & eig $m_r$ \\
+graft                       & $0$        & $0$      & eig $r + r_2$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}

@@ -2,8 +2,9 @@
 
 How `lgpsf-hessian` is put together, why the API looks the way it does, and how to
 wire your own solver into it. Companion math documents: `glr-distributed-design.tex`
-(the ScaLAPACK-backend design record) and `glr-woodbury-formulas.tex` (the
-replicated-backend recipe, step by step).
+(the ScaLAPACK-backend design record), `glr-woodbury-formulas.tex` (the
+replicated-backend recipe, step by step), and `deflation-correction-notes.tex`
+(the stage-2.5 formulas as implemented).
 
 ## The problem shape
 
