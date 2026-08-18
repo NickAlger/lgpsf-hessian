@@ -28,6 +28,7 @@
 
 #include <petscmat.h>
 #include <petscvec.h>
+#include <petscksp.h>
 
 #ifdef __cplusplus
 extern "C"
@@ -86,6 +87,15 @@ lgh_prior_mat_opts_t lgh_prior_mat_opts_default (void);
 
 /* Z: assembled symmetric Mat (kept by reference).  opts NULL = defaults. */
 int lgh_prior_create_mat (Mat Z, Vec mass_lumps,
+                          const lgh_prior_mat_opts_t *opts,
+                          lgh_prior_t **prior);
+
+/* Bring your own ALREADY-CONFIGURED solver for Z: ksp is borrowed
+ * (refcounted) and never mutated — its operator supplies applyZ, its
+ * solves supply solveZ, and the blocked tiers of opts wrap it exactly as
+ * in the Mat path.  For applications with a production-tuned Z solver
+ * that the library should reuse rather than replace. */
+int lgh_prior_create_ksp (KSP ksp, Vec mass_lumps,
                           const lgh_prior_mat_opts_t *opts,
                           lgh_prior_t **prior);
 

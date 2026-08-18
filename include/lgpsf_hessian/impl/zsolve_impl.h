@@ -714,52 +714,44 @@ lgh_prior_mat_solveZ_blocked (Mat X, Mat Y, void *vctx)
   }
 }
 
-int
-lgh_prior_create_mat (Mat Z, Vec mass_lumps,
-                      const lgh_prior_mat_opts_t *opts, lgh_prior_t **prior)
+/* Shared tail of the Mat and KSP paths: reference the solver and its
+ * operator, stand up the Z-solve machinery + requested blocked tier, wire
+ * the prior's callbacks.  ksp is referenced (never mutated).            */
+static PetscErrorCode
+lgh_prior_setup_from_ksp (KSP ksp, Vec mass_lumps,
+                          const lgh_prior_mat_opts_t *o, lgh_prior_t **prior)
 {
-  lgh_prior_mat_opts_t o = (opts != NULL) ? *opts
-                                          : lgh_prior_mat_opts_default ();
   lgh_prior_t        *p;
   MPI_Comm            comm;
-  PC                  pc;
+  Mat                 Zop;
 
   PetscCall (lgh_prior_init_common (mass_lumps, &p));
-  p->Z = Z;
-  PetscCall (PetscObjectReference ((PetscObject) Z));
-
-  /* the solver for Z: CG + AMG, overridable via -lgh_prior_* options */
-  PetscCall (PetscObjectGetComm ((PetscObject) Z, &comm));
-  PetscCall (KSPCreate (comm, &p->zksp));
-  PetscCall (KSPSetType (p->zksp, KSPCG));
-  PetscCall (KSPGetPC (p->zksp, &pc));
-  PetscCall (PCSetType (pc, PCGAMG));
-  PetscCall (KSPSetOperators (p->zksp, Z, Z));
-  PetscCall (KSPSetTolerances (p->zksp, o.ksp_rtol, 0., PETSC_DEFAULT,
-                               10000));
-  PetscCall (KSPSetOptionsPrefix (p->zksp, "lgh_prior_"));
-  PetscCall (KSPSetFromOptions (p->zksp));
-  PetscCall (KSPSetUp (p->zksp));
+  p->zksp = ksp;
+  PetscCall (PetscObjectReference ((PetscObject) ksp));
+  PetscCall (KSPGetOperators (ksp, &Zop, NULL));
+  p->Z = Zop;
+  PetscCall (PetscObjectReference ((PetscObject) Zop));
+  PetscCall (PetscObjectGetComm ((PetscObject) Zop, &comm));
 
   PetscCall (lgh_zs_create (p->zksp, &p->zs));
-  if (o.blocked_mode >= 2) {
+  if (o->blocked_mode >= 2) {
     Vec                 rhs;
     PetscReal           emin, emax;
     PetscInt            its;
     PetscInt            rlo, rhi, i;
     PetscScalar        *ra;
 
-    PetscCall (lgh_zs_blocked_setup (p->zs, o.blocked_mode, o.tile,
+    PetscCall (lgh_zs_blocked_setup (p->zs, o->blocked_mode, o->tile,
                                      /* smax_krylov */ 1,
                                      /* smoother_top */ 1.1,
                                      /* nu_force */ 0));
-    PetscCall (MatCreateVecs (Z, &rhs, NULL));
+    PetscCall (MatCreateVecs (Zop, &rhs, NULL));
     PetscCall (VecGetOwnershipRange (rhs, &rlo, &rhi));
     PetscCall (VecGetArray (rhs, &ra));
     for (i = rlo; i < rhi; i++)
       ra[i - rlo] = lgh_randn_at (0xB0BD5UL, i, 0);
     PetscCall (VecRestoreArray (rhs, &ra));
-    if (o.blocked_mode == 3) {
+    if (o->blocked_mode == 3) {
       PetscCall (lgh_zs_bounds_mode3 (p->zs, rhs, 200, &emin, &emax, &its));
     }
     else {
@@ -770,12 +762,12 @@ lgh_prior_create_mat (Mat Z, Vec mass_lumps,
     /* Lanczos bounds underestimate kappa: widen before trusting them */
     p->zs->lmin = 0.9 * emin;
     p->zs->lmax = 1.1 * emax;
-    p->zs->nit = lgh_zs_cheb_count (p->zs->lmin, p->zs->lmax, o.cheb_rtol);
-    if (o.verbose) {
+    p->zs->nit = lgh_zs_cheb_count (p->zs->lmin, p->zs->lmax, o->cheb_rtol);
+    if (o->verbose) {
       PetscCall (PetscPrintf (comm,
-                              "lgh_prior_create_mat: mode %d bounds "
+                              "lgh_prior: mode %d bounds "
                               "[%.3e, %.3e] (%d its) -> chebyshev nit %d\n",
-                              o.blocked_mode, (double) emin, (double) emax,
+                              o->blocked_mode, (double) emin, (double) emax,
                               (int) its, (int) p->zs->nit));
     }
   }
@@ -787,6 +779,47 @@ lgh_prior_create_mat (Mat Z, Vec mass_lumps,
   p->cb.ctx = p;
 
   *prior = p;
+  return PETSC_SUCCESS;
+}
+
+int
+lgh_prior_create_ksp (KSP ksp, Vec mass_lumps,
+                      const lgh_prior_mat_opts_t *opts, lgh_prior_t **prior)
+{
+  lgh_prior_mat_opts_t o = (opts != NULL) ? *opts
+                                          : lgh_prior_mat_opts_default ();
+  Mat                 Zop = NULL;
+
+  PetscCall (KSPGetOperators (ksp, &Zop, NULL));
+  PetscCheck (Zop != NULL, PETSC_COMM_SELF, PETSC_ERR_ARG_WRONGSTATE,
+              "lgh_prior_create_ksp: the KSP has no operator set");
+  return lgh_prior_setup_from_ksp (ksp, mass_lumps, &o, prior);
+}
+
+int
+lgh_prior_create_mat (Mat Z, Vec mass_lumps,
+                      const lgh_prior_mat_opts_t *opts, lgh_prior_t **prior)
+{
+  lgh_prior_mat_opts_t o = (opts != NULL) ? *opts
+                                          : lgh_prior_mat_opts_default ();
+  MPI_Comm            comm;
+  KSP                 ksp;
+  PC                  pc;
+
+  /* the solver for Z: CG + AMG, overridable via -lgh_prior_* options */
+  PetscCall (PetscObjectGetComm ((PetscObject) Z, &comm));
+  PetscCall (KSPCreate (comm, &ksp));
+  PetscCall (KSPSetType (ksp, KSPCG));
+  PetscCall (KSPGetPC (ksp, &pc));
+  PetscCall (PCSetType (pc, PCGAMG));
+  PetscCall (KSPSetOperators (ksp, Z, Z));
+  PetscCall (KSPSetTolerances (ksp, o.ksp_rtol, 0., PETSC_DEFAULT, 10000));
+  PetscCall (KSPSetOptionsPrefix (ksp, "lgh_prior_"));
+  PetscCall (KSPSetFromOptions (ksp));
+  PetscCall (KSPSetUp (ksp));
+
+  PetscCall (lgh_prior_setup_from_ksp (ksp, mass_lumps, &o, prior));
+  PetscCall (KSPDestroy (&ksp));   /* the prior holds its own reference */
   return PETSC_SUCCESS;
 }
 

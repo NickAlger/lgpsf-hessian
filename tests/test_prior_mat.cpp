@@ -192,6 +192,32 @@ main (int argc, char **argv)
     lgh_prior_destroy (prior);
   }
 
+  /* bring-your-own-KSP path: wrap an already-configured solver (mode 2) */
+  {
+    KSP                 kown;
+    PC                  pcown;
+    lgh_prior_mat_opts_t po = lgh_prior_mat_opts_default ();
+    lgh_prior_t        *prior;
+    double              rd;
+
+    PetscCall (KSPCreate (PETSC_COMM_WORLD, &kown));
+    PetscCall (KSPSetType (kown, KSPCG));
+    PetscCall (KSPGetPC (kown, &pcown));
+    PetscCall (PCSetType (pcown, PCGAMG));
+    PetscCall (KSPSetOperators (kown, Z, Z));
+    PetscCall (KSPSetTolerances (kown, 1e-12, 0., PETSC_DEFAULT, 10000));
+    PetscCall (KSPSetUp (kown));
+    po.blocked_mode = 2;
+    po.tile = 8;
+    PetscCall ((PetscErrorCode) lgh_prior_create_ksp (kown, mass, &po,
+                                                      &prior));
+    lgh_prior_mat_solveZ (b, x, prior);
+    PetscCall (rel_diff (x, xref, s1, &rd));
+    check (rd < 1e-8, "create_ksp vec solve vs reference", rd);
+    lgh_prior_destroy (prior);
+    PetscCall (KSPDestroy (&kown));   /* borrowed by the prior, refcounted */
+  }
+
   /* end-to-end: replicated GLR over a low-rank B with a mode-2 prior */
   {
     Mat                 B;
