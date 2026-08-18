@@ -22,8 +22,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: dependencies
+        # Azure apt mirror outages can hang the default update for an hour;
+        # short timeouts + retries make the fallback mirror kick in fast, and
+        # a failed update is survivable (the image ships recent indexes).
         run: |
-          sudo apt-get update
+          sudo apt-get update -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 || true
           sudo apt-get install -y cmake pkg-config petsc-dev \
             libscalapack-openmpi-dev liblapack-dev libopenmpi-dev
       - name: configure
