@@ -32,9 +32,14 @@ extern "C"
 #endif
 
 /* y = H x on LOCAL arrays (this rank's owned dofs, ascending global order).
- * Collective: every rank is called at the same point in the ladder. */
+ * Collective: every rank is called at the same point in the ladder.
+ * (Guarded: glr.h declares the same callback type for lgh_glr_correct, and
+ * either header may be included first.) */
+#ifndef LGH_HESSIAN_FN_DEFINED
+#define LGH_HESSIAN_FN_DEFINED
 typedef void (*lgh_hessian_fn) (const double *in_local, double *out_local,
                                 void *ctx);
+#endif
 
 typedef struct lgh_fit lgh_fit_t; /* opaque */
 

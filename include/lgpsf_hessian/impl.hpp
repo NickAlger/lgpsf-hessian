@@ -23,6 +23,7 @@
 #ifdef LGH_WITH_SCALAPACK
 #include "lgpsf_hessian/impl/glr_scalapack_impl.h"
 #endif
+#include "lgpsf_hessian/impl/correct_impl.h"
 #include "lgpsf_hessian/impl/zsolve_impl.h"
 #ifdef LGH_HAVE_LGPSF /* defined by the lgpsf_hessian::fit CMake target;
                          fit-only consumers may instead include

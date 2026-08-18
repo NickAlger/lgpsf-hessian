@@ -113,7 +113,8 @@ int lgh_glr_compute (Mat B, lgh_prior_t *prior, const lgh_glr_opts_t *opts,
  * columns (continuing the same sequence — extension is exactly the build
  * you would have done at ell + k_new), re-eigensolve, re-select.  Turns the
  * unknown-rank gamble into a stopping criterion: grow until
- * report->next_abs clears trunc_abs with margin. */
+ * report->next_abs clears trunc_abs with margin.
+ * Not available after lgh_glr_correct (correct last; see below). */
 int lgh_glr_extend (lgh_glr_t *glr, int k_new, lgh_glr_report_t *report);
 
 void lgh_glr_destroy (lgh_glr_t *glr);
@@ -166,6 +167,99 @@ int lgh_glr_filter (lgh_glr_t *glr, const double *f_lam, double f_c,
 /* Read the treated, kept spectrum (|lam|-descending; replicated).  Borrowed
  * pointer, valid until extend/destroy.  Not collective. */
 int lgh_glr_eigs (const lgh_glr_t *glr, int *nkept, const double **lam);
+
+/* ---- stage 2.5: deflation correction against the TRUE Hessian --------- */
+
+/* The GLR object approximates the misfit Hessian twice over (lgpsf row-fit
+ * error + sketch truncation).  lgh_glr_correct measures the dominant modes
+ * of that error against the TRUE misfit Hessian — the generalized EVP
+ *
+ *     (H - Htilde) v  =  d Htilde v,      Htilde(c0) evaluated at a
+ *                                         reference shift c0 —
+ *
+ * and folds a rank-r correction into (U, lam).  Every downstream operation
+ * then serves the corrected operator unchanged, at EVERY shift c: the
+ * regularization cancels in H - Htilde, so the stored correction is
+ * c-independent (c0 only sets the error metric — which modes count as
+ * dominant).
+ *
+ * The correction's eigenvalues are SIGNED information (d < 0 means the fit
+ * came out too big in that direction) and are never flipped.  Exact
+ * generalized eigenvalues satisfy 1 + d > 0 automatically (both operators
+ * PD at c0); the clamp d >= -1 + clamp_eps guards only against estimation
+ * noise in the Rayleigh values — a nonzero report->clamped means the apply
+ * budget was too small to price what it found, not that H is indefinite.
+ * After correction the combined spectrum may contain (small) negative
+ * lam': shift-taking operations then require c > report->floor
+ * ( = max(0, -min lam'), with floor < c0 guaranteed) instead of c > 0.
+ *
+ * lgh_glr_apply switches from the exact sparse action (B v + c R v) to the
+ * corrected low-rank action Z M^{-1/2}(U'lam'U'^T + cI)M^{-1/2}Z v — the
+ * sparse B alone no longer represents the corrected operator. */
+
+typedef struct lgh_glr_correct_opts
+{
+  double        c0;        /* reference shift for the error metric (your
+                              working shift; default 1.0)                 */
+  int           rank;      /* max correction rank; -1 (default) = all     */
+  int           applies;   /* TRUE-Hessian apply budget (default 30) —
+                              the binding cost: each apply is typically a
+                              forward + adjoint PDE solve                 */
+  int           n_qc;      /* probes path: the TRAILING n_qc supplied
+                              probe pairs are held out for the qc_before/
+                              qc_after report fields (default 0)          */
+  int           q_power;   /* fresh path: extra power passes (default 0)  */
+  double        clamp_eps; /* d clamped to >= -1 + clamp_eps (default .05)*/
+  double        drop_tol;  /* relative basis drop tolerance (default 1e-12)*/
+  unsigned long seed;      /* fresh-path hashed sketch seed               */
+  int           verbose;
+}
+lgh_glr_correct_opts_t;
+
+lgh_glr_correct_opts_t lgh_glr_correct_opts_default (void);
+
+typedef struct lgh_glr_correct_report
+{
+  int    kept;             /* correction modes grafted                    */
+  int    basis;            /* error-basis dimension available             */
+  int    clamped;          /* Rayleigh values clamped at -1 + clamp_eps   */
+  int    hd_applies;       /* true-Hessian applies spent                  */
+  double d_min, d_max;     /* correction eigenvalues, post-clamp          */
+  double floor;            /* shift validity: ops need c > floor          */
+  double qc_before, qc_after;  /* whitened energy ratio on held-out
+                                  probes (probes path, n_qc > 0); -1
+                                  when unavailable                        */
+  double t_operator, t_dense;
+}
+lgh_glr_correct_report_t;
+
+/* The misfit-Hessian callback family shared with the fit stage: y = H x on
+ * LOCAL arrays (this rank's owned dofs, ascending global order);
+ * collective. */
+#ifndef LGH_HESSIAN_FN_DEFINED
+#define LGH_HESSIAN_FN_DEFINED
+typedef void (*lgh_hessian_fn) (const double *in_local, double *out_local,
+                                void *ctx);
+#endif
+
+/* Value-pass correction (recommended): reuse the k probe pairs the fit
+ * stage already paid for — V and HV column-major as in lgh_fit_probes
+ * (V[j*nloc + i] = entry i of probe j, HV the true-Hessian responses).
+ * The error basis comes from this data for FREE (no new Hessian applies);
+ * opts->applies are then spent pricing the top basis directions exactly
+ * (with a power step past the basis when the budget allows).  Collective;
+ * mutates glr in place. */
+int lgh_glr_correct_probes (lgh_glr_t *glr, int k, const double *V,
+                            const double *HV, lgh_hessian_fn hessian_apply,
+                            void *ctx, const lgh_glr_correct_opts_t *opts,
+                            lgh_glr_correct_report_t *report);
+
+/* Fresh randomized correction (no probe data): a hashed Gaussian sketch of
+ * the whitened error operator; costs ~2x the applies of the value pass for
+ * the same rank.  Collective; mutates glr in place. */
+int lgh_glr_correct (lgh_glr_t *glr, lgh_hessian_fn hessian_apply, void *ctx,
+                     const lgh_glr_correct_opts_t *opts,
+                     lgh_glr_correct_report_t *report);
 
 /* ---- the seam from stage 1 -------------------------------------------- */
 

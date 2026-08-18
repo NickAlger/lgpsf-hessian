@@ -264,6 +264,12 @@ struct lgh_glr
   struct lgh_glrd_state *dist;      /* scalapack backend only           */
   PetscReal          *lam;          /* treated, |lam|-descending        */
   PetscInt            kept;
+  /* deflation correction (lgh_glr_correct): after a graft the spectrum is
+   * signed, U is always explicit (dispatch is by representation), the
+   * sketch state is gone (extend forbidden), and shift-taking ops require
+   * c > floor instead of c > 0.                                          */
+  int                 corrected;
+  double              floor;        /* max(0, -min lam'); 0 uncorrected  */
   /* scratch */
   Vec                 w1, w2;       /* full-space work                  */
   double             *wbuf;         /* kept-sized coefficient work      */
@@ -280,6 +286,10 @@ static void           lgh_glrd_destroy_state (lgh_glr_t *g);
 static PetscErrorCode lgh_glrd_UTmult (lgh_glr_t *g, Vec x, double *w);
 static PetscErrorCode lgh_glrd_Umult (lgh_glr_t *g, const double *w, Vec y,
                                       PetscBool add);
+static PetscErrorCode lgh_glrd_UTmult_block (lgh_glr_t *g, Mat X, double *W);
+static PetscErrorCode lgh_glrd_Umult_block (lgh_glr_t *g, const double *W,
+                                            Mat Y, PetscBool add);
+static PetscErrorCode lgh_glrd_materialize_U (lgh_glr_t *g, Mat *Uout);
 #endif
 
 lgh_glr_opts_t
@@ -682,6 +692,10 @@ lgh_glr_extend (lgh_glr_t *glr, int k_new, lgh_glr_report_t *report)
    * ScaLAPACK backend realizes it incrementally (reuses Q, borders T);
    * the replicated backend recomputes at the wider ell — correct, not
    * incremental-cost.                                                   */
+  PetscCheck (!glr->corrected, glr->comm, PETSC_ERR_ORDER,
+              "lgh_glr_extend: not available after lgh_glr_correct (the "
+              "sketch no longer represents the corrected operator) — "
+              "extend first, correct last");
   PetscCheck (k_new > 0, glr->comm, PETSC_ERR_ARG_OUTOFRANGE,
               "lgh_glr_extend: k_new must be positive");
   PetscCheck (glr->opts.ell + k_new <= glr->Nglob, glr->comm,
@@ -780,11 +794,13 @@ lgh_glre_Umult (lgh_glr_t *g, const double *w, Vec y, PetscBool add)
   return PETSC_SUCCESS;
 }
 
+/* Dispatch is by REPRESENTATION, not backend: a graft (lgh_glr_correct)
+ * leaves every object with an explicit U, including ScaLAPACK-built ones. */
 static PetscErrorCode
 lgh_glr_UTmult (lgh_glr_t *g, Vec x, double *w)
 {
 #ifdef LGH_WITH_SCALAPACK
-  if (g->opts.backend == LGH_GLR_SCALAPACK)
+  if (g->U == NULL)
     return lgh_glrd_UTmult (g, x, w);
 #endif
   return lgh_glre_UTmult (g, x, w);
@@ -794,10 +810,138 @@ static PetscErrorCode
 lgh_glr_Umult (lgh_glr_t *g, const double *w, Vec y, PetscBool add)
 {
 #ifdef LGH_WITH_SCALAPACK
-  if (g->opts.backend == LGH_GLR_SCALAPACK)
+  if (g->U == NULL)
     return lgh_glrd_Umult (g, w, y, add);
 #endif
   return lgh_glre_Umult (g, w, y, add);
+}
+
+/* ---- block (MATDENSE) forms of the implicit-U primitives -------------- */
+/* W is a replicated kept x m coefficient block, column-major.  One GEMM +
+ * one allreduce per call (vs one allreduce per column with the Vec forms —
+ * and, downstream, per-column Z solves always take the expensive KSP path,
+ * so the correction sweeps must be block-based end to end).               */
+
+static PetscErrorCode
+lgh_glre_UTmult_block (lgh_glr_t *g, Mat X, double *W)
+{
+  const PetscScalar  *ua, *xa;
+  PetscInt            nloc, ldu, ldx, m, i;
+  double             *Wl;
+  int                 bm, bk, bmm, bldu, bldx;
+  double              one = 1.0, zero = 0.0;
+
+  PetscCall (MatGetSize (X, NULL, &m));
+  PetscCall (PetscMalloc1 ((size_t) PetscMax (g->kept * m, 1), &Wl));
+  PetscCall (MatGetLocalSize (g->U, &nloc, NULL));
+  PetscCall (MatDenseGetLDA (g->U, &ldu));
+  PetscCall (MatDenseGetLDA (X, &ldx));
+  PetscCall (MatDenseGetArrayRead (g->U, &ua));
+  PetscCall (MatDenseGetArrayRead (X, &xa));
+  bm = (int) nloc; bk = (int) g->kept; bmm = (int) m;
+  bldu = (int) ldu; bldx = (int) ldx;
+  if (nloc > 0 && g->kept > 0) {
+    LGH_BLAS_DGEMM ("T", "N", &bk, &bmm, &bm, &one, ua, &bldu, xa, &bldx,
+                    &zero, Wl, &bk);
+  }
+  else { for (i = 0; i < g->kept * m; i++) Wl[i] = 0.; }
+  PetscCall (MatDenseRestoreArrayRead (X, &xa));
+  PetscCall (MatDenseRestoreArrayRead (g->U, &ua));
+  if (g->kept > 0)
+    PetscCallMPI (MPI_Allreduce (Wl, W, (int) (g->kept * m), MPI_DOUBLE,
+                                 MPI_SUM, g->comm));
+  PetscCall (PetscFree (Wl));
+  return PETSC_SUCCESS;
+}
+
+static PetscErrorCode
+lgh_glre_Umult_block (lgh_glr_t *g, const double *W, Mat Y, PetscBool add)
+{
+  const PetscScalar  *ua;
+  PetscScalar        *ya;
+  PetscInt            nloc, ldu, ldy, m;
+  int                 bm, bk, bmm, bldu, bldy;
+  double              one = 1.0, beta;
+
+  PetscCall (MatGetSize (Y, NULL, &m));
+  PetscCall (MatGetLocalSize (g->U, &nloc, NULL));
+  PetscCall (MatDenseGetLDA (g->U, &ldu));
+  PetscCall (MatDenseGetLDA (Y, &ldy));
+  PetscCall (MatDenseGetArrayRead (g->U, &ua));
+  PetscCall (MatDenseGetArray (Y, &ya));
+  bm = (int) nloc; bk = (int) g->kept; bmm = (int) m;
+  bldu = (int) ldu; bldy = (int) ldy;
+  beta = add ? 1.0 : 0.0;
+  if (nloc > 0 && g->kept > 0) {
+    LGH_BLAS_DGEMM ("N", "N", &bm, &bmm, &bk, &one, ua, &bldu, W, &bk,
+                    &beta, ya, &bldy);
+  }
+  else if (nloc > 0 && !add) {
+    PetscInt            j, jc;
+    for (jc = 0; jc < m; jc++)
+      for (j = 0; j < nloc; j++) ya[j + (size_t) jc * ldy] = 0.;
+  }
+  PetscCall (MatDenseRestoreArray (Y, &ya));
+  PetscCall (MatDenseRestoreArrayRead (g->U, &ua));
+  return PETSC_SUCCESS;
+}
+
+static PetscErrorCode
+lgh_glr_UTmult_block (lgh_glr_t *g, Mat X, double *W)
+{
+#ifdef LGH_WITH_SCALAPACK
+  if (g->U == NULL)
+    return lgh_glrd_UTmult_block (g, X, W);
+#endif
+  return lgh_glre_UTmult_block (g, X, W);
+}
+
+static PetscErrorCode
+lgh_glr_Umult_block (lgh_glr_t *g, const double *W, Mat Y, PetscBool add)
+{
+#ifdef LGH_WITH_SCALAPACK
+  if (g->U == NULL)
+    return lgh_glrd_Umult_block (g, W, Y, add);
+#endif
+  return lgh_glre_Umult_block (g, W, Y, add);
+}
+
+/* Y = f_c X + U diag(f_lam - f_c) U^T X  (block master formula).         */
+static PetscErrorCode
+lgh_glr_filter_block (lgh_glr_t *g, const double *f_lam, double f_c,
+                      Mat X, Mat Y)
+{
+  PetscInt            m, k, j;
+  double             *W = NULL;
+
+  PetscCall (MatGetSize (X, NULL, &m));
+  PetscCall (MatCopy (X, Y, SAME_NONZERO_PATTERN));
+  PetscCall (MatScale (Y, f_c));
+  if (g->kept == 0) return PETSC_SUCCESS;
+  PetscCall (PetscMalloc1 ((size_t) g->kept * m, &W));
+  PetscCall (lgh_glr_UTmult_block (g, X, W));
+  for (j = 0; j < m; j++)
+    for (k = 0; k < g->kept; k++)
+      W[k + (size_t) j * g->kept] *= f_lam[k] - f_c;
+  PetscCall (lgh_glr_Umult_block (g, W, Y, PETSC_TRUE));
+  PetscCall (PetscFree (W));
+  return PETSC_SUCCESS;
+}
+
+/* Y = (F + cI)^p X over the kept modes (block form of lgh_glr_pow).      */
+static PetscErrorCode
+lgh_glr_pow_block (lgh_glr_t *g, double c, double p, Mat X, Mat Y)
+{
+  double             *fv = NULL;
+  PetscInt            i;
+  PetscErrorCode      ierr;
+
+  PetscCall (PetscMalloc1 (PetscMax (g->kept, 1), &fv));
+  for (i = 0; i < g->kept; i++)
+    fv[i] = pow (g->lam[i] + c, p);
+  ierr = lgh_glr_filter_block (g, fv, pow (c, p), X, Y);
+  PetscCall (PetscFree (fv));
+  return ierr;
 }
 
 /* out = f_c in + U diag(f_lam - f_c) U^T in  (the master formula).     */
@@ -833,8 +977,9 @@ lgh_glr_pow (lgh_glr_t *glr, double c, double p, Vec in, Vec out)
 {
   PetscInt            i;
 
-  PetscCheck (c > 0., glr->comm, PETSC_ERR_ARG_OUTOFRANGE,
-              "lgh_glr_pow: shift c must be positive");
+  PetscCheck (c > glr->floor, glr->comm, PETSC_ERR_ARG_OUTOFRANGE,
+              "lgh_glr_pow: shift c must exceed the spectrum floor %g",
+              glr->floor);
   for (i = 0; i < glr->kept; i++)
     glr->fbuf[i] = pow (glr->lam[i] + c, p);
   return (int) lgh_glr_filter_core (glr, glr->fbuf, pow (c, p), in, out);
@@ -865,8 +1010,9 @@ lgh_glr_solve (lgh_glr_t *glr, double c, Vec rhs, Vec x)
   /* H(c)^{-1} = Z^{-T} M^{1/2} (F + cI)^{-1} M^{1/2} Z^{-1} */
   PetscInt            i;
 
-  PetscCheck (c > 0., glr->comm, PETSC_ERR_ARG_OUTOFRANGE,
-              "lgh_glr_solve: shift c must be positive");
+  PetscCheck (c > glr->floor, glr->comm, PETSC_ERR_ARG_OUTOFRANGE,
+              "lgh_glr_solve: shift c must exceed the spectrum floor %g",
+              glr->floor);
   PetscCall (lgh_prior_solveZ_vec (glr->prior, rhs, glr->w1));
   PetscCall (VecPointwiseMult (glr->w1, glr->w1, glr->prior->msqrt));
   for (i = 0; i < glr->kept; i++)
@@ -880,6 +1026,20 @@ lgh_glr_solve (lgh_glr_t *glr, double c, Vec rhs, Vec x)
 int
 lgh_glr_apply (lgh_glr_t *glr, double c, Vec v, Vec y)
 {
+  if (glr->corrected) {
+    /* After a graft the sparse B alone no longer represents the operator:
+     * apply the corrected low-rank action
+     * y = Z M^{-1/2} (U' lam' U'^T + cI) M^{-1/2} Z^T v.                 */
+    PetscInt            i;
+    PetscCall (lgh_prior_applyZt_vec (glr->prior, v, glr->w1));
+    PetscCall (VecPointwiseMult (glr->w1, glr->w1, glr->prior->minvsqrt));
+    for (i = 0; i < glr->kept; i++)
+      glr->fbuf[i] = glr->lam[i] + c;
+    PetscCall (lgh_glr_filter_core (glr, glr->fbuf, c, glr->w1, glr->w2));
+    PetscCall (VecPointwiseMult (glr->w2, glr->w2, glr->prior->minvsqrt));
+    PetscCall (lgh_prior_applyZ_vec (glr->prior, glr->w2, y));
+    return PETSC_SUCCESS;
+  }
   /* exact: y = B v + c R v (no truncation error) */
   PetscCall (MatMult (glr->B, v, y));
   PetscCall (lgh_prior_apply (glr->prior, v, glr->w1));
@@ -895,8 +1055,9 @@ lgh_glr_factor (lgh_glr_t *glr, double c, lgh_factor_t which,
   PetscInt            i;
   const double        half = 0.5;
 
-  PetscCheck (c > 0., glr->comm, PETSC_ERR_ARG_OUTOFRANGE,
-              "lgh_glr_factor: shift c must be positive");
+  PetscCheck (c > glr->floor, glr->comm, PETSC_ERR_ARG_OUTOFRANGE,
+              "lgh_glr_factor: shift c must exceed the spectrum floor %g",
+              glr->floor);
   switch (which) {
   case LGH_FACTOR_G:            /* Z M^{-1/2} S in                       */
     for (i = 0; i < glr->kept; i++)

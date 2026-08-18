@@ -914,4 +914,170 @@ lgh_glrd_extend_incr (lgh_glr_t *g, int k_new, lgh_glr_report_t *rep)
   return PETSC_SUCCESS;
 }
 
+/* ------------------------------------------------------------------ */
+/* block (MATDENSE) forms of the implicit-U primitives: one GEMM + two
+ * allreduces per call regardless of the column count.                   */
+
+/* W[kept x m] = U^T X = V_kept^T (Q^T X); W replicated, column-major.   */
+static PetscErrorCode
+lgh_glrd_UTmult_block (lgh_glr_t *g, Mat X, double *W)
+{
+  struct lgh_glrd_state *s = g->dist;
+  const PetscScalar  *qa, *xa;
+  PetscInt            nloc, ldq, ldx, m;
+  double             *cl, *cf, *wl;
+  int                 i, lj, k, jc;
+
+  PetscCall (MatGetSize (X, NULL, &m));
+  PetscCall (PetscMalloc3 ((size_t) s->ell * m, &cl,
+                           (size_t) s->ell * m, &cf,
+                           (size_t) PetscMax (g->kept * m, 1), &wl));
+  PetscCall (MatGetLocalSize (s->Q, &nloc, NULL));
+  PetscCall (MatDenseGetLDA (s->Q, &ldq));
+  PetscCall (MatDenseGetLDA (X, &ldx));
+  PetscCall (MatDenseGetArrayRead (s->Q, &qa));
+  PetscCall (MatDenseGetArrayRead (X, &xa));
+  if (nloc > 0) {
+    int                 bm = (int) nloc, bl = s->ell, bmm = (int) m;
+    int                 bldq = (int) ldq, bldx = (int) ldx;
+    double              one = 1.0, zero = 0.0;
+    LGH_BLAS_DGEMM ("T", "N", &bl, &bmm, &bm, &one, qa, &bldq, xa, &bldx,
+                    &zero, cl, &bl);
+  }
+  else { for (i = 0; i < s->ell * (int) m; i++) cl[i] = 0.; }
+  PetscCall (MatDenseRestoreArrayRead (X, &xa));
+  PetscCall (MatDenseRestoreArrayRead (s->Q, &qa));
+  PetscCallMPI (MPI_Allreduce (cl, cf, (int) (s->ell * m), MPI_DOUBLE,
+                               MPI_SUM, g->comm));
+
+  for (i = 0; i < (int) (g->kept * m); i++) wl[i] = 0.;
+  for (lj = 0; lj < s->tl_cols; lj++) {
+    const int           gj = (lj / s->nb) * s->nb * s->pcol
+                              + s->mycol * s->nb + lj % s->nb;
+    if (gj >= s->ell || (k = s->kpos[gj]) < 0) continue;
+    for (i = 0; i < s->tl_rows; i++) {
+      const int           gi = (i / s->nb) * s->nb * s->prow
+                                + s->myrow * s->nb + i % s->nb;
+      double              vij;
+      if (gi >= s->ell) continue;
+      vij = s->Vloc[i + (size_t) lj * s->tl_rows];
+      for (jc = 0; jc < (int) m; jc++)
+        wl[k + (size_t) jc * g->kept] += vij * cf[gi + (size_t) jc * s->ell];
+    }
+  }
+  PetscCallMPI (MPI_Allreduce (wl, W, (int) (g->kept * m), MPI_DOUBLE,
+                               MPI_SUM, g->comm));
+  PetscCall (PetscFree3 (cl, cf, wl));
+  return PETSC_SUCCESS;
+}
+
+/* Y (+)= U W = Q (V_kept W); W replicated kept x m, column-major.       */
+static PetscErrorCode
+lgh_glrd_Umult_block (lgh_glr_t *g, const double *W, Mat Y, PetscBool add)
+{
+  struct lgh_glrd_state *s = g->dist;
+  const PetscScalar  *qa;
+  PetscScalar        *ya;
+  PetscInt            nloc, ldq, ldy, m;
+  double             *cl, *cf;
+  int                 i, lj, k, jc;
+
+  PetscCall (MatGetSize (Y, NULL, &m));
+  PetscCall (PetscMalloc2 ((size_t) s->ell * m, &cl,
+                           (size_t) s->ell * m, &cf));
+  for (i = 0; i < (int) (s->ell * m); i++) cl[i] = 0.;
+  for (lj = 0; lj < s->tl_cols; lj++) {
+    const int           gj = (lj / s->nb) * s->nb * s->pcol
+                              + s->mycol * s->nb + lj % s->nb;
+    if (gj >= s->ell || (k = s->kpos[gj]) < 0) continue;
+    for (i = 0; i < s->tl_rows; i++) {
+      const int           gi = (i / s->nb) * s->nb * s->prow
+                                + s->myrow * s->nb + i % s->nb;
+      double              vij;
+      if (gi >= s->ell) continue;
+      vij = s->Vloc[i + (size_t) lj * s->tl_rows];
+      for (jc = 0; jc < (int) m; jc++)
+        cl[gi + (size_t) jc * s->ell] += vij * W[k + (size_t) jc * g->kept];
+    }
+  }
+  PetscCallMPI (MPI_Allreduce (cl, cf, (int) (s->ell * m), MPI_DOUBLE,
+                               MPI_SUM, g->comm));
+
+  PetscCall (MatGetLocalSize (s->Q, &nloc, NULL));
+  PetscCall (MatDenseGetLDA (s->Q, &ldq));
+  PetscCall (MatDenseGetLDA (Y, &ldy));
+  PetscCall (MatDenseGetArrayRead (s->Q, &qa));
+  PetscCall (MatDenseGetArray (Y, &ya));
+  if (nloc > 0) {
+    int                 bm = (int) nloc, bl = s->ell, bmm = (int) m;
+    int                 bldq = (int) ldq, bldy = (int) ldy;
+    double              one = 1.0, beta = add ? 1.0 : 0.0;
+    LGH_BLAS_DGEMM ("N", "N", &bm, &bmm, &bl, &one, qa, &bldq, cf, &bl,
+                    &beta, ya, &bldy);
+  }
+  PetscCall (MatDenseRestoreArray (Y, &ya));
+  PetscCall (MatDenseRestoreArrayRead (s->Q, &qa));
+  PetscCall (PetscFree2 (cl, cf));
+  return PETSC_SUCCESS;
+}
+
+/* Materialize the implicit U = Q V_kept as an explicit N x kept row slab
+ * (panel-wise: replicate an ell x bw coefficient panel from Vloc's owners,
+ * one allreduce + one GEMM per panel).  Used by the correction graft,
+ * which afterwards abandons the sketch representation entirely.          */
+static PetscErrorCode
+lgh_glrd_materialize_U (lgh_glr_t *g, Mat *Uout)
+{
+  struct lgh_glrd_state *s = g->dist;
+  const int           pb = PetscMax (g->opts.panel, 1);
+  Mat                 U;
+  const PetscScalar  *qa;
+  PetscScalar        *ua;
+  PetscInt            nloc, ldq, ldu;
+  double             *cl, *cf;
+  int                 p0, i, lj, k;
+
+  PetscCall (MatCreateDense (g->comm, g->nloc, PETSC_DECIDE, g->Nglob,
+                             PetscMax (g->kept, 1), NULL, &U));
+  PetscCall (PetscMalloc2 ((size_t) s->ell * pb, &cl,
+                           (size_t) s->ell * pb, &cf));
+  PetscCall (MatGetLocalSize (s->Q, &nloc, NULL));
+  PetscCall (MatDenseGetLDA (s->Q, &ldq));
+  PetscCall (MatDenseGetLDA (U, &ldu));
+  PetscCall (MatDenseGetArrayRead (s->Q, &qa));
+  PetscCall (MatDenseGetArray (U, &ua));
+  for (p0 = 0; p0 < g->kept; p0 += pb) {
+    const int           bw = PetscMin (pb, (int) g->kept - p0);
+
+    for (i = 0; i < s->ell * bw; i++) cl[i] = 0.;
+    for (lj = 0; lj < s->tl_cols; lj++) {
+      const int           gj = (lj / s->nb) * s->nb * s->pcol
+                                + s->mycol * s->nb + lj % s->nb;
+      if (gj >= s->ell || (k = s->kpos[gj]) < 0) continue;
+      if (k < p0 || k >= p0 + bw) continue;
+      for (i = 0; i < s->tl_rows; i++) {
+        const int           gi = (i / s->nb) * s->nb * s->prow
+                                  + s->myrow * s->nb + i % s->nb;
+        if (gi >= s->ell) continue;
+        cl[gi + (size_t) (k - p0) * s->ell] =
+            s->Vloc[i + (size_t) lj * s->tl_rows];
+      }
+    }
+    PetscCallMPI (MPI_Allreduce (cl, cf, s->ell * bw, MPI_DOUBLE, MPI_SUM,
+                                 g->comm));
+    if (nloc > 0) {
+      int                 bm = (int) nloc, bl = s->ell, bb = bw;
+      int                 bldq = (int) ldq, bldu = (int) ldu;
+      double              one = 1.0, zero = 0.0;
+      LGH_BLAS_DGEMM ("N", "N", &bm, &bb, &bl, &one, qa, &bldq, cf, &bl,
+                      &zero, ua + (size_t) p0 * ldu, &bldu);
+    }
+  }
+  PetscCall (MatDenseRestoreArray (U, &ua));
+  PetscCall (MatDenseRestoreArrayRead (s->Q, &qa));
+  PetscCall (PetscFree2 (cl, cf));
+  *Uout = U;
+  return PETSC_SUCCESS;
+}
+
 #endif /* LGPSF_HESSIAN_GLR_SCALAPACK_IMPL_H */
