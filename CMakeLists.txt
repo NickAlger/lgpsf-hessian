@@ -61,7 +61,9 @@ if(NOT lgpsf_FOUND AND LGH_FETCH_LGPSF)
   include(FetchContent)
   FetchContent_Declare(lgpsf
     GIT_REPOSITORY https://github.com/NickAlger/lgpsf.git
-    GIT_TAG        v0.1.0)
+    # pinned commit (lgpsf main as validated with this repo's test suite);
+    # move to a release tag when lgpsf cuts one
+    GIT_TAG        572c935258644ab2d5c980278932d5271bada745)
   set(LGPSF_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   set(LGPSF_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(lgpsf)
