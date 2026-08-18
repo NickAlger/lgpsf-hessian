@@ -29,6 +29,13 @@ gives you, in three stages:
    proposals), truncation-consistent log-determinants and matrix functions in
    prior-weighted coordinates.
 
+Optionally, between 2 and 3: **correct** — deflate the dominant modes of the
+approximation error against the *true* Hessian (`lgh_glr_correct_probes`
+reuses the fit's probe pairs for the error basis free of charge and spends a
+small budget of true Hessian applies pricing them exactly), grafting a signed
+low-rank correction into the same `(U, Λ)` so every downstream operation
+serves the better operator unchanged.
+
 Requires a diagonal (lumped) mass matrix. Dimension-generic (2D and 3D).
 
 ## Quickstart
@@ -50,6 +57,13 @@ lgh_glr_opts_t go = lgh_glr_opts_default();
 lgh_glr_t *glr;  lgh_glr_report_t grep;
 lgh_glr_compute(B, prior, &go, &glr, &grep);
 lgh_glr_extend(glr, 200, &grep);                  /* rank not converged? grow it */
+
+/* Stage 2.5 (optional) — deflate the remaining error against the TRUE
+ * Hessian, reusing the fit's probe pairs for the basis (free) plus a small
+ * budget of true applies for exact Rayleigh values */
+lgh_glr_correct_opts_t co = lgh_glr_correct_opts_default();
+co.c0 = c;  co.applies = 40;
+lgh_glr_correct_probes(glr, k, V, HV, my_misfit_hessian_apply, my_ctx, &co, &crep);
 
 /* Stage 3 — downstream with H(c) = B + c R */
 lgh_glr_solve (glr, c, rhs, x);                   /* x = H(c)^{-1} rhs           */

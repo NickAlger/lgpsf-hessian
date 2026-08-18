@@ -107,6 +107,36 @@ The spectrum falls from ~10⁶ through the `λ ≈ 1` crossover where data and
 prior curvature balance: a few hundred well-informed directions, then the
 prior takes over.
 
+## Stage 2.5 (optional) — deflation, and when it pays
+
+`-correct N` demonstrates `lgh_glr_correct_probes`: the probe pairs that fed
+the fit are recombined into a basis for the *remaining* error — free of
+charge — and `N` further true-Hessian applies price its dominant modes
+exactly, grafting a signed low-rank correction into the same $(U, \Lambda)$.
+
+Measured here (`-kmax 20 -correct 40`, same 60-apply total as the default):
+
+    fit k = 20: qcE = 0.150
+    correct: basis 15, 30 applies, kept 30 modes (clamped 0),
+             d in [-0.202, 0.450], floor 2.4e-02, whitened qc 0.0683 -> 0.0673
+    reconstruction range: [-0.13, 2.13]   (Morozov 6.3)
+
+Read the `d` window before celebrating: the whitened error has **no heavy
+tail** — its largest generalized eigenvalue is 0.45 and the rest is a flat
+~7% carpet across thousands of modes. A rank-30 correction removes 30 of
+them and the held-out QC barely moves; the replace-the-Hessian solve needs
+the *broadband* error small, so on this problem the extra 40 applies are
+better spent on more probes (`-kmax 60`: qcE 0.052, Morozov 2.3).
+
+That is the honest lesson, and it is the same one the method's originating
+study recorded: error *directions* are nearly free, error *values* are the
+binding constraint — and deflation pays exactly when the error spectrum has
+dominant outlier modes. In the originating ice-sheet inversion it does
+(a rank-50 value-pass correction cut preconditioned-CG iterations by
+2–3x); in this example's smooth-blur Hessian the lgpsf fit leaves no such
+outliers behind. Diagnose before you spend: if `report.d_min/d_max` hug
+zero, buy probes instead.
+
 ## Stage 3 — reconstruct and sample
 
 One call each:
@@ -144,6 +174,7 @@ from the same treated spectrum the sampler uses.
 | `-prior_len` | 0.25 | prior correlation length (domain height 1) |
 | `-prior_std` | 0.5 | target pointwise prior std (`-prior_b` overrides β) |
 | `-kmax` | 60 | probe pairs (the QC curve fits at 20, 40, …, kmax) |
+| `-correct` | 0 | deflation-correction apply budget (0 = off) |
 | `-ell` | 2200 | GLR sketch width |
 | `-trunc_abs` | 1e-2 | spectral truncation cut |
 | `-nstd` | 100 | draws for the std map |

@@ -26,6 +26,11 @@
  *   2. lgh_prior_create_mat(Z): the prior wrapped with the blocked
  *      Chebyshev tier; lgh_glr_compute: the GLR eigendecomposition of the
  *      prior-preconditioned Hd (spectrum written out for plotting).
+ *   2.5 (optional, -correct N): lgh_glr_correct_probes — deflate the
+ *      dominant fit-error modes against the TRUE Hd, reusing the SAME
+ *      probe pairs for the error basis (free) and spending N more true
+ *      applies pricing it.  Try -kmax 20 -correct 40: same total budget
+ *      as -kmax 60, spent smarter.
  *   3. s* = lgh_glr_solve(rhs) (the approximate-Hessian solve);
  *      posterior draws s* + lgh_glr_sample(xi); an empirical pointwise-
  *      sigma map from many draws; lgh_glr_logdet for flavor.
@@ -35,7 +40,8 @@
  *
  * Run:  ./heat_source_inversion            (or mpiexec -n 4 ...)
  * Key options: -height 128|256, -nobs 2000, -noise_rel 0.05,
- * -prior_len 0.25, -prior_b <strength>, -kmax 60, -ell 2200, -threads 4.
+ * -prior_len 0.25, -prior_b <strength>, -kmax 60, -correct 0, -ell 2200,
+ * -threads 4.
  */
 
 #include <lgpsf_hessian/lgpsf_hessian.h>
@@ -255,6 +261,9 @@ main (int argc, char **argv)
   PetscCall (PetscOptionsGetInt (NULL, NULL, "-height", &height, NULL));
   PetscCall (PetscOptionsGetInt (NULL, NULL, "-nobs", &nobs, NULL));
   PetscCall (PetscOptionsGetInt (NULL, NULL, "-kmax", &kmax, NULL));
+  PetscInt            correct_applies = 0;
+  PetscCall (PetscOptionsGetInt (NULL, NULL, "-correct", &correct_applies,
+                                 NULL));
   PetscCall (PetscOptionsGetInt (NULL, NULL, "-nqc", &nqc, NULL));
   PetscCall (PetscOptionsGetInt (NULL, NULL, "-nt", &nt, NULL));
   PetscCall (PetscOptionsGetInt (NULL, NULL, "-nsamples", &nsamples, NULL));
@@ -585,6 +594,31 @@ main (int argc, char **argv)
       "(t_op %.1fs, t_dense %.1fs)\n", grep.kept, (int) go.ell,
       grep.lam_abs_max, grep.next_abs, grep.n_negative_raw,
       grep.t_operator, grep.t_dense));
+
+  /* ---- stage 2.5 (optional): deflation correction ------------------ */
+  /* The error basis is recombined for free from the SAME probe pairs the
+   * fit consumed; -correct N spends N additional true Hessian applies
+   * pricing its top directions exactly.  The trailing nqc pairs stay held
+   * out, so qc_before/qc_after report the whitened energy ratio of the
+   * operator actually used downstream.                                  */
+  if (correct_applies > 0) {
+    lgh_glr_correct_opts_t co = lgh_glr_correct_opts_default ();
+    lgh_glr_correct_report_t crep;
+
+    co.c0 = 1.0;                /* the working shift of the solves below */
+    co.applies = (int) correct_applies;
+    co.n_qc = (int) nqc;
+    PetscCall ((PetscErrorCode) lgh_glr_correct_probes (glr, (int) kmax,
+                                                        V.data (),
+                                                        HV.data (),
+                                                        hd_apply, &hc, &co,
+                                                        &crep));
+    PetscCall (PetscPrintf (PETSC_COMM_WORLD,
+        "correct: basis %d, %d applies, kept %d modes (clamped %d), "
+        "d in [%.3f, %.3f], floor %.2e, whitened qc %.4f -> %.4f\n",
+        crep.basis, crep.hd_applies, crep.kept, crep.clamped, crep.d_min,
+        crep.d_max, crep.floor, crep.qc_before, crep.qc_after));
+  }
   PetscCall (PetscPrintf (PETSC_COMM_WORLD,
       "logdet piece sum log(1 + lam) = %.6e\n", lgh_glr_logdet (glr, 1.0)));
   if (rank == 0) {

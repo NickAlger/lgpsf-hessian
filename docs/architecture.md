@@ -46,11 +46,57 @@ With `F = M^{1/2} Z⁻¹ B Z⁻ᵀ M^{1/2} ≈ U Λ Uᵀ` (never formed) and
 | `(F + cI)^p w`, `p ∈ {−1, ±1/2, +1}` | `lgh_glr_pow` | prior-weighted |
 | `f(F + cI) w` (master formula) | `lgh_glr_filter` | prior-weighted |
 | read treated `Λ` | `lgh_glr_eigs` | — |
+| deflate `(H−H̃)v = d H̃ v`, graft into `(U, Λ)` | `lgh_glr_correct_probes` / `lgh_glr_correct` | — |
 
 **Frame discipline.** Full-space operations act where your parameter lives (they
 compose the outer `Z`, `M^{±1/2}` factors internally). Prior-weighted operations
 act in the whitened frame of `F`; that is where the log-determinant and matrix
 functions are well defined and mesh-independent.
+
+## Stage 2.5: the deflation correction
+
+The GLR object approximates the misfit Hessian twice over — lgpsf row-fit error
+plus sketch truncation. `lgh_glr_correct` measures the dominant modes of that
+error against the **true** Hessian and folds a low-rank correction into
+`(U, Λ)`, after which every operation in the table above serves the corrected
+operator unchanged. The mathematics, in the whitened frame:
+
+- the generalized error EVP `(H − H̃)v = d·H̃v` at a reference shift `c0`
+  becomes the ordinary symmetric problem for
+  `E_w = S⁻(F_true + c0 I)S⁻ − I` with `S^± = (UΛUᵀ + c0 I)^{±1/2}` — and
+  `S^±` is one filter apply, so none of the metric contortions of an
+  operator-blind implementation are needed;
+- the regularization **cancels** in `H − H̃`, so the stored correction
+  approximates the c-independent absolute error: one corrected build still
+  serves every shift, with the error *metric* (which modes count as dominant)
+  anchored at `c0`;
+- `eig(H̃⁻¹H) = 1 + d`: deflating the largest `|d|` is exactly the right
+  metric for a preconditioner.
+
+**Signs are information.** The correction's negative eigenvalues mean "the fit
+came out too big in that direction" and are never flipped (FLIP exists to fix
+fit artifacts at the stage where the operator is *supposed* to be SPD). Exact
+generalized eigenvalues satisfy `1 + d > 0` automatically; the clamp at
+`−1 + clamp_eps` guards only against estimation noise, so a nonzero
+`report.clamped` is a budget-too-small diagnostic. After the graft the combined
+spectrum may be signed: shift-taking operations require `c > report.floor`
+(`= max(0, −min λ')`, with `floor < c0` guaranteed) instead of `c > 0`.
+
+**Where the budget goes** (from the originating deflation study: error
+*directions* are nearly free, error *values* are the binding constraint):
+`lgh_glr_correct_probes` recombines the fit stage's probe pairs
+`(Ω, H_d Ω)` into the whitened error basis with **zero** new Hessian applies,
+then spends `opts.applies` true applies pricing the top directions exactly
+(one power step past the basis when budget remains). The measured allocation
+rule: fit to a moderate probe count, then spend the rest of the matvec budget
+here. `lgh_glr_correct` is the probe-free fallback (a fresh hashed sketch of
+`E_w`, ~2× the applies for the same rank).
+
+Order matters: `compute → extend (as needed) → correct` (last). After a
+correction the sketch no longer represents the operator, so `lgh_glr_extend`
+is refused, `lgh_glr_apply` switches from the exact sparse action to the
+corrected low-rank action, and ScaLAPACK-built objects materialize their
+implicit `U` (the object dispatches by representation from then on).
 
 ## Design rationale
 
