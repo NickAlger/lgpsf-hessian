@@ -45,7 +45,8 @@ PATTERNS = [
      "a file that only exists in the private research repo"),
 ]
 
-SKIP_SUFFIXES = {".png", ".pdf", ".pyc", ".so", ".o"}
+SKIP_SUFFIXES = {".png", ".pdf", ".pyc", ".so", ".o", ".jpeg", ".jpg",
+                 ".pgm", ".ppm"}
 
 # Public C headers must not pull in the heavyweight C++ stack.
 PUBLIC_HEADER_BANNED_INCLUDE = re.compile(

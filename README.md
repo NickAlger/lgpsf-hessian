@@ -54,8 +54,9 @@ See `include/lgpsf_hessian/{fit,prior,glr}.h` for the full API — the headers a
 reference documentation. Deeper reading in `docs/`: `architecture.md` (design
 rationale, math↔function table, integration guide), `glr-distributed-design.tex` /
 `glr-woodbury-formulas.tex` (the engine's design records), and `platform-notes.md`
-(operational gotchas). `examples/` will contain a complete heat-equation
-source-inversion example with scattered point observations.
+(operational gotchas). `examples/heat/` is a complete worked example — a
+heat-equation source inversion with scattered point observations, from probing
+through posterior sampling, with a walkthrough (`examples/heat/README.md`).
 
 ## Status
 
