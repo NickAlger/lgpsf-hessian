@@ -104,6 +104,9 @@ lgh_prior_mat_opts_default (void)
   o.blocked_mode = 0;
   o.tile = 64;
   o.cheb_rtol = 1e-10;
+  o.smax_krylov = 1;
+  o.smoother_top = 1.1;
+  o.nu_force = 0;
   o.verbose = 0;
   return o;
 }

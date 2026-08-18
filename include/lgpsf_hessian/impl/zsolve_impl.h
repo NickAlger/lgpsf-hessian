@@ -742,9 +742,8 @@ lgh_prior_setup_from_ksp (KSP ksp, Vec mass_lumps,
     PetscScalar        *ra;
 
     PetscCall (lgh_zs_blocked_setup (p->zs, o->blocked_mode, o->tile,
-                                     /* smax_krylov */ 1,
-                                     /* smoother_top */ 1.1,
-                                     /* nu_force */ 0));
+                                     o->smax_krylov, o->smoother_top,
+                                     o->nu_force));
     PetscCall (MatCreateVecs (Zop, &rhs, NULL));
     PetscCall (VecGetOwnershipRange (rhs, &rlo, &rhi));
     PetscCall (VecGetArray (rhs, &ra));

@@ -79,6 +79,11 @@ typedef struct lgh_prior_mat_opts
   int    blocked_mode; /* 0 (default) | 2 | 3, see above                 */
   int    tile;         /* block width for modes 2/3 (default 64)         */
   double cheb_rtol;    /* Chebyshev accuracy target (default 1e-10)      */
+  /* mode-3 hierarchy harvest tuning */
+  int    smax_krylov;  /* 1 (default): per-level smoother bound via
+                          CG-Lanczos; 0: power iteration                 */
+  double smoother_top; /* smoothing-interval top factor (default 1.1)    */
+  int    nu_force;     /* force smoother degree (0 = take the level's)   */
   int    verbose;
 }
 lgh_prior_mat_opts_t;
