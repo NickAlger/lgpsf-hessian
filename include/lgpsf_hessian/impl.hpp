@@ -14,6 +14,11 @@
 #ifndef LGPSF_HESSIAN_IMPL_HPP
 #define LGPSF_HESSIAN_IMPL_HPP
 
+/* The full public API first, in canonical order: every definition below
+ * must see its extern "C" declaration (notably the lgh_fit_get_mat seam,
+ * whose declaration in glr.h activates only after fit.h). */
+#include "lgpsf_hessian/lgpsf_hessian.h"
+
 #include "lgpsf_hessian/impl/glr_common_impl.h"
 #ifdef LGH_WITH_SCALAPACK
 #include "lgpsf_hessian/impl/glr_scalapack_impl.h"
