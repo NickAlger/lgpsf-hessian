@@ -67,6 +67,21 @@ for i in range(16):
         show_field(f"sample_{i}", f"posterior draw {i}")
 show_field("std", "pointwise posterior std (own scale)", cmap="magma")
 
+# --- hero: truth + observations beside the reconstruction ---------------
+recon = read_pgm(out / "recon.pgm")
+fig, (axl, axr) = plt.subplots(1, 2, figsize=(12, 6 * H / W), dpi=140)
+axl.imshow(photo, cmap="gray", extent=[0, Lx, 0, 1], origin="upper")
+axl.scatter(obs[:, 0], obs[:, 1], s=3, c="red", marker="o", linewidths=0,
+            alpha=0.8)
+axl.set_title(f"true source, observed at {len(obs)} scattered points")
+axr.imshow(recon, cmap="gray", vmin=0, vmax=1, interpolation="bicubic")
+axr.set_title("reconstruction from the fitted LGPSF–GLR Hessian")
+for ax in (axl, axr):
+    ax.set_xticks([]); ax.set_yticks([])
+fig.tight_layout()
+fig.savefig(out / "fig_hero.png")
+plt.close(fig)
+
 # --- spectrum ------------------------------------------------------------
 eigs = np.loadtxt(out / "eigs.txt")
 fig, ax = plt.subplots(figsize=(6, 4), dpi=140)

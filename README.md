@@ -4,6 +4,13 @@ Distributed-memory approximation of operators with local point-spread structure 
 "Hessians" — using Laguerre-Gaussian point spread function (LG-PSF) row fits and a
 prior-preconditioned global low rank (GLR) eigendecomposition, on a PETSc backend.
 
+![heat-equation source inversion from scattered observations](examples/heat/figures/fig_hero.png)
+
+*From the worked example (`examples/heat/`): a source observed through the heat
+equation at 2000 scattered points, and its Bayesian reconstruction computed
+entirely through the fitted LGPSF–GLR Hessian — 60 true Hessian applies for the
+whole posterior, sampling included.*
+
 The intended user has a **misfit Hessian** available only through matvecs (each one a
 forward + adjoint PDE solve), a **lumped mass matrix**, and a **prior / regularization**
 with the standard square-root structure `R = Z M⁻¹ Z` (bilaplacian-like). The library

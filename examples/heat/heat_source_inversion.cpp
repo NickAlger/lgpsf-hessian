@@ -3,25 +3,25 @@
  *
  * Problem.  A source s on a rectangular domain (regular grid, 5-point
  * finite differences, lumped mass M = h^2 I) diffuses to time T:
- * u(T) = F s with F = ((M + dt kappa K)^{-1} M)^{nt} (implicit Euler; K =
- * the 5-point stiffness).  Noisy point observations y = B F s + noise,
+ * u(T) = L s with L = ((M + dt kappa K)^{-1} M)^{nt} (implicit Euler; K =
+ * the 5-point stiffness).  Noisy point observations y = B L s + noise,
  * B = evaluation at n_obs scattered locations drawn from a Gaussian
  * centered in the right half of the domain (dense there, sparse on the
  * left).  With prior precision R = Z M^{-1} Z, Z = a K + b M (a shifted
  * Laplacian; correlation length ~ sqrt(a/b)), the deterministic problem is
  *
- *     min_s 0.5 |y - B F s|^2 / sigma^2 + 0.5 s^T R s ,
+ *     min_s 0.5 |y - B L s|^2 / sigma^2 + 0.5 s^T R s ,
  *
- * whose Hessian is H = Hd + R with Hd = F^T B^T B F / sigma^2 — an
+ * whose Hessian is H = Hd + R with Hd = L^T B^T B L / sigma^2 — an
  * operator with local point-spread structure (each row is a blurred
  * splat of the observation pattern near that node).  The Laplace
  * posterior is N(s*, H^{-1}).
  *
  * Pipeline (all three lgpsf-hessian stages):
- *   1. lgh_fit_probes: fit the sparse B_lg ~= Hd from hashed probe pairs,
+ *   1. lgh_fit_probes: fit the sparse Hd_lg ~= Hd from hashed probe pairs,
  *      recording the energy-QC as the probe count grows (the QC-vs-k
  *      curve), with a-priori isotropic ellipsoids from the physics
- *      (ell = 2 sqrt(2 kappa T), the 2-sigma width of F delta; the x5
+ *      (ell = 2 sqrt(2 kappa T), the 2-sigma width of L delta; the x5
  *      support margin is lgpsf's window).
  *   2. lgh_prior_create_mat(Z): the prior wrapped with the blocked
  *      Chebyshev tier; lgh_glr_compute: the GLR eigendecomposition of the
@@ -68,9 +68,9 @@ typedef struct
 }
 heat_ctx_t;
 
-/* u <- F u : nt implicit Euler steps (rhs = M u_n) */
+/* u <- L u : nt implicit Euler steps (rhs = M u_n) */
 static PetscErrorCode
-heat_F (heat_ctx_t *hc, Vec u)
+heat_L (heat_ctx_t *hc, Vec u)
 {
   for (int t = 0; t < hc->nt; t++) {
     PetscCall (VecCopy (u, hc->utmp));
@@ -120,21 +120,21 @@ heat_Bt (heat_ctx_t *hc, const double *r, Vec u)
   return PETSC_SUCCESS;
 }
 
-/* rhs <- F^T B^T (r / sigma^2): the adjoint chain.  With scalar lumped
- * mass the Euclidean transpose of F equals F, so the same solve chain
+/* rhs <- L^T B^T (r / sigma^2): the adjoint chain.  With scalar lumped
+ * mass the Euclidean transpose of L equals L, so the same solve chain
  * serves forward and adjoint. */
 static PetscErrorCode
-heat_FtBt (heat_ctx_t *hc, const double *r, Vec out)
+heat_LtBt (heat_ctx_t *hc, const double *r, Vec out)
 {
   std::vector<double> rs ((size_t) hc->n_obs);
 
   for (int k = 0; k < hc->n_obs; k++) rs[(size_t) k] = r[k] * hc->inv_sigma2;
   PetscCall (heat_Bt (hc, rs.data (), out));
-  PetscCall (heat_F (hc, out));
+  PetscCall (heat_L (hc, out));
   return PETSC_SUCCESS;
 }
 
-/* the misfit-Hessian matvec for lgh_fit: out = F^T B^T B F in / sigma^2 */
+/* the misfit-Hessian matvec for lgh_fit: out = L^T B^T B L in / sigma^2 */
 static void
 hd_apply (const double *in_local, double *out_local, void *vctx)
 {
@@ -153,9 +153,9 @@ hd_apply (const double *in_local, double *out_local, void *vctx)
   ierr = VecRestoreArray (u, &a);
   CHKERRABORT (PETSC_COMM_WORLD, ierr);
 
-  ierr = heat_F (hc, u);              CHKERRABORT (PETSC_COMM_WORLD, ierr);
+  ierr = heat_L (hc, u);              CHKERRABORT (PETSC_COMM_WORLD, ierr);
   ierr = heat_B (hc, u, r.data ());   CHKERRABORT (PETSC_COMM_WORLD, ierr);
-  ierr = heat_FtBt (hc, r.data (), u); CHKERRABORT (PETSC_COMM_WORLD, ierr);
+  ierr = heat_LtBt (hc, r.data (), u); CHKERRABORT (PETSC_COMM_WORLD, ierr);
 
   ierr = VecGetArray (u, &a);
   CHKERRABORT (PETSC_COMM_WORLD, ierr);
@@ -288,7 +288,7 @@ main (int argc, char **argv)
    * PIXELS is resolution-independent, so this choice fixes the per-row
    * fit cost at every -height) while the PSF still spans several
    * observation spacings on the dense side.  The a-priori ellipsoid is
-   * the 2-sigma width of F delta: ell = 2 sqrt(2 kappa T); the support
+   * the 2-sigma width of L delta: ell = 2 sqrt(2 kappa T); the support
    * margin is lgpsf's window (tau_window). */
   const double        sigma_heat = 1.5 * h;
   const double        ell_lg = 2.0 * sqrt (2.0) * sigma_heat;
@@ -395,7 +395,7 @@ main (int argc, char **argv)
 
   std::vector<double> y_clean ((size_t) nobs), y ((size_t) nobs);
   PetscCall (VecCopy (s_true, work));
-  PetscCall (heat_F (&hc, work));
+  PetscCall (heat_L (&hc, work));
   PetscCall (heat_B (&hc, work, y_clean.data ()));
   double              ymean = 0., yvar = 0., sigma_noise;
   for (int k = 0; k < nobs; k++) ymean += y_clean[(size_t) k];
@@ -494,8 +494,8 @@ main (int argc, char **argv)
   }
   if (rank == 0) fclose (fqc);
 
-  Mat                 Blg;
-  PetscCall (lgh_fit_get_mat (fit, &Blg));
+  Mat                 Hd_lg;
+  PetscCall (lgh_fit_get_mat (fit, &Hd_lg));
 
   /* ---- stage 2: prior + GLR --------------------------------------- */
   /* Z = beta (len^2 K + M): correlation length len, overall strength
@@ -578,7 +578,7 @@ main (int argc, char **argv)
                                         scale this up */
   lgh_glr_t          *glr;
   lgh_glr_report_t    grep;
-  PetscCall ((PetscErrorCode) lgh_glr_compute (Blg, prior, &go, &glr,
+  PetscCall ((PetscErrorCode) lgh_glr_compute (Hd_lg, prior, &go, &glr,
                                                &grep));
   PetscCall (PetscPrintf (PETSC_COMM_WORLD,
       "GLR: kept %d / ell %d, |lam|max %.3e, next %.3e, negatives %d "
@@ -602,7 +602,7 @@ main (int argc, char **argv)
   Vec                 rhs, srec, xi, samp, smean, svar;
   PetscCall (DMCreateGlobalVector (da, &rhs));
   PetscCall (DMCreateGlobalVector (da, &srec));
-  PetscCall (heat_FtBt (&hc, y.data (), rhs));
+  PetscCall (heat_LtBt (&hc, y.data (), rhs));
   PetscCall ((PetscErrorCode) lgh_glr_solve (glr, 1.0, rhs, srec));
   {
     PetscReal           smin, smax2;
@@ -618,7 +618,7 @@ main (int argc, char **argv)
     std::vector<double> yr ((size_t) nobs);
     double              m2 = 0.;
     PetscCall (VecCopy (srec, work));
-    PetscCall (heat_F (&hc, work));
+    PetscCall (heat_L (&hc, work));
     PetscCall (heat_B (&hc, work, yr.data ()));
     for (int k = 0; k < nobs; k++) {
       const double        dv = yr[(size_t) k] - y[(size_t) k];

@@ -23,10 +23,12 @@ A source field `s` on a rectangular domain diffuses for a short time `T`
 under the heat equation; we observe the diffused field at `n_obs = 2000`
 scattered points and add i.i.d. Gaussian noise:
 
-$$u(T) = F s, \qquad y = B\,F s + \eta, \qquad \eta \sim N(0, \sigma^2 I).$$
+$$u(T) = L s, \qquad y = B\,L s + \eta, \qquad \eta \sim N(0, \sigma^2 I).$$
 
-`F` is the heat propagator (implicit Euler with the 5-point stiffness `K`
-and lumped mass `M = h^2 I`), and `B` samples the solution at the
+`L` is the heat solution map (implicit Euler with the 5-point stiffness `K`
+and lumped mass `M = h^2 I` — `L`, not `F`, because `F` is reserved below
+for the whitened prior-preconditioned Hessian, the library's convention),
+and `B` samples the solution at the
 observation points. The observation locations are drawn from a Gaussian
 centered in the right half of the domain — dense on the right, sparse on
 the left — which is the experiment: *the posterior should know much more
@@ -42,9 +44,9 @@ $R = Z M^{-1} Z$, $Z = a K + b M$ (correlation length
 $\sqrt{a/b}$ = `-prior_len`, overall strength calibrated so the pointwise
 prior std hits `-prior_std`), the deterministic problem and its Hessian are
 
-$$\min_s \tfrac{1}{2\sigma^2}\lVert y - BFs\rVert^2 + \tfrac12 s^T R s,
+$$\min_s \tfrac{1}{2\sigma^2}\lVert y - BLs\rVert^2 + \tfrac12 s^T R s,
 \qquad
-H = H_d + R, \quad H_d = \tfrac{1}{\sigma^2} F^T B^T B F,$$
+H = H_d + R, \quad H_d = \tfrac{1}{\sigma^2} L^T B^T B L,$$
 
 and the Laplace posterior is $N(s^*, H^{-1})$.
 
@@ -62,16 +64,16 @@ spend them on random probes and fit every row once:
 lgh_fit_t *fit = lgh_fit_create(comm, 2, nloc, gid0, coords, mass, threads);
 lgh_sigma_isotropic(2, nloc, ell_field, sigma);   /* ell = 2 sqrt(2 kappa T) */
 lgh_fit_probes(fit, k, V, HV, sigma, &opts, &report);
-Mat B_lg;  lgh_fit_get_mat(fit, &B_lg);           /* symmetric MPIAIJ */
+Mat Hd_lg;  lgh_fit_get_mat(fit, &Hd_lg);         /* symmetric MPIAIJ */
 ```
 
 The a-priori ellipsoids come straight from the physics: the impulse
-response `F δ` is a Gaussian of width $\sigma_\text{heat} = \sqrt{2\kappa T}$,
+response `L δ` is a Gaussian of width $\sigma_\text{heat} = \sqrt{2\kappa T}$,
 so `ell = 2 σ_heat` — the ×5 support margin is lgpsf's window
 (`tau_window`), not the ellipsoid.
 
 The one number that matters is the held-out **energy QC**,
-$\sqrt{\sum\lVert B_{lg} z - H_d z\rVert^2 / \sum\lVert H_d z\rVert^2}$
+$\sqrt{\sum\lVert \widetilde{H}_d z - H_d z\rVert^2 / \sum\lVert H_d z\rVert^2}$
 over whitened probes — an estimate of the relative Frobenius error. The
 example fits at increasing `k` from one precomputed probe set:
 
@@ -79,7 +81,8 @@ example fits at increasing `k` from one precomputed probe set:
 
 A lesson this example teaches the hard way (reproduce it with
 `-kmax 20`): at `qcE ≈ 0.23` the *replace-the-Hessian* strategy below
-produces garbage — the fit-error tail of `B_lg` carries spurious curvature
+produces garbage — the fit-error tail of the fitted operator $\widetilde{H}_d$
+carries spurious curvature
 that the solve happily inverts. At `qcE ≈ 0.07` everything snaps into
 place. If you use the approximation as the operator (rather than as a
 preconditioner), drive the QC down first.
@@ -88,11 +91,12 @@ preconditioner), drive the QC down first.
 
 ```c
 lgh_prior_t *prior;  lgh_prior_create_mat(Z, mass_vec, &popts, &prior);
-lgh_glr_t *glr;      lgh_glr_compute(B_lg, prior, &gopts, &glr, &grep);
+lgh_glr_t *glr;      lgh_glr_compute(Hd_lg, prior, &gopts, &glr, &grep);
 ```
 
-The engine sweeps only the *fitted sparse* operator — no more heat solves —
-and eigendecomposes $F_w = M^{1/2}Z^{-1} B_{lg} Z^{-1} M^{1/2}$ with a
+The engine sweeps only the *fitted sparse* operator $\widetilde{H}_d$
+(the library API calls it generically `B`) — no more heat solves — and
+eigendecomposes $F = M^{1/2}Z^{-1} \widetilde{H}_d Z^{-1} M^{1/2}$ with a
 hashed, partition-independent sketch (`ell = 2200` over 2000 observations;
 `report.next_abs` under the truncation cut is the evidence the rank
 converged — `lgh_glr_extend` grows the sketch if it is not).
@@ -108,7 +112,7 @@ prior takes over.
 One call each:
 
 ```c
-lgh_glr_solve (glr, 1.0, rhs, s_star);   /* rhs = F^T B^T y / sigma^2  */
+lgh_glr_solve (glr, 1.0, rhs, s_star);   /* rhs = L^T B^T y / sigma^2  */
 lgh_glr_sample(glr, 1.0, xi, d);         /* draw: s_star + d ~ N(s*, H^{-1}) */
 ```
 
