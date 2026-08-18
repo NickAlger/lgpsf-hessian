@@ -31,6 +31,16 @@ jobs:
           PKG_CONFIG_PATH=$(dirname $(find /usr/lib -name "PETSc.pc" | head -1)) \
           cmake -B build -DCMAKE_BUILD_TYPE=Release -DLGH_FETCH_LGPSF=ON
       - name: build (-j 2 — Eigen-heavy TUs, see docs/platform-notes.md)
-        run: cmake --build build -j 2
+        run: |
+          cmake --build build -j 2 2>&1 | tee build.log
+          exit ${PIPESTATUS[0]}
+      # Annotations are visible through the public checks API; the raw step
+      # log is not.  Surface the failure so it can be diagnosed remotely.
+      - name: surface build errors as annotations
+        if: failure()
+        run: |
+          grep -n -i -m 4 -E "error|killed|no such file" build.log | \
+            while IFS= read -r l; do echo "::error::${l}"; done
+          tail -6 build.log | while IFS= read -r l; do echo "::error::tail: ${l}"; done
       - name: test
         run: ctest --test-dir build --output-on-failure
