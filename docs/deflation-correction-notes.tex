@@ -92,7 +92,11 @@ E Q_m = S^-\bigl((F_{\mathrm{true}} + c_0 I)(S^- Q_m)\bigr) - Q_m
 $T = V_s D V_s^T$, $V = Q_m V_s$.  If budget remains beyond the basis
 dimension, one power step: orthogonalize $E Q_m$ against $Q_m$, take the
 energy basis of the remainder, price it with the remaining applies, and
-assemble $T$ on the combined block.
+assemble $T$ on the combined block.  Kept modes are $|d|$-descending,
+clamped (\S1), and truncated at \texttt{d\_keep\_min}: values priced below
+the estimation-noise level add noise rather than information, and if no
+mode clears the threshold the object is left uncorrected (the report still
+carries the observed $d$ window).
 
 \section*{4. Fresh sketch (\texttt{lgh\_glr\_correct})}
 

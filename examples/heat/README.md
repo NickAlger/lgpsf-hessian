@@ -114,28 +114,41 @@ the fit are recombined into a basis for the *remaining* error — free of
 charge — and `N` further true-Hessian applies price its dominant modes
 exactly, grafting a signed low-rank correction into the same $(U, \Lambda)$.
 
-Measured here (`-kmax 20 -correct 40`, same 60-apply total as the default):
+Measured equal-budget ladder (probes vs probes-plus-correction at the same
+total count of true Hessian applies):
 
-    fit k = 20: qcE = 0.150
-    correct: basis 15, 30 applies, kept 30 modes (clamped 0),
-             d in [-0.202, 0.450], floor 2.4e-02, whitened qc 0.0683 -> 0.0673
-    reconstruction range: [-0.13, 2.13]   (Morozov 6.3)
+| applies | config | fit qcE | correction `d` window | held-out whitened QC | Morozov |
+|---|---|---|---|---|---|
+| 60 | fit k=60 | 0.052 | — | — | 2.3 |
+| 60 | k=20 + correct 40 | 0.150 | [−0.202, 0.450] | 0.068 → 0.067 | 6.3 |
+| 100 | fit k=100 | 0.049 | — | — | 2.17 |
+| 100 | k=60 + correct 40 | 0.052 | [−0.027, 0.014] | 0.045 → 0.045 | 2.34 |
+| 140 | fit k=140 | 0.045 | — | — | 2.13 |
+| 140 | k=100 + correct 40 | 0.049 | [−0.027, 0.020] | 0.026 → 0.028 | 2.17 |
 
-Read the `d` window before celebrating: the whitened error has **no heavy
-tail** — its largest generalized eigenvalue is 0.45 and the rest is a flat
-~7% carpet across thousands of modes. A rank-30 correction removes 30 of
-them and the held-out QC barely moves; the replace-the-Hessian solve needs
-the *broadband* error small, so on this problem the extra 40 applies are
-better spent on more probes (`-kmax 60`: qcE 0.052, Morozov 2.3).
+Read the `d` window before celebrating: on this problem the whitened error
+has **no heavy tail at any budget** — its largest generalized eigenvalue
+collapses from 0.45 at k=20 to ~0.02 at k≥60, leaving a flat few-percent
+carpet across thousands of modes. A rank-tens correction removes a
+vanishing fraction of that carpet, the replace-the-Hessian solve needs the
+*broadband* error small, and probes win at every budget level. Note the
+140-apply row: the held-out QC got slightly **worse** after correction —
+Rayleigh values of ±0.02 are at the estimation-noise level, and grafting
+modes priced from noise injects noise ("interpolation, not estimation").
+`opts.d_keep_min` exists for exactly this: set it above the noise level and
+sub-threshold modes are dropped (if nothing clears it, the object is left
+uncorrected — and the report still shows you the observed window, so a
+correction attempt doubles as a cheap audit of the fit).
 
 That is the honest lesson, and it is the same one the method's originating
 study recorded: error *directions* are nearly free, error *values* are the
 binding constraint — and deflation pays exactly when the error spectrum has
 dominant outlier modes. In the originating ice-sheet inversion it does
-(a rank-50 value-pass correction cut preconditioned-CG iterations by
-2–3x); in this example's smooth-blur Hessian the lgpsf fit leaves no such
-outliers behind. Diagnose before you spend: if `report.d_min/d_max` hug
-zero, buy probes instead.
+(the certified extremes stayed ~3 even at k=200, and a rank-50 value-pass
+correction cut preconditioned-CG iterations by 2–3x); in this example's
+smooth-blur Hessian the lgpsf fit leaves no such outliers behind at any k.
+Diagnose before you spend: if `report.d_min/d_max` hug zero, buy probes
+instead.
 
 ## Stage 3 — reconstruct and sample
 

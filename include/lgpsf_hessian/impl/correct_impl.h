@@ -51,6 +51,7 @@ lgh_glr_correct_opts_default (void)
   o.n_qc = 0;
   o.q_power = 0;
   o.clamp_eps = 0.05;
+  o.d_keep_min = 0.;
   o.drop_tol = 1e-12;
   o.seed = 424242UL;
   o.verbose = 0;
@@ -521,6 +522,23 @@ lgh_correct_price_and_graft (lgh_glr_t *g,
         const int           t = order[i]; order[i] = order[j]; order[j] = t;
       }
   rkeep = (opts->rank < 0) ? (int) r : PetscMin ((int) r, opts->rank);
+  /* |d|-descending order: dropping the sub-threshold tail is a truncation.
+   * Rayleigh values at the estimation-noise level add noise, not
+   * information (see the deflation study; measured on the heat example). */
+  while (rkeep > 0 && fabs (ev[order[rkeep - 1]]) < opts->d_keep_min)
+    rkeep--;
+  if (rkeep == 0) {
+    /* nothing clears the threshold: leave the object UNCORRECTED (still
+     * extendable/correctable); report what was seen.                     */
+    rep->kept = 0;
+    rep->clamped = 0;
+    rep->d_min = (r > 0) ? ev[0] : 0.;       /* dsyevd ascending */
+    rep->d_max = (r > 0) ? ev[r - 1] : 0.;
+    rep->floor = 0.;
+    PetscCall (PetscFree (order));
+    PetscCall (PetscFree2 (S, ev));
+    return PETSC_SUCCESS;
+  }
 
   PetscCall (PetscMalloc2 (PetscMax (rkeep, 1), &dsel,
                            (size_t) r * PetscMax (rkeep, 1), &Csel));

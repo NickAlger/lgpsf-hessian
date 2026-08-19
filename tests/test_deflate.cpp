@@ -553,6 +553,55 @@ run_clamp (lgh_glr_backend_t backend)
   return PETSC_SUCCESS;
 }
 
+/* Scenario C: d_keep_min drops everything -> object left uncorrected ---- */
+
+static PetscErrorCode
+run_threshold (lgh_glr_backend_t backend)
+{
+  const double        err_scale = 1.0;
+  setup_t             S;
+  lgh_glr_t          *glr;
+  lgh_glr_correct_opts_t co = lgh_glr_correct_opts_default ();
+  lgh_glr_correct_report_t crep;
+  const int           k = 30;
+  double             *V, *HV;
+  int                 nk;
+  const double       *lam;
+
+  PetscCall (setup_problem (&S, err_scale));
+  PetscCall (build_glr (&S, backend, &glr));
+
+  V = (double *) malloc (sizeof (double) * (size_t) S.hctx.nloc * k + 8);
+  HV = (double *) malloc (sizeof (double) * (size_t) S.hctx.nloc * k + 8);
+  fill_probes (&S, k, err_scale, V, HV);
+
+  co.c0 = 1.0;
+  co.applies = 8;
+  co.d_keep_min = 10.0;   /* nothing clears this */
+  PetscCall ((PetscErrorCode) lgh_glr_correct_probes (glr, k, V, HV,
+                                                      hd_apply, &S.hctx,
+                                                      &co, &crep));
+  check (crep.kept == 0, "thresh: nothing grafted", (double) crep.kept);
+  check (crep.d_max != 0., "thresh: observed window still reported",
+         crep.d_max);
+  (void) lgh_glr_eigs (glr, &nk, &lam);
+  check (nk == RANK_B, "thresh: object untouched", (double) nk);
+  /* still extendable: the no-op correction did not consume the sketch */
+  PetscCall (lgh_glr_extend (glr, 5, NULL));
+  /* and still correctable: a real correction goes through afterwards */
+  co.d_keep_min = 0.;
+  PetscCall ((PetscErrorCode) lgh_glr_correct_probes (glr, k, V, HV,
+                                                      hd_apply, &S.hctx,
+                                                      &co, &crep));
+  check (crep.kept > 0, "thresh: later real correction works",
+         (double) crep.kept);
+
+  free (V); free (HV);
+  lgh_glr_destroy (glr);
+  PetscCall (teardown_problem (&S));
+  return PETSC_SUCCESS;
+}
+
 int
 main (int argc, char **argv)
 {
@@ -560,10 +609,12 @@ main (int argc, char **argv)
   PetscCall (run_valuepass (LGH_GLR_REPLICATED));
   PetscCall (run_fresh (LGH_GLR_REPLICATED));
   PetscCall (run_clamp (LGH_GLR_REPLICATED));
+  PetscCall (run_threshold (LGH_GLR_REPLICATED));
 #ifdef LGH_WITH_SCALAPACK
   PetscCall (run_valuepass (LGH_GLR_SCALAPACK));
   PetscCall (run_fresh (LGH_GLR_SCALAPACK));
   PetscCall (run_clamp (LGH_GLR_SCALAPACK));
+  PetscCall (run_threshold (LGH_GLR_SCALAPACK));
 #endif
   if (n_fail == 0)
     PetscCall (PetscPrintf (PETSC_COMM_WORLD, "PASS test_deflate\n"));

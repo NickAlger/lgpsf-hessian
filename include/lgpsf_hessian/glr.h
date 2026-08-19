@@ -210,6 +210,14 @@ typedef struct lgh_glr_correct_opts
                               qc_after report fields (default 0)          */
   int           q_power;   /* fresh path: extra power passes (default 0)  */
   double        clamp_eps; /* d clamped to >= -1 + clamp_eps (default .05)*/
+  double        d_keep_min;/* drop priced modes with |d| below this
+                              (default 0 = keep all).  Rayleigh values at
+                              the estimation-noise level add noise rather
+                              than information; when report->d_min/d_max
+                              hug zero there is nothing worth deflating.
+                              If NO priced mode clears the threshold the
+                              object is left UNCORRECTED (kept = 0; still
+                              extendable/correctable).                    */
   double        drop_tol;  /* relative basis drop tolerance (default 1e-12)*/
   unsigned long seed;      /* fresh-path hashed sketch seed               */
   int           verbose;
