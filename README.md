@@ -32,7 +32,7 @@ The library gives you, in three stages:
 2. **GLR** — randomized eigendecomposition of the prior-preconditioned misfit Hessian approximation
    `F = M^{1/2} Z⁻¹ B Z⁻¹ M^{1/2} ≈ U Λ Uᵀ` (never formed), with a deterministic
    partition-independent sketch and first-class incremental rank growth.
-3. **Downstream** — operations with `H(c) = B + c R`, one build serving every shift `c`:
+3. **Downstream** — operations with `H(c) = B + c Hr`, one build serving every shift `c`:
    solves (Newton-CG preconditioning), sampling with covariance `H(c)⁻¹` (MCMC
    proposals), truncation-consistent log-determinants and matrix functions in
    prior-weighted coordinates.
