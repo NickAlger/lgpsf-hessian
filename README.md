@@ -1,8 +1,6 @@
 # lgpsf-hessian
 
-Distributed-memory approximation of operators with local point-spread structure —
-"Hessians" — using Laguerre-Gaussian point spread function (LG-PSF) row fits and a
-prior-preconditioned global low rank (GLR) eigendecomposition, on a PETSc backend.
+Distributed-memory approximation of Hessians (or similar operators) with local point-spread structure using Laguerre-Gaussian point spread function (LG-PSF) row fits and a prior-preconditioned global low rank (GLR) eigendecomposition, on a PETSc backend.
 
 ![heat-equation source inversion from scattered observations](examples/heat/figures/fig_hero.png)
 
@@ -11,17 +9,27 @@ equation at 2000 scattered points, and its Bayesian reconstruction computed
 entirely through the fitted LGPSF–GLR Hessian — 60 true Hessian applies for the
 whole posterior, sampling included.*
 
-The intended user has a **misfit Hessian** available only through matvecs (each one a
-forward + adjoint PDE solve), a **lumped mass matrix**, and a **prior / regularization**
-with the standard square-root structure `R = Z M⁻¹ Z` (bilaplacian-like). The library
-gives you, in three stages:
+The intended user has a **Hessian**
 
-1. **Fit** — probe the Hessian with random vectors and fit every row with an LG-PSF
+`H = Hd + c Hr`
+
+which consists of a **misfit Hessian** `Hd` which is available only through matvecs (each one a
+forward + adjoint PDE solve), a **prior / regularization Hessian**
+
+`Hr = Z M⁻¹ Z`
+
+which consists of a diagonal **lumped mass matrix**, `M`, and differential operator `Z`. 
+For example if `Z` is a shifted Laplacian, then `Hr` is a bi-Laplacian, corresponding to an
+inverse problem with a prior in the Matern class. The scalar `c` is a regularization or prior variance parameter.
+
+The library gives you, in three stages:
+
+1. **Fit** — probe the misfit Hessian with random vectors and fit every row with an LG-PSF
    (via the [lgpsf](https://github.com/NickAlger/lgpsf) library), assembling a sparse
-   approximation `B ≈ H_misfit`. Accuracy is one knob: probes are added until a held-out
+   approximation `B ≈ Hd`. Accuracy is one knob: probes are added until a held-out
    energy-ratio QC (≈ relative Frobenius error in mass-whitened variables) meets your
    target.
-2. **GLR** — randomized eigendecomposition of the prior-preconditioned approximation
+2. **GLR** — randomized eigendecomposition of the prior-preconditioned misfit Hessian approximation
    `F = M^{1/2} Z⁻¹ B Z⁻¹ M^{1/2} ≈ U Λ Uᵀ` (never formed), with a deterministic
    partition-independent sketch and first-class incremental rank growth.
 3. **Downstream** — operations with `H(c) = B + c R`, one build serving every shift `c`:
