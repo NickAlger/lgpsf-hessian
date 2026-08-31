@@ -527,6 +527,7 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
           fit.col_gids[(size_t) it.col ()], it.value ()});
     }
   }
+  const auto          t_presym = Clock::now ();
   switch (o.wsym)
   {
   case LGH_WSYM_WEIGHTED:
@@ -571,6 +572,8 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
     break;
   }
   rep->t_fit += std::chrono::duration<double> (Clock::now () - t1).count ();
+  rep->t_fit_symmetrize +=
+      std::chrono::duration<double> (Clock::now () - t_presym).count ();
   rep->ladder_rungs++;
 
   /* Guard: a globally EMPTY fit (every row dead) means the probe pool is
