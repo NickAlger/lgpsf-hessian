@@ -122,12 +122,27 @@ typedef struct lgh_fit_report
   double t_fit_symmetrize; /* seconds, ALSO included in t_fit above: just
                                the dist_weighted_symmetrize (or REFERENCE/
                                NONE-path equivalent) portion, summed across
-                               ladder rungs like t_fit. Added 2026-08-30 to
-                               separate the communication-bound symmetrize
-                               step from the per-row fit itself -- see
-                               ice_hessian/tacc_stampede3 scaling results in
-                               the private companion research repo:
-                               per-row fit time = t_fit - t_fit_symmetrize */
+                               ladder rungs like t_fit. Added 2026-08-30.
+                               Since 2026-09-03 an MPI_Barrier precedes this
+                               timer, so it measures the symmetrize itself and
+                               not the wait for the slowest rank's fit (see
+                               t_fit_rank_* below); t_fit therefore = own fit
+                               + wait + symmetrize, i.e. the slowest rank's
+                               fit + symmetrize on every rank */
+  double t_fit_rank_max;   /* seconds: the per-rank wall of the per-row fit
+                              alone (dist_fit + triplet conversion, BEFORE the
+                              symmetrize's first collective), allreduced across
+                              ranks: max / min / mean, summed across ladder
+                              rungs.  Added 2026-09-03: t_fit_symmetrize had
+                              been absorbing the wait for the slowest rank's
+                              fit (its first statement is an allgather), so
+                              the fit's load imbalance showed up as
+                              "symmetrize time" (55 s at 192 ranks).  Now a
+                              barrier precedes the symmetrize timer and the
+                              imbalance is reported here: max/mean is the
+                              number to watch (1 = balanced). */
+  double t_fit_rank_min;
+  double t_fit_rank_mean;
   /* spike diagnostics (mass-weighted Dirac content; mesh-independent —
    * the resolution meter) */
   double spike_mass;      /* sum over fitted rows of m|s|                 */

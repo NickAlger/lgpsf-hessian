@@ -527,6 +527,20 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
           fit.col_gids[(size_t) it.col ()], it.value ()});
     }
   }
+  /* per-rank fit wall (fit + triplet conversion), allreduced, BEFORE the
+   * barrier: the load-imbalance meter (see fit.h, t_fit_rank_*) */
+  {
+    double              tl[3], tmax, tmin, tsum;
+
+    tl[0] = std::chrono::duration<double> (Clock::now () - t1).count ();
+    MPI_Allreduce (&tl[0], &tmax, 1, MPI_DOUBLE, MPI_MAX, b->comm);
+    MPI_Allreduce (&tl[0], &tmin, 1, MPI_DOUBLE, MPI_MIN, b->comm);
+    MPI_Allreduce (&tl[0], &tsum, 1, MPI_DOUBLE, MPI_SUM, b->comm);
+    rep->t_fit_rank_max += tmax;
+    rep->t_fit_rank_min += tmin;
+    rep->t_fit_rank_mean += tsum / (double) b->size;
+  }
+  MPI_Barrier (b->comm);   /* so t_fit_symmetrize times the symmetrize only */
   const auto          t_presym = Clock::now ();
   switch (o.wsym)
   {
