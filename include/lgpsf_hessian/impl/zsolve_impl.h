@@ -569,7 +569,8 @@ lgh_zs_bvcycle_pcapply_vec (PC pc, Vec r, Vec z)
 /* spectral bounds of the mode-3 preconditioned operator                 */
 static PetscErrorCode
 lgh_zs_bounds_mode3 (struct lgh_zs_ctx *zs, Vec rhs, PetscInt maxit,
-                     PetscReal *emin, PetscReal *emax, PetscInt *its)
+                     PetscReal *emin, PetscReal *emax, PetscInt *its,
+                     int verbose)
 {
   MPI_Comm            comm;
   KSP                 k2;
@@ -591,6 +592,25 @@ lgh_zs_bounds_mode3 (struct lgh_zs_ctx *zs, Vec rhs, PetscInt maxit,
   PetscCall (KSPSolve (k2, rhs, y));
   PetscCall (KSPComputeExtremeSingularValues (k2, emax, emin));
   PetscCall (KSPGetIterationNumber (k2, its));
+  if (verbose && *its > 0) {
+    /* the Lanczos Ritz values of the preconditioned operator: is the low
+     * end an isolated outlier (deflatable) or a continuum?               */
+    PetscInt            n = *its, neig, i;
+    PetscReal          *re, *im;
+
+    PetscCall (PetscMalloc2 (n, &re, n, &im));
+    PetscCall (KSPComputeEigenvalues (k2, n, re, im, &neig));
+    PetscCall (PetscSortReal (neig, re));
+    PetscCall (PetscPrintf (comm, "lgh_prior: mode 3 ritz (%d): low",
+                            (int) neig));
+    for (i = 0; i < PetscMin (12, neig); i++)
+      PetscCall (PetscPrintf (comm, " %.3e", (double) re[i]));
+    PetscCall (PetscPrintf (comm, " | high"));
+    for (i = PetscMax (0, neig - 3); i < neig; i++)
+      PetscCall (PetscPrintf (comm, " %.3e", (double) re[i]));
+    PetscCall (PetscPrintf (comm, "\n"));
+    PetscCall (PetscFree2 (re, im));
+  }
   PetscCall (VecDestroy (&y));
   PetscCall (KSPDestroy (&k2));
   return PETSC_SUCCESS;
@@ -751,7 +771,8 @@ lgh_prior_setup_from_ksp (KSP ksp, Vec mass_lumps,
       ra[i - rlo] = lgh_randn_at (0xB0BD5UL, i, 0);
     PetscCall (VecRestoreArray (rhs, &ra));
     if (o->blocked_mode == 3) {
-      PetscCall (lgh_zs_bounds_mode3 (p->zs, rhs, 200, &emin, &emax, &its));
+      PetscCall (lgh_zs_bounds_mode3 (p->zs, rhs, 200, &emin, &emax, &its,
+                                      o->verbose));
     }
     else {
       PetscCall (lgh_zs_spectral_bounds (p->zs, rhs, 200, &emin, &emax,
