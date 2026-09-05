@@ -27,6 +27,12 @@
  *   -load <file>  a production operator instead of the grid: PETSc binary
  *                 holding the Mat then the mass-lump Vec, as written by the
  *                 library's LGH_ZS_DUMP_SPARSE=<file> hook at prior setup
+ *   -layout <file>  replay the recorded row distribution (<dump>.layout,
+ *                 same rank count as the recording run) instead of PETSc's
+ *                 contiguous default; -repartition parmetis then rebalances
+ *                 the loaded operator with a graph partition of its own
+ *                 adjacency (what a basal-mesh repartition in the
+ *                 application would do) before the setup.
  *
  * Examples:  mpiexec -n 4 ./prior_zsolve_bench -m 640 -L 5000 -mass 1e-5
  *            mpiexec -n 4 ./prior_zsolve_bench -load prior_continent.petsc -strong 0.5
@@ -80,7 +86,9 @@ main (int argc, char **argv)
   PetscInt            m = 160, nsolve = 1;
   PetscReal           L = 5000., mass = 1e-5;
   char                hier[32] = "auto", load[PETSC_MAX_PATH_LEN] = "";
-  PetscBool           have_load = PETSC_FALSE;
+  char                layout[PETSC_MAX_PATH_LEN] = "", repart[32] = "none";
+  PetscBool           have_load = PETSC_FALSE, have_layout = PETSC_FALSE;
+  PetscMPIInt         rank;
   lgh_prior_mat_opts_t po = lgh_prior_mat_opts_default ();
   Mat                 Z;
   Vec                 lump;
@@ -91,6 +99,7 @@ main (int argc, char **argv)
   PetscCall (PetscInitialize (&argc, &argv, NULL,
                               "blocked prior Z-solve benchmark on -Delta_h + mass M\n"));
   PetscCallMPI (MPI_Comm_size (PETSC_COMM_WORLD, &size));
+  PetscCallMPI (MPI_Comm_rank (PETSC_COMM_WORLD, &rank));
   po.blocked_mode = 3;
   po.cheb_rtol = 1e-3;
   po.verbose = 1;
@@ -110,6 +119,8 @@ main (int argc, char **argv)
   PetscCall (PetscOptionsGetReal (NULL, NULL, "-smoother_top", &po.smoother_top, NULL));
   PetscCall (PetscOptionsGetInt (NULL, NULL, "-nsolve", &nsolve, NULL));
   PetscCall (PetscOptionsGetString (NULL, NULL, "-load", load, sizeof (load), &have_load));
+  PetscCall (PetscOptionsGetString (NULL, NULL, "-layout", layout, sizeof (layout), &have_layout));
+  PetscCall (PetscOptionsGetString (NULL, NULL, "-repartition", repart, sizeof (repart), NULL));
   if (!strcmp (hier, "pcmg") || !strcmp (hier, "gamg")) po.hierarchy = LGH_HIERARCHY_PCMG;
   else if (!strcmp (hier, "hypre")) po.hierarchy = LGH_HIERARCHY_HYPRE;
   else po.hierarchy = LGH_HIERARCHY_AUTO;
@@ -121,6 +132,29 @@ main (int argc, char **argv)
     PetscCall (PetscViewerBinaryOpen (PETSC_COMM_WORLD, load, FILE_MODE_READ, &v));
     PetscCall (MatCreate (PETSC_COMM_WORLD, &Z));
     PetscCall (MatSetType (Z, MATAIJ));
+    if (have_layout) {
+      /* recorded local row counts: rank 0 reads, everyone gets its own */
+      PetscInt           *counts = NULL, nl, Nl;
+      int                 nr = 0;
+
+      if (rank == 0) {
+        FILE               *f = fopen (layout, "r");
+
+        PetscCheck (f != NULL, PETSC_COMM_SELF, PETSC_ERR_FILE_OPEN, "cannot read %s", layout);
+        PetscCheck (fscanf (f, "%d %" PetscInt_FMT, &nr, &Nl) == 2, PETSC_COMM_SELF,
+                    PETSC_ERR_FILE_READ, "%s: bad header", layout);
+        PetscCheck (nr == (int) size, PETSC_COMM_SELF, PETSC_ERR_ARG_SIZ,
+                    "%s was recorded on %d ranks, this run has %d", layout, nr, (int) size);
+        PetscCall (PetscMalloc1 (size, &counts));
+        for (int r = 0; r < nr; r++)
+          PetscCheck (fscanf (f, "%" PetscInt_FMT, &counts[r]) == 1, PETSC_COMM_SELF,
+                      PETSC_ERR_FILE_READ, "%s: short", layout);
+        fclose (f);
+      }
+      PetscCallMPI (MPI_Scatter (counts, 1, MPIU_INT, &nl, 1, MPIU_INT, 0, PETSC_COMM_WORLD));
+      if (rank == 0) PetscCall (PetscFree (counts));
+      PetscCall (MatSetSizes (Z, nl, nl, PETSC_DETERMINE, PETSC_DETERMINE));
+    }
     PetscCall (MatLoad (Z, v));
     PetscCall (MatCreateVecs (Z, &lump, NULL));
     PetscCall (VecLoad (lump, v));
@@ -128,9 +162,53 @@ main (int argc, char **argv)
     PetscCall (MatGetSize (Z, &N, NULL));
     m = (PetscInt) PetscSqrtReal ((PetscReal) N);   /* only for the column count below */
     PetscCall (PetscPrintf (PETSC_COMM_WORLD,
-      "bench: loaded %s: N = %d, ranks %d, hierarchy %s (hypre compiled in: %s)\n",
-      load, (int) N, (int) size, hier, lgh_have_hypre () ? "yes" : "no"));
+      "bench: loaded %s: N = %d, ranks %d, hierarchy %s (hypre compiled in: %s)%s\n",
+      load, (int) N, (int) size, hier, lgh_have_hypre () ? "yes" : "no",
+      have_layout ? ", recorded row layout" : ""));
   } else PetscCall (build_Z (m, L, mass, &Z, &lump));
+
+  if (strcmp (repart, "none") && size > 1) {
+    /* rebalance: graph partition of Z's own adjacency (ParMETIS through
+     * PETSc's MatPartitioning), then the rows move to their new owners and
+     * are renumbered contiguously per rank -- the operator the blocked
+     * cycle would see after a basal-mesh repartition in the application */
+    Mat                 adj, Z2;
+    Vec                 lump2;
+    MatPartitioning     part;
+    IS                  is_part, is_num, is_rows;
+    PetscInt           *counts;
+    VecScatter          sc;
+
+    PetscCheck (!strcmp (repart, "parmetis"), PETSC_COMM_SELF, PETSC_ERR_ARG_UNKNOWN_TYPE,
+                "-repartition: %s (parmetis | none)", repart);
+    PetscCall (MatConvert (Z, MATMPIADJ, MAT_INITIAL_MATRIX, &adj));
+    PetscCall (MatPartitioningCreate (PETSC_COMM_WORLD, &part));
+    PetscCall (MatPartitioningSetAdjacency (part, adj));
+    PetscCall (MatPartitioningSetType (part, MATPARTITIONINGPARMETIS));
+    PetscCall (MatPartitioningSetFromOptions (part));
+    PetscCall (MatPartitioningApply (part, &is_part));
+    PetscCall (ISPartitioningToNumbering (is_part, &is_num));
+    PetscCall (PetscMalloc1 (size, &counts));
+    PetscCall (ISPartitioningCount (is_part, size, counts));
+    PetscCall (ISInvertPermutation (is_num, counts[rank], &is_rows));
+    PetscCall (MatCreateSubMatrix (Z, is_rows, is_rows, MAT_INITIAL_MATRIX, &Z2));
+    PetscCall (VecCreateMPI (PETSC_COMM_WORLD, counts[rank], PETSC_DETERMINE, &lump2));
+    PetscCall (VecScatterCreate (lump, is_rows, lump2, NULL, &sc));
+    PetscCall (VecScatterBegin (sc, lump, lump2, INSERT_VALUES, SCATTER_FORWARD));
+    PetscCall (VecScatterEnd (sc, lump, lump2, INSERT_VALUES, SCATTER_FORWARD));
+    PetscCall (VecScatterDestroy (&sc));
+    PetscCall (ISDestroy (&is_rows));
+    PetscCall (ISDestroy (&is_num));
+    PetscCall (ISDestroy (&is_part));
+    PetscCall (PetscFree (counts));
+    PetscCall (MatPartitioningDestroy (&part));
+    PetscCall (MatDestroy (&adj));
+    PetscCall (MatDestroy (&Z));
+    PetscCall (VecDestroy (&lump));
+    Z = Z2;
+    lump = lump2;
+    PetscCall (PetscPrintf (PETSC_COMM_WORLD, "bench: rows repartitioned with %s\n", repart));
+  }
   if (!have_load) {
     const PetscReal     h = L / (PetscReal) (m - 1);
     /* Laplacian modes below the shift: (k pi / L)^2 < mass  =>  k < L sqrt(mass) / pi

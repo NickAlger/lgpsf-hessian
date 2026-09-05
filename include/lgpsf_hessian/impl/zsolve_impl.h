@@ -1168,6 +1168,26 @@ lgh_prior_setup_from_ksp (KSP ksp, Vec mass_lumps,
     PetscInt            rlo, rhi, i;
     PetscScalar        *ra;
 
+    if (o->verbose) {
+      /* how the rows are spread over the ranks: the blocked cycle's work
+       * per rank is proportional to its rows on every level, so max/mean
+       * is the parallel efficiency ceiling of the F stage */
+      PetscInt            nloc, mn, mx, sum, emp, e;
+      PetscMPIInt         size;
+
+      PetscCallMPI (MPI_Comm_size (comm, &size));
+      PetscCall (MatGetLocalSize (Zop, &nloc, NULL));
+      e = (nloc == 0) ? 1 : 0;
+      PetscCallMPI (MPI_Allreduce (&nloc, &mn, 1, MPIU_INT, MPI_MIN, comm));
+      PetscCallMPI (MPI_Allreduce (&nloc, &mx, 1, MPIU_INT, MPI_MAX, comm));
+      PetscCallMPI (MPI_Allreduce (&nloc, &sum, 1, MPIU_INT, MPI_SUM, comm));
+      PetscCallMPI (MPI_Allreduce (&e, &emp, 1, MPIU_INT, MPI_SUM, comm));
+      PetscCall (PetscPrintf (comm,
+        "lgh_prior: rows over %d ranks: min %" PetscInt_FMT " mean %.0f max %" PetscInt_FMT
+        " (max/mean %.2f), %" PetscInt_FMT " empty\n",
+        (int) size, mn, (double) sum / (double) size, mx,
+        (double) mx * (double) size / (double) sum, emp));
+    }
     PetscCall (lgh_zs_blocked_setup (p->zs, o));
     PetscCall (MatCreateVecs (Zop, &rhs, NULL));
     PetscCall (VecGetOwnershipRange (rhs, &rlo, &rhi));
@@ -1208,12 +1228,36 @@ lgh_prior_setup_from_ksp (KSP ksp, Vec mass_lumps,
       if (dumps != NULL) {
         PetscViewer         v;
 
+        PetscInt            nloc, *counts = NULL, N;
+        PetscMPIInt         size, rank;
+
         PetscCall (PetscViewerBinaryOpen (comm, dumps, FILE_MODE_WRITE, &v));
         PetscCall (MatView (Zop, v));
         PetscCall (VecView (mass_lumps, v));
         PetscCall (PetscViewerDestroy (&v));
+        /* <file>.layout: "nranks N" then one local row count per rank, so
+         * the production distribution can be replayed offline (the binary
+         * format stores rows in global order and forgets who owned them) */
+        PetscCallMPI (MPI_Comm_size (comm, &size));
+        PetscCallMPI (MPI_Comm_rank (comm, &rank));
+        PetscCall (MatGetLocalSize (Zop, &nloc, NULL));
+        PetscCall (MatGetSize (Zop, &N, NULL));
+        if (rank == 0) PetscCall (PetscMalloc1 (size, &counts));
+        PetscCallMPI (MPI_Gather (&nloc, 1, MPIU_INT, counts, 1, MPIU_INT, 0, comm));
+        if (rank == 0) {
+          char                fn[PETSC_MAX_PATH_LEN];
+          FILE               *f;
+
+          PetscCall (PetscSNPrintf (fn, sizeof (fn), "%s.layout", dumps));
+          f = fopen (fn, "w");
+          PetscCheck (f != NULL, PETSC_COMM_SELF, PETSC_ERR_FILE_OPEN, "cannot write %s", fn);
+          fprintf (f, "%d %" PetscInt_FMT "\n", (int) size, N);
+          for (int r = 0; r < size; r++) fprintf (f, "%" PetscInt_FMT "\n", counts[r]);
+          fclose (f);
+          PetscCall (PetscFree (counts));
+        }
         if (o->verbose)
-          PetscCall (PetscPrintf (comm, "lgh_prior: operator + mass lumps written to %s\n", dumps));
+          PetscCall (PetscPrintf (comm, "lgh_prior: operator + mass lumps written to %s (row layout in %s.layout)\n", dumps, dumps));
       }
     }
   }
