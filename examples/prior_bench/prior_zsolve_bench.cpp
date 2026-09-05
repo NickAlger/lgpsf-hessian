@@ -24,6 +24,14 @@
  *   -hierarchy auto|pcmg|hypre   -coarsen 10 -interp 6 -strong 0.25
  *   -agg_nl 0 -max_coarse 200    -nu 0 (force smoother degree)
  *   -mode 3 -tile 64 -cheb_rtol 1e-3 -smoother_top 1.1 -nsolve 1
+ *   -zero_mean    block entries in [-1, 1) instead of [0, 1)
+ *   -energy_norm  also print the residual in the Z^-1 norm (the one the
+ *                 Chebyshev bound controls; the 2-norm can exceed it by up
+ *                 to sqrt(theta_max / theta_min) on a mean-heavy block)
+ *   -nit_list 3,4,5,6,8   then force these counts on the same setup and
+ *                 print time and both residuals per count: the
+ *                 time-to-accuracy curve, which is what compares two
+ *                 hierarchies fairly (their nominal counts differ in slack)
  *   -load <file>  a production operator instead of the grid: PETSc binary
  *                 holding the Mat then the mass-lump Vec, as written by the
  *                 library's LGH_ZS_DUMP_SPARSE=<file> hook at prior setup
@@ -90,6 +98,9 @@ main (int argc, char **argv)
   PetscBool           have_load = PETSC_FALSE, have_layout = PETSC_FALSE;
   PetscBool           zero_mean = PETSC_FALSE;   /* -zero_mean: block entries in [-1, 1) instead of [0, 1) */
   PetscBool           energy_norm = PETSC_FALSE; /* -energy_norm: also |r|_{Z^-1} / |x|_{Z^-1} (the norm Chebyshev controls) */
+  PetscInt            nit_list[32], n_nit = 32;  /* -nit_list 3,4,5,...: after the nominal solve, force these Chebyshev
+                                                    counts on the same setup and report time + residuals per count: the
+                                                    time-to-accuracy curve, which compares configurations fairly */
   PetscMPIInt         rank;
   lgh_prior_mat_opts_t po = lgh_prior_mat_opts_default ();
   Mat                 Z;
@@ -125,6 +136,7 @@ main (int argc, char **argv)
   PetscCall (PetscOptionsGetString (NULL, NULL, "-repartition", repart, sizeof (repart), NULL));
   PetscCall (PetscOptionsGetBool (NULL, NULL, "-zero_mean", &zero_mean, NULL));
   PetscCall (PetscOptionsGetBool (NULL, NULL, "-energy_norm", &energy_norm, NULL));
+  PetscCall (PetscOptionsGetIntArray (NULL, NULL, "-nit_list", nit_list, &n_nit, NULL));
   if (!strcmp (hier, "pcmg") || !strcmp (hier, "gamg")) po.hierarchy = LGH_HIERARCHY_PCMG;
   else if (!strcmp (hier, "hypre")) po.hierarchy = LGH_HIERARCHY_HYPRE;
   else po.hierarchy = LGH_HIERARCHY_AUTO;
@@ -304,6 +316,55 @@ main (int argc, char **argv)
       PetscCall (PetscPrintf (PETSC_COMM_WORLD,
         "bench: column-0 residual in the Z^-1 norm: |r|_{Z^-1} / |x|_{Z^-1} = %.2e\n",
         (double) PetscSqrtReal (rr / xx)));
+      PetscCall (VecDestroy (&t));
+      PetscCall (VecDestroy (&x0c));
+      PetscCall (KSPDestroy (&kt));
+    }
+    if (n_nit > 0 && n_nit < 32) {
+      /* time-to-accuracy curve on the same setup: force the count, re-solve */
+      KSP                 kt;
+      PC                  pct;
+      Vec                 t, x0c;
+      PetscReal           xx = 1., rr;
+      const PetscInt      nit_nominal = prior->zs->nit;
+
+      PetscCall (KSPCreate (PETSC_COMM_WORLD, &kt));
+      PetscCall (KSPSetType (kt, KSPCG));
+      PetscCall (KSPGetPC (kt, &pct));
+      PetscCall (PCSetType (pct, PCGAMG));
+      PetscCall (KSPSetOperators (kt, Z, Z));
+      PetscCall (KSPSetTolerances (kt, 1e-12, 0., PETSC_DEFAULT, 500));
+      PetscCall (KSPSetOptionsPrefix (kt, "energy_"));
+      PetscCall (KSPSetFromOptions (kt));
+      PetscCall (VecDuplicate (r, &t));
+      PetscCall (VecDuplicate (r, &x0c));
+      PetscCall (MatDenseGetColumnVecRead (X, 0, &x0));
+      PetscCall (VecCopy (x0, x0c));
+      PetscCall (MatDenseRestoreColumnVecRead (X, 0, &x0));
+      PetscCall (VecZeroEntries (t));
+      PetscCall (KSPSolve (kt, x0c, t));
+      PetscCall (VecDot (x0c, t, &xx));
+      for (PetscInt q = 0; q < n_nit; q++) {
+        prior->zs->nit = nit_list[q];
+        PetscCallMPI (MPI_Barrier (PETSC_COMM_WORLD));
+        t0 = MPI_Wtime ();
+        PetscCall (lgh_prior_solve_block (prior, LGH_PRIOR_SOLVEZ, X, Y));
+        PetscCallMPI (MPI_Barrier (PETSC_COMM_WORLD));
+        t_solve = MPI_Wtime () - t0;
+        PetscCall (MatDenseGetColumnVecRead (Y, 0, &y0));
+        PetscCall (MatMult (Z, y0, r));
+        PetscCall (MatDenseRestoreColumnVecRead (Y, 0, &y0));
+        PetscCall (VecAXPY (r, -1.0, x0c));
+        PetscCall (VecNorm (r, NORM_2, &nr));
+        PetscCall (VecZeroEntries (t));
+        PetscCall (KSPSolve (kt, r, t));
+        PetscCall (VecDot (r, t, &rr));
+        PetscCall (PetscPrintf (PETSC_COMM_WORLD,
+          "bench: nit %2d | solve of %d columns %.3f s | residual 2-norm %.2e | Z^-1-norm %.2e\n",
+          (int) nit_list[q], (int) po.tile, t_solve, (double) (nr / nx),
+          (double) PetscSqrtReal (rr / xx)));
+      }
+      prior->zs->nit = nit_nominal;
       PetscCall (VecDestroy (&t));
       PetscCall (VecDestroy (&x0c));
       PetscCall (KSPDestroy (&kt));
