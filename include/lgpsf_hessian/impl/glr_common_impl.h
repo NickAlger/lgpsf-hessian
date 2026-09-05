@@ -110,7 +110,14 @@ lgh_prior_mat_opts_default (void)
   o.hierarchy = LGH_HIERARCHY_AUTO;
   o.hypre_coarsen = 10;      /* HMIS */
   o.hypre_interp = 6;        /* extended+i */
-  o.hypre_strong = 0.25;
+  o.hypre_strong = 0.1;      /* 0.25 until 2026-09-05: at equal delivered accuracy
+                                0.1 is 20% cheaper per column on the continental
+                                ice-sheet prior (high-order stiffness, 43% positive
+                                off-diagonals: the negative-connection strength
+                                graph is sparse and a lower threshold keeps more
+                                of it) and neutral on a sub-mesh and a structured
+                                grid; PMIS (8) is -18% alone but the two do not
+                                compound, and smoother degree 3 buys nothing */
   o.hypre_agg_nl = 0;
   o.hypre_max_coarse = 200;
   o.verbose = 0;

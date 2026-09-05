@@ -99,7 +99,7 @@ typedef struct lgh_prior_mat_opts
   int    hierarchy;        /* LGH_HIERARCHY_AUTO | _PCMG | _HYPRE           */
   int    hypre_coarsen;    /* BoomerAMG coarsening type (10 = HMIS)         */
   int    hypre_interp;     /* BoomerAMG interpolation (6 = extended+i)      */
-  double hypre_strong;     /* strength threshold (0.25)                     */
+  double hypre_strong;     /* strength threshold (0.1; hypre's own default 0.25) */
   int    hypre_agg_nl;     /* aggressive-coarsening levels (0: keep it 0)   */
   int    hypre_max_coarse; /* coarsest-level size cap (200; dense LU below) */
   int    verbose;

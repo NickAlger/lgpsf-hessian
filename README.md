@@ -138,9 +138,13 @@ comes from is `opts.hierarchy`:
 - `LGH_HIERARCHY_PCMG`: harvested from the Z solver's PCMG/GAMG preconditioner
   (the original path; no extra dependency).
 - `LGH_HIERARCHY_HYPRE`: built at setup by hypre's BoomerAMG (classical
-  coarsening + interpolation, defaults HMIS / extended+i, no aggressive
-  coarsening), levels copied into PETSc matrices, hypre solver discarded. None of
-  hypre's smoothers or solves are used online.
+  coarsening + interpolation, defaults HMIS / extended+i, strength threshold 0.1,
+  no aggressive coarsening), levels copied into PETSc matrices, hypre solver
+  discarded. None of hypre's smoothers or solves are used online. The threshold
+  is below hypre's usual 0.25 on purpose: on a high-order stiffness with many
+  positive off-diagonals the negative-connection strength graph is sparse, and
+  0.1 was 20% cheaper per column at equal accuracy on a 409k-node ice-sheet
+  prior while neutral elsewhere (`examples/prior_bench`, `-nit_list`).
 - `LGH_HIERARCHY_AUTO` (default): hypre when available, PCMG otherwise.
 
 Availability: the hypre path compiles in when `petscconf.h` defines
