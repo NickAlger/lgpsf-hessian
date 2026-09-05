@@ -666,7 +666,7 @@ lgh_zs_blocked_asolve (struct lgh_zs_ctx *zs, Mat Xsrc, Mat Ydst)
   return PETSC_SUCCESS;
 }
 
-/* Diagnostic (env LGH_ZS_DUMP=<prefix>; serial, mode 3, N <= 12000 only):
+/* Diagnostic (env LGH_ZS_DUMP=<prefix>; serial, modes 2/3, N <= 12000 only):
  * write the face operator A and the block V-cycle applied to the identity,
  * both as raw column-major float64 N x N files, for an offline exact
  * eigen-analysis of the V-cycle-preconditioned operator (deflation
@@ -682,15 +682,19 @@ lgh_zs_dump_dense (struct lgh_zs_ctx *zs, Mat A, const char *prefix)
   PetscScalar        *tb;
   FILE               *fp;
   char                name[PETSC_MAX_PATH_LEN];
+  lgh_zs_pcapply_fn   pcap;
+  void               *pcctx;
 
   PetscCall (PetscObjectGetComm ((PetscObject) A, &comm));
   PetscCallMPI (MPI_Comm_size (comm, &size));
   PetscCall (MatGetSize (A, &N, NULL));
-  if (size != 1 || N > 12000 || zs->mode != 3) {
+  if (size != 1 || N > 12000 || zs->mode < 2) {
     PetscCall (PetscPrintf (comm, "lgh_zs_dump_dense: skipped (size %d, N %d, "
                             "mode %d)\n", (int) size, (int) N, zs->mode));
     return PETSC_SUCCESS;
   }
+  if (zs->mode == 3) { pcap = lgh_zs_bvcycle_pcapply;    pcctx = zs->mgh; }
+  else               { pcap = lgh_zs_pcmatapply_pcapply; pcctx = zs->amg; }
   PetscCall (MatConvert (A, MATDENSE, MAT_INITIAL_MATRIX, &Adense));
   PetscCall (MatDenseGetLDA (Adense, &lda));
   PetscCall (MatDenseGetArrayRead (Adense, &a));
@@ -712,7 +716,20 @@ lgh_zs_dump_dense (struct lgh_zs_ctx *zs, Mat A, const char *prefix)
     PetscCall (MatDenseGetArrayWrite (zs->tB, &tb));
     for (j = 0; j < w; j++) tb[(c0 + j) + (size_t) j * lda] = 1.0;
     PetscCall (MatDenseRestoreArrayWrite (zs->tB, &tb));
-    PetscCall (lgh_zs_bvcycle_pcapply (zs->tB, zs->tZ, zs->mgh));
+    if (zs->mode == 3) {
+      PetscCall (pcap (zs->tB, zs->tZ, pcctx));
+    }
+    else {   /* column-wise PCApply: PCMatApply is not available for every PC */
+      for (j = 0; j < w; j++) {
+        Vec                 bj, zj;
+
+        PetscCall (MatDenseGetColumnVecRead (zs->tB, j, &bj));
+        PetscCall (MatDenseGetColumnVecWrite (zs->tZ, j, &zj));
+        PetscCall (PCApply (zs->amg, bj, zj));
+        PetscCall (MatDenseRestoreColumnVecWrite (zs->tZ, j, &zj));
+        PetscCall (MatDenseRestoreColumnVecRead (zs->tB, j, &bj));
+      }
+    }
     PetscCall (MatDenseGetArrayRead (zs->tZ, &tz));
     for (j = 0; j < w; j++)
       fwrite (tz + (size_t) j * ldaz, sizeof (PetscScalar), (size_t) N, fp);
