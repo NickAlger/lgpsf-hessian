@@ -209,6 +209,64 @@ lgh_zs_spectral_bounds (struct lgh_zs_ctx *zs, Vec rhs, PetscInt maxit,
 
 /* -------- harvested hierarchy (mode 3) -------- */
 
+/* Every rank gets a sequential dense copy of the small distributed A0:
+ * local rows via MatGetRow, one MPI_Allgatherv.  Replaces
+ * MatCreateRedundantMatrix (2026-09-05): that path SEGV'd inside PETSc's
+ * MatCreateSubMatrices at 192 ranks on a hypre coarse grid whose 158 rows
+ * were spread over all ranks (most owning 0-1 rows); this is layout-agnostic.
+ * Ownership ranges are contiguous and rank-ordered, so the gathered
+ * row-major buffer is already in global row order.                        */
+static PetscErrorCode
+lgh_zs_gather_dense (Mat A, Mat *Aseq)
+{
+  MPI_Comm            comm;
+  PetscMPIInt         size, r;
+  PetscInt            n0, nloc, rs, re, i, j, ncols;
+  const PetscInt     *cols;
+  const PetscScalar  *vals;
+  PetscScalar        *loc, *all, *a;
+  int                *counts, *displs, myn;
+
+  PetscCall (PetscObjectGetComm ((PetscObject) A, &comm));
+  PetscCallMPI (MPI_Comm_size (comm, &size));
+  PetscCall (MatGetSize (A, &n0, NULL));
+  PetscCall (MatGetOwnershipRange (A, &rs, &re));
+  nloc = re - rs;
+  PetscCall (PetscCalloc1 ((size_t) PetscMax (nloc, 1) * (size_t) n0, &loc));
+  for (i = rs; i < re; i++) {
+    PetscCall (MatGetRow (A, i, &ncols, &cols, &vals));
+    for (j = 0; j < ncols; j++) loc[(size_t) (i - rs) * n0 + cols[j]] = vals[j];
+    PetscCall (MatRestoreRow (A, i, &ncols, &cols, &vals));
+  }
+  PetscCall (PetscMalloc2 (size, &counts, size, &displs));
+  myn = (int) (nloc * n0);
+  PetscCallMPI (MPI_Allgather (&myn, 1, MPI_INT, counts, 1, MPI_INT, comm));
+  displs[0] = 0;
+  for (r = 1; r < size; r++) displs[r] = displs[r - 1] + counts[r - 1];
+  {
+    long                tot = (long) displs[size - 1] + counts[size - 1];
+    PetscInt            N, M;
+
+    PetscCall (MatGetSize (A, &M, &N));
+    PetscCheck (tot == (long) n0 * n0, comm, PETSC_ERR_PLIB,
+                "gather_dense: row counts sum to %ld entries but the matrix is "
+                "%" PetscInt_FMT " x %" PetscInt_FMT " (this rank: rows [%"
+                PetscInt_FMT ", %" PetscInt_FMT "))", tot, M, N, rs, re);
+  }
+  PetscCall (PetscMalloc1 ((size_t) n0 * (size_t) n0, &all));
+  PetscCallMPI (MPI_Allgatherv (loc, myn, MPIU_SCALAR, all, counts, displs,
+                                MPIU_SCALAR, comm));
+  PetscCall (MatCreateSeqDense (PETSC_COMM_SELF, n0, n0, NULL, Aseq));
+  PetscCall (MatDenseGetArrayWrite (*Aseq, &a));
+  for (i = 0; i < n0; i++)
+    for (j = 0; j < n0; j++) a[i + (size_t) j * n0] = all[(size_t) i * n0 + j];
+  PetscCall (MatDenseRestoreArrayWrite (*Aseq, &a));
+  PetscCall (PetscFree (all));
+  PetscCall (PetscFree (loc));
+  PetscCall (PetscFree2 (counts, displs));
+  return PETSC_SUCCESS;
+}
+
 /* Build the blocked V-cycle data from level operators A[l] and
  * prolongators P[l] (l = 0 coarsest .. nl-1 finest; P[l] maps l-1 -> l,
  * P[0] unused), plus per-level smoother bounds (deterministic seed; run
@@ -256,15 +314,11 @@ lgh_zs_mg_build (PetscInt nl, Mat *Aops, Mat *Pops, KSP coarse_ksp,
       }
       else if (n0 <= 2000) {
         /* size > 1: redundant coarse — full seq copy on every rank */
-        Mat                 Ared, Adense;
+        Mat                 Adense;
         PetscMPIInt         r;
         PetscInt            rs, re;
 
-        PetscCall (MatCreateRedundantMatrix (lv->A, csize, PETSC_COMM_SELF,
-                                             MAT_INITIAL_MATRIX, &Ared));
-        PetscCall (MatConvert (Ared, MATSEQDENSE, MAT_INITIAL_MATRIX,
-                               &Adense));
-        PetscCall (MatDestroy (&Ared));
+        PetscCall (lgh_zs_gather_dense (lv->A, &Adense));
         PetscCall (MatLUFactor (Adense, NULL, NULL, NULL));
         h->coarse_fact = Adense;
         PetscCall (MatGetOwnershipRange (lv->A, &rs, &re));
@@ -413,6 +467,71 @@ lgh_zs_mg_harvest (PC pcmg, PetscInt tile, int smax_krylov,
 }
 
 #if defined(PETSC_HAVE_HYPRE)
+/* hypre ParCSR -> PETSc MPIAIJ (a copy), built from hypre's diag/offd CSR
+ * blocks and its row/column partitions.  NOT PETSc's MatCreateFromParCSR:
+ * in PETSc 3.21 that routine turns a rank with ZERO local rows into a
+ * one-row rank (it clamps the empty range, then still adds 1 for the PETSc
+ * convention), shifting every later rank's range and leaving the layout
+ * inconsistent with the global size -- the coarse levels of a hypre
+ * hierarchy have many empty ranks, so this crashed at 192 ranks
+ * (2026-09-05).  Host memory only (CPU hypre).                           */
+static PetscErrorCode
+lgh_parcsr_to_aij (hypre_ParCSRMatrix *par, MPI_Comm comm, Mat *out)
+{
+  hypre_CSRMatrix    *diag = hypre_ParCSRMatrixDiag (par);
+  hypre_CSRMatrix    *offd = hypre_ParCSRMatrixOffd (par);
+  HYPRE_BigInt       *rows = hypre_ParCSRMatrixRowStarts (par);
+  HYPRE_BigInt       *cols = hypre_ParCSRMatrixColStarts (par);
+  HYPRE_BigInt       *cmap = hypre_ParCSRMatrixColMapOffd (par);
+  const PetscInt      M = (PetscInt) hypre_ParCSRMatrixGlobalNumRows (par);
+  const PetscInt      N = (PetscInt) hypre_ParCSRMatrixGlobalNumCols (par);
+  const PetscInt      m = (PetscInt) (rows[1] - rows[0]);
+  const PetscInt      n = (PetscInt) (cols[1] - cols[0]);
+  HYPRE_Int          *di = hypre_CSRMatrixI (diag), *dj = hypre_CSRMatrixJ (diag);
+  HYPRE_Int          *oi = hypre_CSRMatrixI (offd), *oj = hypre_CSRMatrixJ (offd);
+  HYPRE_Complex      *dv = hypre_CSRMatrixData (diag), *ov = hypre_CSRMatrixData (offd);
+  PetscInt           *dnnz, *onnz, i, k, maxnz = 0;
+  PetscInt           *cbuf;
+  PetscScalar        *vbuf;
+  Mat                 B;
+
+  PetscCall (MatCreate (comm, &B));
+  PetscCall (MatSetSizes (B, m, n, M, N));
+  PetscCall (MatSetType (B, MATAIJ));
+  PetscCall (PetscMalloc2 (PetscMax (m, 1), &dnnz, PetscMax (m, 1), &onnz));
+  for (i = 0; i < m; i++) {
+    dnnz[i] = (PetscInt) (di[i + 1] - di[i]);
+    onnz[i] = (oi != NULL) ? (PetscInt) (oi[i + 1] - oi[i]) : 0;
+    if (dnnz[i] + onnz[i] > maxnz) maxnz = dnnz[i] + onnz[i];
+  }
+  PetscCall (MatSeqAIJSetPreallocation (B, 0, dnnz));
+  PetscCall (MatMPIAIJSetPreallocation (B, 0, dnnz, 0, onnz));
+  PetscCall (MatSetOption (B, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE));
+  PetscCall (PetscMalloc2 (PetscMax (maxnz, 1), &cbuf, PetscMax (maxnz, 1), &vbuf));
+  for (i = 0; i < m; i++) {
+    const PetscInt      r = (PetscInt) rows[0] + i;
+    PetscInt            nz = 0;
+
+    for (k = di[i]; k < di[i + 1]; k++) {
+      cbuf[nz] = (PetscInt) cols[0] + (PetscInt) dj[k];
+      vbuf[nz++] = (PetscScalar) dv[k];
+    }
+    if (oi != NULL) {
+      for (k = oi[i]; k < oi[i + 1]; k++) {
+        cbuf[nz] = (PetscInt) cmap[oj[k]];
+        vbuf[nz++] = (PetscScalar) ov[k];
+      }
+    }
+    PetscCall (MatSetValues (B, 1, &r, nz, cbuf, vbuf, INSERT_VALUES));
+  }
+  PetscCall (MatAssemblyBegin (B, MAT_FINAL_ASSEMBLY));
+  PetscCall (MatAssemblyEnd (B, MAT_FINAL_ASSEMBLY));
+  PetscCall (PetscFree2 (cbuf, vbuf));
+  PetscCall (PetscFree2 (dnnz, onnz));
+  *out = B;
+  return PETSC_SUCCESS;
+}
+
 /* Build a BoomerAMG hierarchy for A with hypre, copy its level operators
  * and prolongators into PETSc matrices, discard the hypre solver.  hypre's
  * coarse operators are Galerkin (R = P^T, restriction type 0), which is
@@ -432,7 +551,9 @@ lgh_zs_mg_harvest_hypre (Mat A, int coarsen, int interp, PetscReal strong,
   hypre_ParCSRMatrix **A_array, **P_array;
   PetscInt            nl, k, l;
   Mat                *Aops, *Pops;
+  MPI_Comm            comm;
 
+  PetscCall (PetscObjectGetComm ((PetscObject) A, &comm));
   PetscCall (MatConvert (A, MATHYPRE, MAT_INITIAL_MATRIX, &Ah));
   PetscCall (MatHYPREGetParCSR (Ah, &par));
   PetscCallExternal (HYPRE_BoomerAMGCreate, &solver);
@@ -469,13 +590,11 @@ lgh_zs_mg_harvest_hypre (Mat A, int coarsen, int interp, PetscReal strong,
       PetscCall (PetscObjectReference ((PetscObject) A));
     }
     else {
-      PetscCall (MatCreateFromParCSR (A_array[k], MATAIJ, PETSC_COPY_VALUES,
-                                      &Aops[l]));
+      PetscCall (lgh_parcsr_to_aij (A_array[k], comm, &Aops[l]));
     }
     Pops[l] = NULL;
     if (k < nl - 1) {   /* P_array[k]: hypre level k+1 -> k, i.e. ours l-1 -> l */
-      PetscCall (MatCreateFromParCSR (P_array[k], MATAIJ, PETSC_COPY_VALUES,
-                                      &Pops[l]));
+      PetscCall (lgh_parcsr_to_aij (P_array[k], comm, &Pops[l]));
     }
   }
   hypre_ParVectorDestroy (fv);
