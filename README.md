@@ -143,12 +143,17 @@ comes from is `opts.hierarchy`:
   hypre's smoothers or solves are used online.
 - `LGH_HIERARCHY_AUTO` (default): hypre when available, PCMG otherwise.
 
-Availability is decided by PETSc: the hypre path compiles in when `petscconf.h`
-defines `PETSC_HAVE_HYPRE` (PETSc configured with `--download-hypre` or
-`--with-hypre-dir`). Because the harvest calls hypre's setup directly, hypre must
-also be on the link line; CMake finds `libHYPRE` next to PETSc and adds it, and
-non-CMake consumers add `-lHYPRE` themselves. Without hypre everything builds and
-runs as before.
+Availability: the hypre path compiles in when `petscconf.h` defines
+`PETSC_HAVE_HYPRE` (PETSc configured with `--download-hypre` or
+`--with-hypre-dir`) and hypre's own headers are on the include path (the impl
+checks with `__has_include` and silently compiles without hypre otherwise;
+`lgh_have_hypre()` reports the outcome). Because the harvest calls hypre's setup
+directly, hypre must also be on the link line. CMake handles both: it finds
+`libHYPRE` and the header directory next to PETSc, or in `/usr/include/hypre`
+for distribution packages (install `libhypre-dev` alongside `petsc-dev`), and
+`-DLGH_WITH_HYPRE=OFF` opts out. Non-CMake consumers add `-lHYPRE` (and, for a
+packaged PETSc, `-I/usr/include/hypre`) themselves, or define `LGH_NO_HYPRE`.
+Without hypre everything builds and runs as before.
 
 Why it exists: on a near-singular prior (`-Delta + 1e-5 M` on the Antarctic basal
 mesh) GAMG's default aggressive coarsening leaves ~9% of the preconditioned

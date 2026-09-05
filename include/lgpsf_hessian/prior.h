@@ -91,7 +91,7 @@ typedef struct lgh_prior_mat_opts
    * BoomerAMG hierarchy with hypre at setup (classical coarsening +
    * interpolation, no smoother of hypre's is ever applied), reads the
    * levels back, and discards the hypre solver; available when PETSc was
-   * configured with hypre (PETSC_HAVE_HYPRE).  LGH_HIERARCHY_AUTO (default)
+   * configured with hypre (see lgh_have_hypre).  LGH_HIERARCHY_AUTO (default)
    * picks hypre when it is available and PCMG otherwise.  Measured on the
    * ice-sheet prior (-Delta + 1e-5 M): GAMG's default aggressive coarsening
    * leaves ~9% of the modes below 0.7 in the preconditioned spectrum,
@@ -110,7 +110,9 @@ lgh_prior_mat_opts_t;
 #define LGH_HIERARCHY_PCMG  1
 #define LGH_HIERARCHY_HYPRE 2
 
-/* 1 when the hypre hierarchy source is compiled in (PETSC_HAVE_HYPRE). */
+/* 1 when the hypre hierarchy source is compiled in: PETSc has hypre
+ * (PETSC_HAVE_HYPRE), hypre's headers were reachable when the impl was
+ * compiled, and LGH_NO_HYPRE was not defined. */
 int lgh_have_hypre (void);
 
 lgh_prior_mat_opts_t lgh_prior_mat_opts_default (void);

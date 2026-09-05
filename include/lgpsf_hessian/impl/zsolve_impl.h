@@ -29,7 +29,23 @@
 
 #include <stdlib.h>
 #include <stdio.h>
-#if defined(PETSC_HAVE_HYPRE)
+
+/* The hypre hierarchy source compiles in when PETSc has hypre AND hypre's
+ * internal headers are reachable.  PETSC_HAVE_HYPRE alone is not enough:
+ * distribution packages (Debian/Ubuntu petsc-dev) define it but keep the
+ * hypre headers in /usr/include/hypre, off the default include path, so
+ * <petscmathypre.h> itself fails to compile there.  Consumers add the
+ * directory (CMake does it for them) or opt out with -DLGH_NO_HYPRE. */
+#if defined(PETSC_HAVE_HYPRE) && !defined(LGH_NO_HYPRE)
+#if defined(__has_include)
+#if __has_include(<_hypre_parcsr_mv.h>) && __has_include(<_hypre_parcsr_ls.h>)
+#define LGH_HAVE_HYPRE 1
+#endif
+#else
+#define LGH_HAVE_HYPRE 1
+#endif
+#endif
+#if defined(LGH_HAVE_HYPRE)
 #include <petscmathypre.h>
 #include <HYPRE.h>
 #include <HYPRE_parcsr_ls.h>
@@ -466,7 +482,7 @@ lgh_zs_mg_harvest (PC pcmg, PetscInt tile, int smax_krylov,
   return PETSC_SUCCESS;
 }
 
-#if defined(PETSC_HAVE_HYPRE)
+#if defined(LGH_HAVE_HYPRE)
 /* hypre ParCSR -> PETSc MPIAIJ (a copy), built from hypre's diag/offd CSR
  * blocks and its row/column partitions.  NOT PETSc's MatCreateFromParCSR:
  * in PETSc 3.21 that routine turns a rank with ZERO local rows into a
@@ -807,16 +823,17 @@ lgh_zs_blocked_setup (struct lgh_zs_ctx *zs, const lgh_prior_mat_opts_t *o)
   if (mode == 3) {
     int                 want = o->hierarchy;
 
-#if defined(PETSC_HAVE_HYPRE)
+#if defined(LGH_HAVE_HYPRE)
     if (want == LGH_HIERARCHY_AUTO) want = LGH_HIERARCHY_HYPRE;
 #else
     PetscCheck (want != LGH_HIERARCHY_HYPRE, comm, PETSC_ERR_SUP,
-                "hierarchy = hypre requested, but this PETSc was built "
-                "without hypre (PETSC_HAVE_HYPRE undefined)");
+                "hierarchy = hypre requested, but the hypre hierarchy source "
+                "is not compiled in (PETSc without hypre, hypre headers not on "
+                "the include path, or LGH_NO_HYPRE)");
     want = LGH_HIERARCHY_PCMG;
 #endif
     zs->hierarchy = want;
-#if defined(PETSC_HAVE_HYPRE)
+#if defined(LGH_HAVE_HYPRE)
     if (want == LGH_HIERARCHY_HYPRE) {
       PetscCall (lgh_zs_mg_harvest_hypre (zs->Aface, o->hypre_coarsen,
                                           o->hypre_interp, o->hypre_strong,
@@ -1245,7 +1262,7 @@ lgh_zs_prior_teardown (lgh_prior_t *p)
 int
 lgh_have_hypre (void)
 {
-#if defined(PETSC_HAVE_HYPRE)
+#if defined(LGH_HAVE_HYPRE)
   return 1;
 #else
   return 0;
