@@ -102,7 +102,7 @@ int
 main (int argc, char **argv)
 {
   Mat                 Z;
-  Vec                 mass, b, xref, x, s1;
+  Vec                 mass, b, xref, x, s1, b2, xref2;
   KSP                 kref;
   PC                  pcref;
 
@@ -125,6 +125,15 @@ main (int argc, char **argv)
   PetscCall (KSPSetTolerances (kref, 1e-13, 0., PETSC_DEFAULT, 10000));
   PetscCall (VecZeroEntries (xref));
   PetscCall (KSPSolve (kref, b, xref));
+  /* a right-hand side with a large mean: exercises the constant deflation
+   * (exact for any nonsingular Z; Z here is not shifted-singular, so this
+   * checks the bookkeeping, not the benefit) */
+  PetscCall (VecDuplicate (b, &b2));
+  PetscCall (VecDuplicate (b, &xref2));
+  PetscCall (VecCopy (b, b2));
+  PetscCall (VecShift (b2, 7.0));
+  PetscCall (VecZeroEntries (xref2));
+  PetscCall (KSPSolve (kref, b2, xref2));
 
   /* passes: per-column KSP (0), blocked PCMatApply (2), blocked V-cycle on
    * the PCMG hierarchy (3), and -- when PETSc has hypre -- the blocked
@@ -151,6 +160,41 @@ main (int argc, char **argv)
     PetscCall (rel_diff (x, xref, s1, &rd));
     snprintf (what, sizeof (what), "pass %d (mode %d) vec solve vs reference", pass, mode);
     check (rd < 1e-8, what, rd);
+    lgh_prior_mat_solveZ (b2, x, prior);
+    PetscCall (rel_diff (x, xref2, s1, &rd));
+    snprintf (what, sizeof (what), "pass %d (mode %d) vec solve, mean-7 rhs, vs reference", pass, mode);
+    check (rd < 1e-8, what, rd);
+    {
+      Mat                 X2, Y2;
+      PetscInt            nloc;
+      Vec                 cj;
+
+      PetscCall (VecGetLocalSize (mass, &nloc));
+      PetscCall (MatCreateDense (PETSC_COMM_WORLD, nloc, PETSC_DECIDE, N_GLOBAL, 3, NULL, &X2));
+      PetscCall (MatCreateDense (PETSC_COMM_WORLD, nloc, PETSC_DECIDE, N_GLOBAL, 3, NULL, &Y2));
+      for (int j = 0; j < 3; j++) {
+        PetscCall (MatDenseGetColumnVecWrite (X2, j, &cj));
+        PetscCall (VecCopy (j == 1 ? b2 : b, cj));
+        if (j == 2) PetscCall (VecScale (cj, -3.0));
+        PetscCall (MatDenseRestoreColumnVecWrite (X2, j, &cj));
+      }
+      PetscCall (lgh_prior_solve_block (prior, LGH_PRIOR_SOLVEZ, X2, Y2));
+      PetscCall (MatDenseGetColumnVecRead (Y2, 1, &cj));
+      PetscCall (VecCopy (cj, x));
+      PetscCall (MatDenseRestoreColumnVecRead (Y2, 1, &cj));
+      PetscCall (rel_diff (x, xref2, s1, &rd));
+      snprintf (what, sizeof (what), "pass %d (mode %d) blocked solve, mean-7 column, vs reference", pass, mode);
+      check (rd < 1e-7, what, rd);
+      PetscCall (MatDenseGetColumnVecRead (Y2, 2, &cj));
+      PetscCall (VecCopy (cj, x));
+      PetscCall (MatDenseRestoreColumnVecRead (Y2, 2, &cj));
+      PetscCall (VecScale (x, -1.0 / 3.0));
+      PetscCall (rel_diff (x, xref, s1, &rd));
+      snprintf (what, sizeof (what), "pass %d (mode %d) blocked solve, scaled column, vs reference", pass, mode);
+      check (rd < 1e-7, what, rd);
+      PetscCall (MatDestroy (&X2));
+      PetscCall (MatDestroy (&Y2));
+    }
 
     /* blocked solve vs reference (multi-column, width > tile) */
     {
@@ -288,6 +332,8 @@ main (int argc, char **argv)
   if (n_fail == 0)
     PetscCall (PetscPrintf (PETSC_COMM_WORLD, "PASS test_prior_mat\n"));
   PetscCall (KSPDestroy (&kref));
+  PetscCall (VecDestroy (&b2));
+  PetscCall (VecDestroy (&xref2));
   PetscCall (VecDestroy (&mass));
   PetscCall (VecDestroy (&b));
   PetscCall (VecDestroy (&xref));

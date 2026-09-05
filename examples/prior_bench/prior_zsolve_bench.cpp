@@ -88,6 +88,8 @@ main (int argc, char **argv)
   char                hier[32] = "auto", load[PETSC_MAX_PATH_LEN] = "";
   char                layout[PETSC_MAX_PATH_LEN] = "", repart[32] = "none";
   PetscBool           have_load = PETSC_FALSE, have_layout = PETSC_FALSE;
+  PetscBool           zero_mean = PETSC_FALSE;   /* -zero_mean: block entries in [-1, 1) instead of [0, 1) */
+  PetscBool           energy_norm = PETSC_FALSE; /* -energy_norm: also |r|_{Z^-1} / |x|_{Z^-1} (the norm Chebyshev controls) */
   PetscMPIInt         rank;
   lgh_prior_mat_opts_t po = lgh_prior_mat_opts_default ();
   Mat                 Z;
@@ -121,6 +123,8 @@ main (int argc, char **argv)
   PetscCall (PetscOptionsGetString (NULL, NULL, "-load", load, sizeof (load), &have_load));
   PetscCall (PetscOptionsGetString (NULL, NULL, "-layout", layout, sizeof (layout), &have_layout));
   PetscCall (PetscOptionsGetString (NULL, NULL, "-repartition", repart, sizeof (repart), NULL));
+  PetscCall (PetscOptionsGetBool (NULL, NULL, "-zero_mean", &zero_mean, NULL));
+  PetscCall (PetscOptionsGetBool (NULL, NULL, "-energy_norm", &energy_norm, NULL));
   if (!strcmp (hier, "pcmg") || !strcmp (hier, "gamg")) po.hierarchy = LGH_HIERARCHY_PCMG;
   else if (!strcmp (hier, "hypre")) po.hierarchy = LGH_HIERARCHY_HYPRE;
   else po.hierarchy = LGH_HIERARCHY_AUTO;
@@ -243,6 +247,7 @@ main (int argc, char **argv)
     PetscCall (MatCreateDense (PETSC_COMM_WORLD, nloc, PETSC_DECIDE, N, po.tile, NULL, &Y));
     PetscCall (PetscRandomCreate (PETSC_COMM_WORLD, &rnd));
     PetscCall (PetscRandomSetSeed (rnd, 7));
+    if (zero_mean) PetscCall (PetscRandomSetInterval (rnd, -1.0, 1.0));
     PetscCall (PetscRandomSeed (rnd));
     PetscCall (MatSetRandom (X, rnd));
     PetscCall (PetscRandomDestroy (&rnd));
@@ -267,6 +272,42 @@ main (int argc, char **argv)
       "column-0 residual |Z y - x| / |x| = %.2e (cheb_rtol %g)\n",
       t_setup, (int) po.tile, t_solve, 1e3 * t_solve / (double) po.tile,
       (double) (nr / nx), (double) po.cheb_rtol));
+    if (energy_norm) {
+      /* the Chebyshev bound is on the error's energy norm, i.e. the residual's
+       * Z^{-1} norm; on a right-hand side rich in the strongly amplified low
+       * modes the 2-norm residual can exceed it by up to sqrt(theta_max /
+       * theta_min).  Two tight CG solves (Z^{-1} r and Z^{-1} x) measure it. */
+      KSP                 kt;
+      PC                  pct;
+      Vec                 t, x0c;
+      PetscReal           rr, xx;
+
+      PetscCall (KSPCreate (PETSC_COMM_WORLD, &kt));
+      PetscCall (KSPSetType (kt, KSPCG));
+      PetscCall (KSPGetPC (kt, &pct));
+      PetscCall (PCSetType (pct, PCGAMG));
+      PetscCall (KSPSetOperators (kt, Z, Z));
+      PetscCall (KSPSetTolerances (kt, 1e-12, 0., PETSC_DEFAULT, 500));
+      PetscCall (KSPSetOptionsPrefix (kt, "energy_"));
+      PetscCall (KSPSetFromOptions (kt));
+      PetscCall (VecDuplicate (r, &t));
+      PetscCall (VecDuplicate (r, &x0c));
+      PetscCall (MatDenseGetColumnVecRead (X, 0, &x0));
+      PetscCall (VecCopy (x0, x0c));
+      PetscCall (MatDenseRestoreColumnVecRead (X, 0, &x0));
+      PetscCall (VecZeroEntries (t));
+      PetscCall (KSPSolve (kt, r, t));
+      PetscCall (VecDot (r, t, &rr));
+      PetscCall (VecZeroEntries (t));
+      PetscCall (KSPSolve (kt, x0c, t));
+      PetscCall (VecDot (x0c, t, &xx));
+      PetscCall (PetscPrintf (PETSC_COMM_WORLD,
+        "bench: column-0 residual in the Z^-1 norm: |r|_{Z^-1} / |x|_{Z^-1} = %.2e\n",
+        (double) PetscSqrtReal (rr / xx)));
+      PetscCall (VecDestroy (&t));
+      PetscCall (VecDestroy (&x0c));
+      PetscCall (KSPDestroy (&kt));
+    }
     PetscCall (VecDestroy (&r));
     PetscCall (MatDestroy (&X));
     PetscCall (MatDestroy (&Y));

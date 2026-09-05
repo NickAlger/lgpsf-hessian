@@ -102,6 +102,10 @@ struct lgh_zs_ctx
   PetscInt            tile, nit;
   PetscReal           lmin, lmax;      /* margined outer interval       */
   Mat                 tB, tX, tR, tZ, tD, tAD;   /* n x tile workspace  */
+  /* constant deflation (see lgh_zs_deflate_setup) */
+  int                 deflate;
+  Vec                 ones, w, xw;     /* 1, A 1, work vector           */
+  PetscReal           s1A1;            /* 1' A 1                        */
 };
 
 /* ------------------------------------------------------------------ */
@@ -115,6 +119,43 @@ lgh_zs_create (KSP ksp, struct lgh_zs_ctx **out)
   zs->mode = 1;
   zs->ksp = ksp;
   *out = zs;
+  return PETSC_SUCCESS;
+}
+
+/* Constant deflation (2026-09-05).  With w = A 1 and s = 1'w, any right-
+ * hand side splits as x = alpha w + x_perp with alpha = 1'x / s, and
+ *     A^{-1} x = alpha 1 + A^{-1} x_perp     EXACTLY
+ * (A^{-1} w = 1 for any nonsingular A).  Why it matters: for a shifted
+ * stiffness A = L + c M (L 1 = 0) the constant is an exact eigenvector with
+ * the tiny eigenvalue c, so the solution's constant component is 1/c times
+ * the right-hand side's mean; an AMG cycle whose interpolation does not
+ * reproduce constants exactly (high-order stiffness with positive
+ * off-diagonals) leaks a fraction of that huge component into ordinary
+ * modes -- measured 45x the nominal residual on a right-hand side with a
+ * mean (continental ice-sheet prior, hypre hierarchy).  Handled
+ * analytically, the iteration only ever sees x_perp, whose solution is
+ * M-orthogonal to the constant and never large.  Off when 1'A1 is not
+ * safely positive (a singular Neumann operator). */
+static PetscErrorCode
+lgh_zs_deflate_setup (struct lgh_zs_ctx *zs, Mat A, int verbose)
+{
+  MPI_Comm            comm;
+  PetscReal           nw;
+  PetscInt            N;
+
+  PetscCall (PetscObjectGetComm ((PetscObject) A, &comm));
+  PetscCall (MatGetSize (A, &N, NULL));
+  PetscCall (MatCreateVecs (A, &zs->ones, &zs->w));
+  PetscCall (VecDuplicate (zs->ones, &zs->xw));
+  PetscCall (VecSet (zs->ones, 1.0));
+  PetscCall (MatMult (A, zs->ones, zs->w));
+  PetscCall (VecDot (zs->ones, zs->w, &zs->s1A1));
+  PetscCall (VecNorm (zs->w, NORM_2, &nw));
+  zs->deflate = (zs->s1A1 > 0. &&
+                 zs->s1A1 > 1e-10 * nw * PetscSqrtReal ((PetscReal) N));
+  if (verbose)
+    PetscCall (PetscPrintf (comm, "lgh_prior: constant deflation %s (1'A1 = %.3e, |A1| = %.3e)\n",
+                            zs->deflate ? "on" : "OFF", (double) zs->s1A1, (double) nw));
   return PETSC_SUCCESS;
 }
 
@@ -951,15 +992,23 @@ lgh_zs_bounds_mode3 (struct lgh_zs_ctx *zs, Vec rhs, PetscInt maxit,
 static PetscErrorCode
 lgh_zs_blocked_asolve (struct lgh_zs_ctx *zs, Mat Xsrc, Mat Ydst)
 {
-  PetscInt            nloc, ncols, c0, w_, j;
+  PetscInt            nloc, ncols, c0, w_, j, i;
   PetscInt            ldas, ldad, ldat;
   lgh_zs_pcapply_fn   pcap;
   void               *pcctx;
+  PetscScalar        *alpha = NULL, *asum = NULL;
+  const PetscScalar  *wa = NULL;
+  MPI_Comm            comm;
 
   if (zs->mode == 3) { pcap = lgh_zs_bvcycle_pcapply; pcctx = zs->mgh; }
   else               { pcap = lgh_zs_pcmatapply_pcapply; pcctx = zs->amg; }
+  PetscCall (PetscObjectGetComm ((PetscObject) Xsrc, &comm));
   PetscCall (MatGetLocalSize (Xsrc, &nloc, NULL));
   PetscCall (MatGetSize (Xsrc, NULL, &ncols));
+  if (zs->deflate) {
+    PetscCall (PetscMalloc2 (zs->tile, &alpha, zs->tile, &asum));
+    PetscCall (VecGetArrayRead (zs->w, &wa));
+  }
   for (c0 = 0; c0 < ncols; c0 += zs->tile) {
     const PetscScalar  *xs;
     PetscScalar        *tb, *yd;
@@ -975,6 +1024,21 @@ lgh_zs_blocked_asolve (struct lgh_zs_ctx *zs, Mat Xsrc, Mat Ydst)
                               nloc * sizeof (PetscScalar)));
     for (j = w_; j < zs->tile; j++)
       PetscCall (PetscMemzero (tb + j * ldat, nloc * sizeof (PetscScalar)));
+    if (zs->deflate) {
+      /* alpha_j = 1'x_j / 1'A1;  tile column j <- x_j - alpha_j (A 1) */
+      for (j = 0; j < w_; j++) {
+        PetscScalar         sj = 0.;
+
+        for (i = 0; i < nloc; i++) sj += tb[j * ldat + i];
+        asum[j] = sj;
+      }
+      PetscCallMPI (MPI_Allreduce (asum, alpha, (PetscMPIInt) w_, MPIU_SCALAR,
+                                   MPIU_SUM, comm));
+      for (j = 0; j < w_; j++) {
+        alpha[j] /= zs->s1A1;
+        for (i = 0; i < nloc; i++) tb[j * ldat + i] -= alpha[j] * wa[i];
+      }
+    }
     PetscCall (MatDenseRestoreArrayWrite (zs->tB, &tb));
     PetscCall (MatDenseRestoreArrayRead (Xsrc, &xs));
     PetscCall (MatZeroEntries (zs->tX));
@@ -985,11 +1049,21 @@ lgh_zs_blocked_asolve (struct lgh_zs_ctx *zs, Mat Xsrc, Mat Ydst)
     PetscCall (MatDenseGetLDA (Ydst, &ldad));
     PetscCall (MatDenseGetArrayRead (zs->tX, &tx));
     PetscCall (MatDenseGetArray (Ydst, &yd));
-    for (j = 0; j < w_; j++)
-      PetscCall (PetscMemcpy (yd + (c0 + j) * ldad, tx + j * ldat,
-                              nloc * sizeof (PetscScalar)));
+    for (j = 0; j < w_; j++) {
+      if (zs->deflate) {     /* y_j = A^{-1} x_perp,j + alpha_j 1 */
+        for (i = 0; i < nloc; i++)
+          yd[(c0 + j) * ldad + i] = tx[j * ldat + i] + alpha[j];
+      }
+      else
+        PetscCall (PetscMemcpy (yd + (c0 + j) * ldad, tx + j * ldat,
+                                nloc * sizeof (PetscScalar)));
+    }
     PetscCall (MatDenseRestoreArray (Ydst, &yd));
     PetscCall (MatDenseRestoreArrayRead (zs->tX, &tx));
+  }
+  if (zs->deflate) {
+    PetscCall (VecRestoreArrayRead (zs->w, &wa));
+    PetscCall (PetscFree2 (alpha, asum));
   }
   return PETSC_SUCCESS;
 }
@@ -1080,6 +1154,9 @@ lgh_zs_destroy (struct lgh_zs_ctx *zs)
   (void) MatDestroy (&zs->tZ);
   (void) MatDestroy (&zs->tD);
   (void) MatDestroy (&zs->tAD);
+  (void) VecDestroy (&zs->ones);
+  (void) VecDestroy (&zs->w);
+  (void) VecDestroy (&zs->xw);
   lgh_zs_mgh_destroy (zs->mgh);
   /* ksp is borrowed (the prior owns it) */
   (void) PetscFree (zs);
@@ -1105,6 +1182,23 @@ lgh_prior_mat_solveZ (Vec x, Vec y, void *vctx)
 
   ierr = VecZeroEntries (y);
   CHKERRABORT (PetscObjectComm ((PetscObject) p->Z), ierr);
+  if (p->zs != NULL && p->zs->deflate) {
+    /* constant deflation: x = alpha A1 + x_perp, y = alpha 1 + A^{-1} x_perp */
+    PetscScalar         alpha;
+
+    ierr = VecSum (x, &alpha);
+    CHKERRABORT (PetscObjectComm ((PetscObject) p->Z), ierr);
+    alpha /= p->zs->s1A1;
+    ierr = VecCopy (x, p->zs->xw);
+    CHKERRABORT (PetscObjectComm ((PetscObject) p->Z), ierr);
+    ierr = VecAXPY (p->zs->xw, -alpha, p->zs->w);
+    CHKERRABORT (PetscObjectComm ((PetscObject) p->Z), ierr);
+    ierr = KSPSolve (p->zksp, p->zs->xw, y);
+    CHKERRABORT (PetscObjectComm ((PetscObject) p->Z), ierr);
+    ierr = VecShift (y, alpha);
+    CHKERRABORT (PetscObjectComm ((PetscObject) p->Z), ierr);
+    return;
+  }
   ierr = KSPSolve (p->zksp, x, y);
   CHKERRABORT (PetscObjectComm ((PetscObject) p->Z), ierr);
 }
@@ -1161,6 +1255,7 @@ lgh_prior_setup_from_ksp (KSP ksp, Vec mass_lumps,
   PetscCall (PetscObjectGetComm ((PetscObject) Zop, &comm));
 
   PetscCall (lgh_zs_create (p->zksp, &p->zs));
+  PetscCall (lgh_zs_deflate_setup (p->zs, Zop, o->verbose));
   if (o->blocked_mode >= 2) {
     Vec                 rhs;
     PetscReal           emin, emax;
