@@ -84,9 +84,34 @@ typedef struct lgh_prior_mat_opts
                           CG-Lanczos; 0: power iteration                 */
   double smoother_top; /* smoothing-interval top factor (default 1.1)    */
   int    nu_force;     /* force smoother degree (0 = take the level's)   */
+  /* mode-3 hierarchy SOURCE (2026-09-04).  The blocked V-cycle needs only
+   * the level operators and prolongators; where they come from is a
+   * choice.  LGH_HIERARCHY_PCMG harvests them from the KSP's PCMG/GAMG
+   * preconditioner (the original path).  LGH_HIERARCHY_HYPRE builds a
+   * BoomerAMG hierarchy with hypre at setup (classical coarsening +
+   * interpolation, no smoother of hypre's is ever applied), reads the
+   * levels back, and discards the hypre solver; available when PETSc was
+   * configured with hypre (PETSC_HAVE_HYPRE).  LGH_HIERARCHY_AUTO (default)
+   * picks hypre when it is available and PCMG otherwise.  Measured on the
+   * ice-sheet prior (-Delta + 1e-5 M): GAMG's default aggressive coarsening
+   * leaves ~9% of the modes below 0.7 in the preconditioned spectrum,
+   * hypre's hierarchy leaves none ([0.64, 1] with our Chebyshev(2)). */
+  int    hierarchy;        /* LGH_HIERARCHY_AUTO | _PCMG | _HYPRE           */
+  int    hypre_coarsen;    /* BoomerAMG coarsening type (10 = HMIS)         */
+  int    hypre_interp;     /* BoomerAMG interpolation (6 = extended+i)      */
+  double hypre_strong;     /* strength threshold (0.25)                     */
+  int    hypre_agg_nl;     /* aggressive-coarsening levels (0: keep it 0)   */
+  int    hypre_max_coarse; /* coarsest-level size cap (200; dense LU below) */
   int    verbose;
 }
 lgh_prior_mat_opts_t;
+
+#define LGH_HIERARCHY_AUTO  0
+#define LGH_HIERARCHY_PCMG  1
+#define LGH_HIERARCHY_HYPRE 2
+
+/* 1 when the hypre hierarchy source is compiled in (PETSC_HAVE_HYPRE). */
+int lgh_have_hypre (void);
 
 lgh_prior_mat_opts_t lgh_prior_mat_opts_default (void);
 

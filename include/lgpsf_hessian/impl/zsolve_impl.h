@@ -29,6 +29,12 @@
 
 #include <stdlib.h>
 #include <stdio.h>
+#if defined(PETSC_HAVE_HYPRE)
+#include <petscmathypre.h>
+#include <HYPRE.h>
+#include <HYPRE_parcsr_ls.h>
+#include <_hypre_parcsr_ls.h>
+#endif
 
 #ifndef LGPSF_HESSIAN_GLR_COMMON_IMPL_H
 #error "include impl/glr_common_impl.h first (impl.hpp does this)"
@@ -64,6 +70,8 @@ typedef struct lgh_zs_mgh
   int                *c_counts, *c_displs;
   PetscScalar        *cB, *cX;
   Mat                 cBmat, cXmat;
+  int                 owns_ops;    /* 1: A, P are ours (hypre-built)     */
+  int                 source;      /* LGH_HIERARCHY_PCMG | _HYPRE        */
 }
 lgh_zs_mgh_t;
 
@@ -74,6 +82,7 @@ struct lgh_zs_ctx
   Mat                 Aface;  /* borrowed operator of ksp               */
   PC                  amg;    /* borrowed PC (mode 2)                   */
   lgh_zs_mgh_t       *mgh;    /* harvested hierarchy (mode 3)           */
+  int                 hierarchy;  /* resolved LGH_HIERARCHY_* (mode 3)  */
   PetscInt            tile, nit;
   PetscReal           lmin, lmax;      /* margined outer interval       */
   Mat                 tB, tX, tR, tZ, tD, tAD;   /* n x tile workspace  */
@@ -200,38 +209,45 @@ lgh_zs_spectral_bounds (struct lgh_zs_ctx *zs, Vec rhs, PetscInt maxit,
 
 /* -------- harvested hierarchy (mode 3) -------- */
 
-/* READ-ONLY harvest of the AMG hierarchy + per-level smoother bounds
- * (deterministic seed; run constants).  Work blocks at tile width.      */
+/* Build the blocked V-cycle data from level operators A[l] and
+ * prolongators P[l] (l = 0 coarsest .. nl-1 finest; P[l] maps l-1 -> l,
+ * P[0] unused), plus per-level smoother bounds (deterministic seed; run
+ * constants).  Work blocks at tile width.  coarse_ksp (may be NULL) is the
+ * fallback coarse solver when A_0 is too large for the dense LU; nu_hint[l]
+ * (may be NULL) is the level's suggested smoother degree.  With owned = 1
+ * the hierarchy takes ownership of the A/P handles.                      */
 static PetscErrorCode
-lgh_zs_mg_harvest (PC pcmg, PetscInt tile, int smax_krylov,
-                   PetscReal smoother_top, PetscInt nu_force,
-                   lgh_zs_mgh_t **h_out)
+lgh_zs_mg_build (PetscInt nl, Mat *Aops, Mat *Pops, KSP coarse_ksp,
+                 const PetscInt *nu_hint, int owned, int source,
+                 PetscInt tile, int smax_krylov, PetscReal smoother_top,
+                 PetscInt nu_force, lgh_zs_mgh_t **h_out)
 {
   lgh_zs_mgh_t       *h;
-  PetscInt            l, nl;
+  PetscInt            l;
 
   PetscCall (PetscNew (&h));
-  PetscCall (PCMGGetLevels (pcmg, &nl));
-  h->nl = nl; h->tile = tile;
+  h->nl = nl; h->tile = tile; h->owns_ops = owned; h->source = source;
   PetscCall (PetscCalloc1 (nl, &h->lev));
   for (l = 0; l < nl; l++) {
     lgh_zs_mglevel_t   *lv = &h->lev[l];
-    KSP                 kl;
     PetscInt            nloc, Nglob;
     MPI_Comm            comm;
 
-    PetscCall (PCMGGetSmoother (pcmg, l, &kl));
-    PetscCall (KSPGetOperators (kl, &lv->A, NULL));
+    lv->A = Aops[l];
     if (l == 0) {
       PetscInt            n0;
       MPI_Comm            comm0;
       PetscMPIInt         csize;
 
-      h->coarse = kl;
+      h->coarse = coarse_ksp;
       PetscCall (MatGetSize (lv->A, &n0, NULL));
       PetscCall (PetscObjectGetComm ((PetscObject) lv->A, &comm0));
       PetscCallMPI (MPI_Comm_size (comm0, &csize));
       h->csize = csize; h->n0 = n0;
+      PetscCheck (n0 <= 2000 || coarse_ksp != NULL, comm0, PETSC_ERR_SUP,
+                  "coarsest level has %" PetscInt_FMT " rows (> 2000) and "
+                  "there is no coarse KSP to fall back on; lower "
+                  "hypre_max_coarse", n0);
       if (n0 <= 2000 && csize == 1) {
         /* tiny coarse operator: dense LU once, block MatMatSolve */
         PetscCall (MatConvert (lv->A, MATDENSE, MAT_INITIAL_MATRIX,
@@ -271,7 +287,7 @@ lgh_zs_mg_harvest (PC pcmg, PetscInt tile, int smax_krylov,
       }
     }
     if (l > 0) {
-      PetscCall (PCMGGetInterpolation (pcmg, l, &lv->P));
+      lv->P = Pops[l];
     }
     PetscCall (PetscObjectGetComm ((PetscObject) lv->A, &comm));
     PetscCall (MatGetLocalSize (lv->A, &nloc, NULL));
@@ -280,8 +296,7 @@ lgh_zs_mg_harvest (PC pcmg, PetscInt tile, int smax_krylov,
     PetscCall (MatGetDiagonal (lv->A, lv->dinv));
     PetscCall (VecReciprocal (lv->dinv));
     if (l > 0) {
-      PetscInt            maxits;
-      PetscCall (KSPGetTolerances (kl, NULL, NULL, NULL, &maxits));
+      const PetscInt      maxits = (nu_hint != NULL) ? nu_hint[l] : 0;
       lv->nu = (nu_force > 0) ? nu_force
                               : ((maxits > 0 && maxits < 20) ? maxits : 2);
       if (smax_krylov) {
@@ -358,6 +373,152 @@ lgh_zs_mg_harvest (PC pcmg, PetscInt tile, int smax_krylov,
   return PETSC_SUCCESS;
 }
 
+/* READ-ONLY harvest of a PCMG/GAMG hierarchy (the original source).      */
+static PetscErrorCode
+lgh_zs_mg_harvest (PC pcmg, PetscInt tile, int smax_krylov,
+                   PetscReal smoother_top, PetscInt nu_force,
+                   lgh_zs_mgh_t **h_out)
+{
+  PetscInt            l, nl;
+  Mat                *Aops, *Pops;
+  PetscInt           *nuh;
+  KSP                 kcoarse = NULL;
+  PetscBool           ismg;
+  const char         *tname;
+
+  PetscCall (PetscObjectTypeCompareAny ((PetscObject) pcmg, &ismg, PCMG,
+                                        PCGAMG, PCML, ""));
+  PetscCall (PetscObjectGetType ((PetscObject) pcmg, &tname));
+  PetscCheck (ismg, PetscObjectComm ((PetscObject) pcmg), PETSC_ERR_SUP,
+              "hierarchy = pcmg needs a PCMG-type preconditioner on the "
+              "Z solver (got %s); use hierarchy = hypre or configure GAMG",
+              tname);
+  PetscCall (PCMGGetLevels (pcmg, &nl));
+  PetscCall (PetscMalloc3 (nl, &Aops, nl, &Pops, nl, &nuh));
+  for (l = 0; l < nl; l++) {
+    KSP                 kl;
+
+    PetscCall (PCMGGetSmoother (pcmg, l, &kl));
+    PetscCall (KSPGetOperators (kl, &Aops[l], NULL));
+    Pops[l] = NULL;
+    if (l > 0) PetscCall (PCMGGetInterpolation (pcmg, l, &Pops[l]));
+    if (l == 0) kcoarse = kl;
+    PetscCall (KSPGetTolerances (kl, NULL, NULL, NULL, &nuh[l]));
+  }
+  PetscCall (lgh_zs_mg_build (nl, Aops, Pops, kcoarse, nuh, 0,
+                              LGH_HIERARCHY_PCMG, tile, smax_krylov,
+                              smoother_top, nu_force, h_out));
+  PetscCall (PetscFree3 (Aops, Pops, nuh));
+  return PETSC_SUCCESS;
+}
+
+#if defined(PETSC_HAVE_HYPRE)
+/* Build a BoomerAMG hierarchy for A with hypre, copy its level operators
+ * and prolongators into PETSc matrices, discard the hypre solver.  hypre's
+ * coarse operators are Galerkin (R = P^T, restriction type 0), which is
+ * what the blocked cycle assumes.  hypre level 0 is the finest; ours is
+ * the coarsest, hence the index flip.                                    */
+static PetscErrorCode
+lgh_zs_mg_harvest_hypre (Mat A, int coarsen, int interp, PetscReal strong,
+                         int agg_nl, int max_coarse, PetscInt tile,
+                         int smax_krylov, PetscReal smoother_top,
+                         PetscInt nu_force, lgh_zs_mgh_t **h_out)
+{
+  Mat                 Ah;
+  hypre_ParCSRMatrix *par;
+  HYPRE_Solver        solver;
+  hypre_ParAMGData   *amg;
+  hypre_ParVector    *fv, *xv;
+  hypre_ParCSRMatrix **A_array, **P_array;
+  PetscInt            nl, k, l;
+  Mat                *Aops, *Pops;
+
+  PetscCall (MatConvert (A, MATHYPRE, MAT_INITIAL_MATRIX, &Ah));
+  PetscCall (MatHYPREGetParCSR (Ah, &par));
+  PetscCallExternal (HYPRE_BoomerAMGCreate, &solver);
+  PetscCallExternal (HYPRE_BoomerAMGSetCoarsenType, solver, coarsen);
+  PetscCallExternal (HYPRE_BoomerAMGSetInterpType, solver, interp);
+  PetscCallExternal (HYPRE_BoomerAMGSetStrongThreshold, solver, strong);
+  PetscCallExternal (HYPRE_BoomerAMGSetAggNumLevels, solver, agg_nl);
+  PetscCallExternal (HYPRE_BoomerAMGSetMaxCoarseSize, solver, max_coarse);
+  PetscCallExternal (HYPRE_BoomerAMGSetMaxLevels, solver, 25);
+  PetscCallExternal (HYPRE_BoomerAMGSetRestriction, solver, 0);
+  PetscCallExternal (HYPRE_BoomerAMGSetRelaxType, solver, 0);  /* setup only */
+  PetscCallExternal (HYPRE_BoomerAMGSetPrintLevel, solver, 0);
+  PetscCallExternal (HYPRE_BoomerAMGSetMaxIter, solver, 1);
+  PetscCallExternal (HYPRE_BoomerAMGSetTol, solver, 0.);
+  fv = hypre_ParVectorCreate (hypre_ParCSRMatrixComm (par),
+                              hypre_ParCSRMatrixGlobalNumRows (par),
+                              hypre_ParCSRMatrixRowStarts (par));
+  xv = hypre_ParVectorCreate (hypre_ParCSRMatrixComm (par),
+                              hypre_ParCSRMatrixGlobalNumRows (par),
+                              hypre_ParCSRMatrixRowStarts (par));
+  hypre_ParVectorInitialize (fv);
+  hypre_ParVectorInitialize (xv);
+  PetscCallExternal (HYPRE_BoomerAMGSetup, solver, (HYPRE_ParCSRMatrix) par,
+                     (HYPRE_ParVector) fv, (HYPRE_ParVector) xv);
+  amg = (hypre_ParAMGData *) solver;
+  nl = (PetscInt) hypre_ParAMGDataNumLevels (amg);
+  A_array = hypre_ParAMGDataAArray (amg);
+  P_array = hypre_ParAMGDataPArray (amg);
+  PetscCall (PetscMalloc2 (nl, &Aops, nl, &Pops));
+  for (k = 0; k < nl; k++) {
+    l = nl - 1 - k;
+    if (k == 0) {
+      Aops[l] = A;
+      PetscCall (PetscObjectReference ((PetscObject) A));
+    }
+    else {
+      PetscCall (MatCreateFromParCSR (A_array[k], MATAIJ, PETSC_COPY_VALUES,
+                                      &Aops[l]));
+    }
+    Pops[l] = NULL;
+    if (k < nl - 1) {   /* P_array[k]: hypre level k+1 -> k, i.e. ours l-1 -> l */
+      PetscCall (MatCreateFromParCSR (P_array[k], MATAIJ, PETSC_COPY_VALUES,
+                                      &Pops[l]));
+    }
+  }
+  hypre_ParVectorDestroy (fv);
+  hypre_ParVectorDestroy (xv);
+  PetscCallExternal (HYPRE_BoomerAMGDestroy, solver);
+  PetscCall (MatDestroy (&Ah));
+  PetscCall (lgh_zs_mg_build (nl, Aops, Pops, NULL, NULL, 1,
+                              LGH_HIERARCHY_HYPRE, tile, smax_krylov,
+                              smoother_top, nu_force, h_out));
+  PetscCall (PetscFree2 (Aops, Pops));
+  return PETSC_SUCCESS;
+}
+#endif
+
+/* one line: source, levels, sizes, operator complexity                   */
+static PetscErrorCode
+lgh_zs_mgh_report (const lgh_zs_mgh_t *h, MPI_Comm comm)
+{
+  PetscInt            l;
+  double              nnz_fine = 0., nnz_all = 0.;
+  char                sizes[512] = "";
+  size_t              used = 0;
+
+  for (l = h->nl - 1; l >= 0; l--) {
+    MatInfo             info;
+    PetscInt            N;
+
+    PetscCall (MatGetInfo (h->lev[l].A, MAT_GLOBAL_SUM, &info));
+    PetscCall (MatGetSize (h->lev[l].A, &N, NULL));
+    nnz_all += info.nz_used;
+    if (l == h->nl - 1) nnz_fine = info.nz_used;
+    if (used < sizeof (sizes) - 32)
+      used += (size_t) snprintf (sizes + used, sizeof (sizes) - used,
+                                 "%s%" PetscInt_FMT, (used ? "-" : ""), N);
+  }
+  PetscCall (PetscPrintf (comm, "lgh_prior: hierarchy %s: %" PetscInt_FMT
+                          " levels %s, operator complexity %.2f\n",
+                          h->source == LGH_HIERARCHY_HYPRE ? "hypre" : "pcmg",
+                          h->nl, sizes,
+                          nnz_fine > 0. ? nnz_all / nnz_fine : 0.));
+  return PETSC_SUCCESS;
+}
+
 static void
 lgh_zs_mgh_destroy (lgh_zs_mgh_t *h)
 {
@@ -366,7 +527,11 @@ lgh_zs_mgh_destroy (lgh_zs_mgh_t *h)
   if (h == NULL) return;
   for (l = 0; l < h->nl; l++) {
     lgh_zs_mglevel_t   *lv = &h->lev[l];
-    /* A, P, coarse KSP are borrowed */
+    /* A, P, coarse KSP are borrowed unless the hierarchy built them */
+    if (h->owns_ops) {
+      (void) MatDestroy (&lv->A);
+      (void) MatDestroy (&lv->P);
+    }
     (void) VecDestroy (&lv->dinv);
     (void) MatDestroy (&lv->R);
     (void) MatDestroy (&lv->Z);
@@ -509,21 +674,46 @@ lgh_zs_pcmatapply_pcapply (Mat R, Mat Z, void *ctx)
 /* -------- blocked-mode setup and drivers -------- */
 
 static PetscErrorCode
-lgh_zs_blocked_setup (struct lgh_zs_ctx *zs, int mode, PetscInt tile,
-                      int smax_krylov, PetscReal smoother_top,
-                      PetscInt nu_force)
+lgh_zs_blocked_setup (struct lgh_zs_ctx *zs, const lgh_prior_mat_opts_t *o)
 {
   PetscInt            nloc, Nglob;
   MPI_Comm            comm;
+  const int           mode = o->blocked_mode;
+  const PetscInt      tile = o->tile;
 
   zs->mode = mode; zs->tile = tile;
   PetscCall (KSPGetOperators (zs->ksp, &zs->Aface, NULL));
   PetscCall (KSPGetPC (zs->ksp, &zs->amg));
-  if (mode == 3) {
-    PetscCall (lgh_zs_mg_harvest (zs->amg, tile, smax_krylov, smoother_top,
-                                  nu_force, &zs->mgh));
-  }
   PetscCall (PetscObjectGetComm ((PetscObject) zs->Aface, &comm));
+  if (mode == 3) {
+    int                 want = o->hierarchy;
+
+#if defined(PETSC_HAVE_HYPRE)
+    if (want == LGH_HIERARCHY_AUTO) want = LGH_HIERARCHY_HYPRE;
+#else
+    PetscCheck (want != LGH_HIERARCHY_HYPRE, comm, PETSC_ERR_SUP,
+                "hierarchy = hypre requested, but this PETSc was built "
+                "without hypre (PETSC_HAVE_HYPRE undefined)");
+    want = LGH_HIERARCHY_PCMG;
+#endif
+    zs->hierarchy = want;
+#if defined(PETSC_HAVE_HYPRE)
+    if (want == LGH_HIERARCHY_HYPRE) {
+      PetscCall (lgh_zs_mg_harvest_hypre (zs->Aface, o->hypre_coarsen,
+                                          o->hypre_interp, o->hypre_strong,
+                                          o->hypre_agg_nl, o->hypre_max_coarse,
+                                          tile, o->smax_krylov,
+                                          o->smoother_top, o->nu_force,
+                                          &zs->mgh));
+    }
+    else
+#endif
+    {
+      PetscCall (lgh_zs_mg_harvest (zs->amg, tile, o->smax_krylov,
+                                    o->smoother_top, o->nu_force, &zs->mgh));
+    }
+    if (o->verbose) PetscCall (lgh_zs_mgh_report (zs->mgh, comm));
+  }
   PetscCall (MatGetLocalSize (zs->Aface, &nloc, NULL));
   PetscCall (MatGetSize (zs->Aface, &Nglob, NULL));
   PetscCall (MatCreateDense (comm, nloc, PETSC_DECIDE, Nglob, tile, NULL,
@@ -840,9 +1030,7 @@ lgh_prior_setup_from_ksp (KSP ksp, Vec mass_lumps,
     PetscInt            rlo, rhi, i;
     PetscScalar        *ra;
 
-    PetscCall (lgh_zs_blocked_setup (p->zs, o->blocked_mode, o->tile,
-                                     o->smax_krylov, o->smoother_top,
-                                     o->nu_force));
+    PetscCall (lgh_zs_blocked_setup (p->zs, o));
     PetscCall (MatCreateVecs (Zop, &rhs, NULL));
     PetscCall (VecGetOwnershipRange (rhs, &rlo, &rhi));
     PetscCall (VecGetArray (rhs, &ra));
@@ -933,6 +1121,16 @@ lgh_zs_prior_teardown (lgh_prior_t *p)
 {
   if (p->zs != NULL) { lgh_zs_destroy (p->zs); p->zs = NULL; }
   if (p->zksp != NULL) (void) KSPDestroy (&p->zksp);
+}
+
+int
+lgh_have_hypre (void)
+{
+#if defined(PETSC_HAVE_HYPRE)
+  return 1;
+#else
+  return 0;
+#endif
 }
 
 #endif /* LGPSF_HESSIAN_ZSOLVE_IMPL_H */

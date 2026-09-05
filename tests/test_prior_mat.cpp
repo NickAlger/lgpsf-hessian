@@ -126,21 +126,30 @@ main (int argc, char **argv)
   PetscCall (VecZeroEntries (xref));
   PetscCall (KSPSolve (kref, b, xref));
 
-  for (int mode = 0; mode <= 3; mode++) {
+  /* passes: per-column KSP (0), blocked PCMatApply (2), blocked V-cycle on
+   * the PCMG hierarchy (3), and -- when PETSc has hypre -- the blocked
+   * V-cycle on a hypre-built hierarchy (3h).  Same gates for all.        */
+  const int           n_pass = lgh_have_hypre () ? 4 : 3;
+  for (int pass = 0; pass < n_pass; pass++) {
     lgh_prior_mat_opts_t po = lgh_prior_mat_opts_default ();
     lgh_prior_t        *prior;
     char                what[128];
     double              rd;
+    const int           mode = (pass == 0) ? 0 : (pass == 1) ? 2 : 3;
 
-    if (mode == 1) continue;   /* 1 == 0 (per-column) */
     po.blocked_mode = mode;
+    po.hierarchy = (pass == 3) ? LGH_HIERARCHY_HYPRE : LGH_HIERARCHY_PCMG;
     po.tile = 8;
+    po.verbose = (mode == 3);
+    if (mode == 3)
+      PetscCall (PetscPrintf (PETSC_COMM_WORLD, "-- mode 3, hierarchy %s\n",
+                              pass == 3 ? "hypre" : "pcmg"));
     PetscCall ((PetscErrorCode) lgh_prior_create_mat (Z, mass, &po, &prior));
 
     /* single-vector solve vs reference */
     lgh_prior_mat_solveZ (b, x, prior);
     PetscCall (rel_diff (x, xref, s1, &rd));
-    snprintf (what, sizeof (what), "mode %d vec solve vs reference", mode);
+    snprintf (what, sizeof (what), "pass %d (mode %d) vec solve vs reference", pass, mode);
     check (rd < 1e-8, what, rd);
 
     /* blocked solve vs reference (multi-column, width > tile) */
@@ -173,8 +182,8 @@ main (int argc, char **argv)
           PetscCall (rel_diff (x, xref, s1, &rd));
           if (rd > worst) worst = rd;
         }
-        snprintf (what, sizeof (what), "mode %d blocked solve vs reference",
-                  mode);
+        snprintf (what, sizeof (what),
+                  "pass %d (mode %d) blocked solve vs reference", pass, mode);
         check (worst < 1e-7, what, worst);
       }
       PetscCall (MatDestroy (&X));
@@ -186,7 +195,7 @@ main (int argc, char **argv)
     lgh_prior_mat_applyZ (b, s1, prior);
     lgh_prior_mat_solveZ (s1, x, prior);
     PetscCall (rel_diff (x, b, s1, &rd));
-    snprintf (what, sizeof (what), "mode %d solveZ(applyZ(v)) == v", mode);
+    snprintf (what, sizeof (what), "pass %d (mode %d) solveZ(applyZ(v)) == v", pass, mode);
     check (rd < 1e-8, what, rd);
 
     lgh_prior_destroy (prior);

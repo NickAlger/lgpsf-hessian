@@ -51,6 +51,20 @@ if(LGH_WITH_SCALAPACK)
   endif()
 endif()
 
+# hypre: OPTIONAL hierarchy source for the blocked Z-solve (mode 3).  The code
+# compiles in whenever PETSc was configured with hypre (petscconf.h defines
+# PETSC_HAVE_HYPRE) and is selected at runtime (hierarchy = auto picks it).
+# The harvest calls hypre's setup directly, so hypre must also be on the link
+# line; PETSc's --download-hypre puts it in PETSc's lib dir.
+find_library(LGH_HYPRE_LIBRARY NAMES HYPRE
+             HINTS ${PETSC_LIBRARY_DIRS} ${PETSC_STATIC_LIBRARY_DIRS})
+if(LGH_HYPRE_LIBRARY)
+  message(STATUS "lgpsf-hessian: hypre found (${LGH_HYPRE_LIBRARY}) -- the "
+                 "hypre hierarchy source is available if PETSc defines PETSC_HAVE_HYPRE")
+else()
+  message(STATUS "lgpsf-hessian: hypre not found -- the blocked Z-solve harvests the PCMG hierarchy")
+endif()
+
 # lgpsf (header-only; brings ellipsoid_tree and Eigen) — needed by the fit
 # component only.  find_package first, then a pinned FetchContent fallback;
 # local checkouts via -DFETCHCONTENT_SOURCE_DIR_LGPSF=/path/to/lgpsf (and
@@ -90,7 +104,8 @@ target_include_directories(lgpsf_hessian_glr INTERFACE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
 target_link_libraries(lgpsf_hessian_glr INTERFACE
-  PkgConfig::PETSC MPI::MPI_C ${LAPACK_LIBRARIES})
+  PkgConfig::PETSC MPI::MPI_C ${LAPACK_LIBRARIES}
+  $<$<BOOL:${LGH_HYPRE_LIBRARY}>:${LGH_HYPRE_LIBRARY}>)
 target_compile_features(lgpsf_hessian_glr INTERFACE c_std_99)
 # In C++ TUs, Ubuntu's OpenMPI mpi.h auto-includes the deprecated MPI C++
 # bindings, adding a libmpi_cxx link dependency that MPI::MPI_C does not

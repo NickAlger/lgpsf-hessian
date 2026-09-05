@@ -107,6 +107,12 @@ lgh_prior_mat_opts_default (void)
   o.smax_krylov = 1;
   o.smoother_top = 1.1;
   o.nu_force = 0;
+  o.hierarchy = LGH_HIERARCHY_AUTO;
+  o.hypre_coarsen = 10;      /* HMIS */
+  o.hypre_interp = 6;        /* extended+i */
+  o.hypre_strong = 0.25;
+  o.hypre_agg_nl = 0;
+  o.hypre_max_coarse = 200;
   o.verbose = 0;
   return o;
 }

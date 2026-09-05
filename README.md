@@ -129,6 +129,34 @@ without `-DZeroByteTypeBug` SIGFPEs on 2D process grids under MPICH — the libr
 defaults to a safe 1×P grid (`opts.grid2d = 0`); and floating-point bit-identity holds
 within a build, not across compilers/flags.
 
+### Optional: hypre for the blocked prior solve's hierarchy
+
+The blocked Z-solve (`lgh_prior_mat_opts_t.blocked_mode = 3`) runs a block
+V-cycle on a multigrid hierarchy of the prior operator. Where that hierarchy
+comes from is `opts.hierarchy`:
+
+- `LGH_HIERARCHY_PCMG`: harvested from the Z solver's PCMG/GAMG preconditioner
+  (the original path; no extra dependency).
+- `LGH_HIERARCHY_HYPRE`: built at setup by hypre's BoomerAMG (classical
+  coarsening + interpolation, defaults HMIS / extended+i, no aggressive
+  coarsening), levels copied into PETSc matrices, hypre solver discarded. None of
+  hypre's smoothers or solves are used online.
+- `LGH_HIERARCHY_AUTO` (default): hypre when available, PCMG otherwise.
+
+Availability is decided by PETSc: the hypre path compiles in when `petscconf.h`
+defines `PETSC_HAVE_HYPRE` (PETSc configured with `--download-hypre` or
+`--with-hypre-dir`). Because the harvest calls hypre's setup directly, hypre must
+also be on the link line; CMake finds `libHYPRE` next to PETSc and adds it, and
+non-CMake consumers add `-lHYPRE` themselves. Without hypre everything builds and
+runs as before.
+
+Why it exists: on a near-singular prior (`-Delta + 1e-5 M` on the Antarctic basal
+mesh) GAMG's default aggressive coarsening leaves ~9% of the preconditioned
+spectrum below 0.7 (bottom 0.11); the hypre hierarchy with the same Chebyshev(2)
+smoother gives [0.64, 1], i.e. Chebyshev counts of 5 instead of 13 at rtol 1e-3.
+With `opts.verbose` the setup prints one line per hierarchy (source, levels,
+sizes, operator complexity) before the spectral bounds.
+
 ## License
 
 MIT. See `LICENSE`.
