@@ -8,3 +8,8 @@ if(TARGET lgpsf_hessian::lgpsf_hessian)
 else()
   message(STATUS "examples: lgpsf not available, skipping heat example")
 endif()
+
+# Blocked prior Z-solve benchmark (PETSc only): hierarchy quality vs grid size,
+# domain size, near-null shift, rank count and hypre's coarsening knobs.
+add_executable(prior_zsolve_bench prior_bench/prior_zsolve_bench.cpp)
+target_link_libraries(prior_zsolve_bench PRIVATE lgpsf_hessian::glr)
