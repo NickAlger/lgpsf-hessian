@@ -320,8 +320,10 @@ lgh_zs_mg_build (PetscInt nl, Mat *Aops, Mat *Pops, KSP coarse_ksp,
       h->csize = csize; h->n0 = n0;
       PetscCheck (n0 <= 2000 || coarse_ksp != NULL, comm0, PETSC_ERR_SUP,
                   "coarsest level has %" PetscInt_FMT " rows (> 2000) and "
-                  "there is no coarse KSP to fall back on; lower "
-                  "hypre_max_coarse", n0);
+                  "there is no coarse KSP to fall back on: the hierarchy did "
+                  "not coarsen enough -- lower hypre_max_coarse, or lower "
+                  "hypre_strong when the operator is diagonally dominant "
+                  "(no strong connections => no coarse level at all)", n0);
       if (n0 <= 2000 && csize == 1) {
         /* tiny coarse operator: dense LU once, block MatMatSolve */
         PetscCall (MatConvert (lv->A, MATDENSE, MAT_INITIAL_MATRIX,
@@ -1195,9 +1197,24 @@ lgh_prior_setup_from_ksp (KSP ksp, Vec mass_lumps,
     }
     {
       const char         *dump = getenv ("LGH_ZS_DUMP");
+      const char         *dumps = getenv ("LGH_ZS_DUMP_SPARSE");
 
       if (dump != NULL)
         PetscCall (lgh_zs_dump_dense (p->zs, Zop, dump));
+      /* LGH_ZS_DUMP_SPARSE=<path>: the operator and the mass lumps in PETSc
+       * binary (MatLoad / VecLoad them back, in that order), any size --
+       * for taking a production prior to a workstation and mapping the
+       * hierarchy knobs there (examples/prior_bench, -load <path>). */
+      if (dumps != NULL) {
+        PetscViewer         v;
+
+        PetscCall (PetscViewerBinaryOpen (comm, dumps, FILE_MODE_WRITE, &v));
+        PetscCall (MatView (Zop, v));
+        PetscCall (VecView (mass_lumps, v));
+        PetscCall (PetscViewerDestroy (&v));
+        if (o->verbose)
+          PetscCall (PetscPrintf (comm, "lgh_prior: operator + mass lumps written to %s\n", dumps));
+      }
     }
   }
 

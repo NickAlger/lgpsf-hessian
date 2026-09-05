@@ -31,9 +31,15 @@ jobs:
           sudo apt-get install -y cmake pkg-config petsc-dev libhypre-dev \
             libscalapack-openmpi-dev liblapack-dev libopenmpi-dev
       - name: configure
+        # The hypre outcome is surfaced as a notice (visible through the public
+        # checks API, unlike the raw step log).
         run: |
           PKG_CONFIG_PATH=$(dirname $(find /usr/lib -name "PETSc.pc" | head -1)) \
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DLGH_FETCH_LGPSF=ON
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DLGH_FETCH_LGPSF=ON 2>&1 | tee configure.log
+          exit ${PIPESTATUS[0]}
+      - name: surface the hypre outcome
+        run: |
+          grep -i "hypre" configure.log | while IFS= read -r l; do echo "::notice::${l}"; done
       - name: build (-j 2 — Eigen-heavy TUs, see docs/platform-notes.md)
         run: |
           cmake --build build -j 2 2>&1 | tee build.log
@@ -47,4 +53,11 @@ jobs:
             while IFS= read -r l; do echo "::error::${l}"; done
           tail -6 build.log | while IFS= read -r l; do echo "::error::tail: ${l}"; done
       - name: test
-        run: ctest --test-dir build --output-on-failure
+        run: |
+          ctest --test-dir build --output-on-failure -V 2>&1 | tee test.log
+          exit ${PIPESTATUS[0]}
+      - name: surface the prior test's hierarchies
+        if: always()
+        run: |
+          grep -h "lgh_prior: hierarchy" test.log | sort | uniq -c | \
+            while IFS= read -r l; do echo "::notice::${l}"; done

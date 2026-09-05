@@ -24,8 +24,12 @@
  *   -hierarchy auto|pcmg|hypre   -coarsen 10 -interp 6 -strong 0.25
  *   -agg_nl 0 -max_coarse 200    -nu 0 (force smoother degree)
  *   -mode 3 -tile 64 -cheb_rtol 1e-3 -smoother_top 1.1 -nsolve 1
+ *   -load <file>  a production operator instead of the grid: PETSc binary
+ *                 holding the Mat then the mass-lump Vec, as written by the
+ *                 library's LGH_ZS_DUMP_SPARSE=<file> hook at prior setup
  *
- * Example:  mpiexec -n 4 ./prior_zsolve_bench -m 640 -L 5000 -mass 1e-5
+ * Examples:  mpiexec -n 4 ./prior_zsolve_bench -m 640 -L 5000 -mass 1e-5
+ *            mpiexec -n 4 ./prior_zsolve_bench -load prior_continent.petsc -strong 0.5
  */
 
 #include <lgpsf_hessian/lgpsf_hessian.h>
@@ -75,7 +79,8 @@ main (int argc, char **argv)
 {
   PetscInt            m = 160, nsolve = 1;
   PetscReal           L = 5000., mass = 1e-5;
-  char                hier[32] = "auto";
+  char                hier[32] = "auto", load[PETSC_MAX_PATH_LEN] = "";
+  PetscBool           have_load = PETSC_FALSE;
   lgh_prior_mat_opts_t po = lgh_prior_mat_opts_default ();
   Mat                 Z;
   Vec                 lump;
@@ -104,12 +109,29 @@ main (int argc, char **argv)
   PetscCall (PetscOptionsGetReal (NULL, NULL, "-cheb_rtol", &po.cheb_rtol, NULL));
   PetscCall (PetscOptionsGetReal (NULL, NULL, "-smoother_top", &po.smoother_top, NULL));
   PetscCall (PetscOptionsGetInt (NULL, NULL, "-nsolve", &nsolve, NULL));
+  PetscCall (PetscOptionsGetString (NULL, NULL, "-load", load, sizeof (load), &have_load));
   if (!strcmp (hier, "pcmg") || !strcmp (hier, "gamg")) po.hierarchy = LGH_HIERARCHY_PCMG;
   else if (!strcmp (hier, "hypre")) po.hierarchy = LGH_HIERARCHY_HYPRE;
   else po.hierarchy = LGH_HIERARCHY_AUTO;
 
-  PetscCall (build_Z (m, L, mass, &Z, &lump));
-  {
+  if (have_load) {
+    PetscViewer         v;
+    PetscInt            N;
+
+    PetscCall (PetscViewerBinaryOpen (PETSC_COMM_WORLD, load, FILE_MODE_READ, &v));
+    PetscCall (MatCreate (PETSC_COMM_WORLD, &Z));
+    PetscCall (MatSetType (Z, MATAIJ));
+    PetscCall (MatLoad (Z, v));
+    PetscCall (MatCreateVecs (Z, &lump, NULL));
+    PetscCall (VecLoad (lump, v));
+    PetscCall (PetscViewerDestroy (&v));
+    PetscCall (MatGetSize (Z, &N, NULL));
+    m = (PetscInt) PetscSqrtReal ((PetscReal) N);   /* only for the column count below */
+    PetscCall (PetscPrintf (PETSC_COMM_WORLD,
+      "bench: loaded %s: N = %d, ranks %d, hierarchy %s (hypre compiled in: %s)\n",
+      load, (int) N, (int) size, hier, lgh_have_hypre () ? "yes" : "no"));
+  } else PetscCall (build_Z (m, L, mass, &Z, &lump));
+  if (!have_load) {
     const PetscReal     h = L / (PetscReal) (m - 1);
     /* Laplacian modes below the shift: (k pi / L)^2 < mass  =>  k < L sqrt(mass) / pi
      * per direction (continuum estimate, Neumann) */
@@ -134,9 +156,10 @@ main (int argc, char **argv)
     Vec                 x0, y0, r;
     PetscInt            nloc;
     PetscReal           nr, nx;
-    const PetscInt      N = m * m;
+    PetscInt            N;
     PetscRandom         rnd;
 
+    PetscCall (VecGetSize (lump, &N));
     PetscCall (VecGetLocalSize (lump, &nloc));
     PetscCall (MatCreateDense (PETSC_COMM_WORLD, nloc, PETSC_DECIDE, N, po.tile, NULL, &X));
     PetscCall (MatCreateDense (PETSC_COMM_WORLD, nloc, PETSC_DECIDE, N, po.tile, NULL, &Y));
