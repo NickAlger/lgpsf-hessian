@@ -27,6 +27,9 @@
 #ifndef LGPSF_HESSIAN_ZSOLVE_IMPL_H
 #define LGPSF_HESSIAN_ZSOLVE_IMPL_H
 
+#include <stdlib.h>
+#include <stdio.h>
+
 #ifndef LGPSF_HESSIAN_GLR_COMMON_IMPL_H
 #error "include impl/glr_common_impl.h first (impl.hpp does this)"
 #endif
@@ -663,6 +666,65 @@ lgh_zs_blocked_asolve (struct lgh_zs_ctx *zs, Mat Xsrc, Mat Ydst)
   return PETSC_SUCCESS;
 }
 
+/* Diagnostic (env LGH_ZS_DUMP=<prefix>; serial, mode 3, N <= 12000 only):
+ * write the face operator A and the block V-cycle applied to the identity,
+ * both as raw column-major float64 N x N files, for an offline exact
+ * eigen-analysis of the V-cycle-preconditioned operator (deflation
+ * studies).  Never runs unless the environment variable is set.          */
+static PetscErrorCode
+lgh_zs_dump_dense (struct lgh_zs_ctx *zs, Mat A, const char *prefix)
+{
+  MPI_Comm            comm;
+  PetscMPIInt         size;
+  PetscInt            N, c0, w, j, lda, ldaz;
+  Mat                 Adense;
+  const PetscScalar  *a, *tz;
+  PetscScalar        *tb;
+  FILE               *fp;
+  char                name[PETSC_MAX_PATH_LEN];
+
+  PetscCall (PetscObjectGetComm ((PetscObject) A, &comm));
+  PetscCallMPI (MPI_Comm_size (comm, &size));
+  PetscCall (MatGetSize (A, &N, NULL));
+  if (size != 1 || N > 12000 || zs->mode != 3) {
+    PetscCall (PetscPrintf (comm, "lgh_zs_dump_dense: skipped (size %d, N %d, "
+                            "mode %d)\n", (int) size, (int) N, zs->mode));
+    return PETSC_SUCCESS;
+  }
+  PetscCall (MatConvert (A, MATDENSE, MAT_INITIAL_MATRIX, &Adense));
+  PetscCall (MatDenseGetLDA (Adense, &lda));
+  PetscCall (MatDenseGetArrayRead (Adense, &a));
+  snprintf (name, sizeof name, "%s_A.f64", prefix);
+  fp = fopen (name, "wb");
+  for (j = 0; j < N; j++)
+    fwrite (a + (size_t) j * lda, sizeof (PetscScalar), (size_t) N, fp);
+  fclose (fp);
+  PetscCall (MatDenseRestoreArrayRead (Adense, &a));
+  PetscCall (MatDestroy (&Adense));
+
+  snprintf (name, sizeof name, "%s_Minv.f64", prefix);
+  fp = fopen (name, "wb");
+  PetscCall (MatDenseGetLDA (zs->tB, &lda));
+  PetscCall (MatDenseGetLDA (zs->tZ, &ldaz));
+  for (c0 = 0; c0 < N; c0 += zs->tile) {
+    w = PetscMin (zs->tile, N - c0);
+    PetscCall (MatZeroEntries (zs->tB));
+    PetscCall (MatDenseGetArrayWrite (zs->tB, &tb));
+    for (j = 0; j < w; j++) tb[(c0 + j) + (size_t) j * lda] = 1.0;
+    PetscCall (MatDenseRestoreArrayWrite (zs->tB, &tb));
+    PetscCall (lgh_zs_bvcycle_pcapply (zs->tB, zs->tZ, zs->mgh));
+    PetscCall (MatDenseGetArrayRead (zs->tZ, &tz));
+    for (j = 0; j < w; j++)
+      fwrite (tz + (size_t) j * ldaz, sizeof (PetscScalar), (size_t) N, fp);
+    PetscCall (MatDenseRestoreArrayRead (zs->tZ, &tz));
+  }
+  fclose (fp);
+  PetscCall (PetscPrintf (comm, "lgh_zs_dump_dense: wrote %s_A.f64 and "
+                          "%s_Minv.f64 (N=%d, column-major float64)\n",
+                          prefix, prefix, (int) N));
+  return PETSC_SUCCESS;
+}
+
 static void
 lgh_zs_destroy (struct lgh_zs_ctx *zs)
 {
@@ -789,6 +851,12 @@ lgh_prior_setup_from_ksp (KSP ksp, Vec mass_lumps,
                               "[%.3e, %.3e] (%d its) -> chebyshev nit %d\n",
                               o->blocked_mode, (double) emin, (double) emax,
                               (int) its, (int) p->zs->nit));
+    }
+    {
+      const char         *dump = getenv ("LGH_ZS_DUMP");
+
+      if (dump != NULL)
+        PetscCall (lgh_zs_dump_dense (p->zs, Zop, dump));
     }
   }
 
