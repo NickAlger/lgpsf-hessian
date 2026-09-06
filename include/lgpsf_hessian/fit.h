@@ -143,6 +143,16 @@ typedef struct lgh_fit_report
                               number to watch (1 = balanced). */
   double t_fit_rank_min;
   double t_fit_rank_mean;
+  /* the fit's WORK (2026-09-06): the sum over a rank's rows of the number of
+   * points inside the row's fit window (tau_window x the a-priori sigma), from
+   * lgpsf's DistFitResult.window_candidates, summed across ladder rungs and
+   * allreduced: max / mean over ranks and the total.  nnz(B) does not measure
+   * this -- the fitted support is typically far smaller than the window -- and
+   * on real data one rank's windows can hold 100x the mean (Nick's hypothesis
+   * for the slow fits). */
+  double win_nodes_rank_max;
+  double win_nodes_rank_mean;
+  double win_nodes_total;
   /* spike diagnostics (mass-weighted Dirac content; mesh-independent —
    * the resolution meter) */
   double spike_mass;      /* sum over fitted rows of m|s|                 */

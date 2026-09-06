@@ -539,6 +539,16 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
     rep->t_fit_rank_max += tmax;
     rep->t_fit_rank_min += tmin;
     rep->t_fit_rank_mean += tsum / (double) b->size;
+    /* the fit's work: window sizes summed over this rank's rows */
+    {
+      double              w = (double) fit.window_candidates, wmax, wsum;
+
+      MPI_Allreduce (&w, &wmax, 1, MPI_DOUBLE, MPI_MAX, b->comm);
+      MPI_Allreduce (&w, &wsum, 1, MPI_DOUBLE, MPI_SUM, b->comm);
+      rep->win_nodes_rank_max += wmax;
+      rep->win_nodes_rank_mean += wsum / (double) b->size;
+      rep->win_nodes_total += wsum;
+    }
   }
   MPI_Barrier (b->comm);   /* so t_fit_symmetrize times the symmetrize only */
   const auto          t_presym = Clock::now ();
