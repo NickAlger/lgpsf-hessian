@@ -498,6 +498,123 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
   in.row_own_gid = b->gids;
   in.HV_local = Y.leftCols (kfit);
   fit = lgpsf::mpi::dist_fit (plan, in, windows, config, o.tau_assemble);
+  /* LGH_FIT_DUMP=<prefix> (2026-09-06, v2): the fitted LG-PSF operator, row by
+   * row, next to the a-priori ellipsoid it started from -- enough to compare
+   * the two AND to reconstruct every impulse response offline (Nick: broadly
+   * useful for analysis and for pictures of how the method works).
+   * One binary file per rank and fit call, <prefix>_c<call>_k<kfit>.rank<r>
+   * (call = a per-process counter of fits: successive builds and ladder rungs
+   * never overwrite each other; the highest call is the latest fit):
+   *   header (8 doubles): magic 20260906, version 2, dim N, P (= 25 + m_max),
+   *                       nrows, m_max, tau_assemble, spike (0/1)
+   *   then nrows records of P doubles:
+   *     [0]  gid            [1..2]  x, y                 (row centre, km)
+   *     [3..5]   a-priori Sigma: S00 S01 S11
+   *     [6..7]   fitted mu     [8..11] fitted L, row-major (Sigma_fit = L L^T)
+   *     [12..14] fitted Sigma: S00 S01 S11 (= L L^T, for convenience)
+   *     [15]     spike s      [16] m1 (row mass)   [17] mode_set_id (-1: no model,
+   *              -2: the row's fit FAILED and lgpsf shipped its fallback -- exclude
+   *              from ellipsoid statistics)
+   *     [18..19] window centre  [20..23] window covariance, row-major
+   *                       (membership: (x-c)^T W^-1 (x-c) <= 1)
+   *     [24]     k0 = the smooth kernel at the row's own centre x (a check
+   *              value for any offline evaluator)
+   *     [25..25+m_max-1] LG coefficients c, zero-padded, in the mode set's order
+   *   NaN in [6..] where the row has no model.
+   * Sidecar <prefix>_c<call>_k<kfit>.modes (rank 0, text): the mode sets (id: p,ell,m
+   * triples) and the evaluation convention:
+   *   u = L^{-1} (x - mu);  r^2 = |u|^2;  alpha = ell + N/2 - 1;
+   *   psi_{p,ell,m}(u) = sqrt(2 p! / Gamma(p+alpha+1)) * Y_{ell,m}(u) *
+   *                      L_p^alpha(r^2) * exp(-r^2 / 2)
+   *   with Y_{ell,m} the real harmonic polynomials of lgpsf/harmonic_polynomials.hpp
+   *   (N = 2: r^ell {cos, sin}(ell theta), orthonormal on S^1);
+   *   kernel(x) = sum_i c_i psi_i(u)   inside the window, 0 outside;
+   *   the operator's row applies kernel(x_col) * m2(col) to columns and adds
+   *   the spike m1 * s on the row's own column.
+   * Offline: nicks_research_experiments/.../plot_apriori_quality.py (compare)
+   * and lg_psf_offline.py (reconstruct). */
+  if (const char *dump = std::getenv ("LGH_FIT_DUMP"))
+  {
+    static int          call = 0;
+    const lgpsf::LGOperator &M = fit.fit.model;
+    const int           N = M.dim;
+    const long          nrows = (long) b->x.rows ();
+    const long          m_max = (long) M.c.cols ();
+    const long          P = 25 + m_max;
+    const std::string   base = std::string (dump) + "_c" + std::to_string (++call)
+                               + "_k" + std::to_string (kfit);
+    std::FILE          *f = std::fopen ((base + ".rank" + std::to_string (b->rank)).c_str (), "wb");
+
+    if (f != NULL && N == 2)
+    {
+      double              hdr[8] = {20260906.0, 2.0, (double) N, (double) P, (double) nrows,
+                                    (double) m_max, o.tau_assemble, M.spike ? 1.0 : 0.0};
+      std::vector<double> rec ((size_t) P);
+
+      std::fwrite (hdr, sizeof (double), 8, f);
+      for (long r = 0; r < nrows; ++r)
+      {
+        const Eigen::MatrixXd &sp = sigma[(size_t) r];
+        const bool          has = M.has_model ((int) r);
+
+        std::fill (rec.begin (), rec.end (), std::nan (""));
+        rec[0] = (double) b->gids[(size_t) r];
+        rec[1] = b->x (r, 0); rec[2] = b->x (r, 1);
+        rec[3] = sp (0, 0); rec[4] = sp (0, 1); rec[5] = sp (1, 1);
+        rec[16] = M.m1_diag (r);
+        rec[17] = (double) M.mode_set_id[(size_t) r];
+        if (fit.fit.diagnostics.failures.count ((int) r)) rec[17] = -2.0;
+        if (has)
+        {
+          Eigen::Matrix2d     L;
+
+          L << M.L (r, 0), M.L (r, 1), M.L (r, 2), M.L (r, 3);
+          const Eigen::Matrix2d S = L * L.transpose ();
+          rec[6] = M.mu (r, 0); rec[7] = M.mu (r, 1);
+          rec[8] = L (0, 0); rec[9] = L (0, 1); rec[10] = L (1, 0); rec[11] = L (1, 1);
+          rec[12] = S (0, 0); rec[13] = S (0, 1); rec[14] = S (1, 1);
+          rec[15] = M.s (r);
+          rec[18] = M.window_center (r, 0); rec[19] = M.window_center (r, 1);
+          for (int q = 0; q < 4; ++q) rec[(size_t) (20 + q)] = M.window_covariance (r, q);
+          {
+            Eigen::MatrixXd     xq (1, 2);
+
+            xq << b->x (r, 0), b->x (r, 1);
+            rec[24] = lgpsf::detail::kernel_at (M, (int) r, xq).values (0);
+          }
+          for (long q = 0; q < m_max; ++q) rec[(size_t) (25 + q)] = M.c (r, q);
+        }
+        std::fwrite (rec.data (), sizeof (double), rec.size (), f);
+      }
+      std::fclose (f);
+    }
+    else if (f != NULL)
+    {
+      std::fclose (f);
+    }
+    if (b->rank == 0)
+    {
+      std::FILE          *g = std::fopen ((base + ".modes").c_str (), "w");
+
+      if (g != NULL)
+      {
+        std::fprintf (g, "# LGH_FIT_DUMP v2: mode sets (id: n  p,ell,m ...), dim %d, m_max %ld, tau_assemble %g, spike %d\n",
+                      N, m_max, o.tau_assemble, M.spike ? 1 : 0);
+        std::fprintf (g, "# kernel(x) = sum_i c_i sqrt(2 p_i!/Gamma(p_i+alpha_i+1)) Y_{ell_i,m_i}(u) L_{p_i}^{alpha_i}(|u|^2) exp(-|u|^2/2),"
+                         " u = L^-1 (x - mu), alpha = ell + N/2 - 1; Y real harmonics orthonormal on S^(N-1); window: (x-c)^T W^-1 (x-c) <= 1\n");
+        for (size_t sid = 0; sid < M.mode_sets.size (); ++sid)
+        {
+          std::fprintf (g, "%ld %ld", (long) sid, (long) M.mode_sets[sid].size ());
+          for (const lgpsf::Mode &md : M.mode_sets[sid])
+            std::fprintf (g, "  %d,%d,%d", md.p, md.ell, md.m);
+          std::fprintf (g, "\n");
+        }
+        std::fclose (g);
+      }
+      std::fprintf (stderr, "[LGH-FIT-DUMP] wrote %s.rank* + %s.modes (v2, k=%d, %ld doubles per row)\n",
+                    base.c_str (), base.c_str (), kfit, P);
+    }
+  }
   if (b->rank == 0 && std::getenv ("LGH_QC_DEBUG") != NULL)
   {
     std::fprintf (stderr, "[LGH-FIT-DEBUG] kfit=%d B_local nnz=%ld rows=%ld"
