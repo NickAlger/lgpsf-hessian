@@ -505,7 +505,7 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
    * One binary file per rank and fit call, <prefix>_c<call>_k<kfit>.rank<r>
    * (call = a per-process counter of fits: successive builds and ladder rungs
    * never overwrite each other; the highest call is the latest fit):
-   *   header (8 doubles): magic 20260906, version 2, dim N, P (= 25 + m_max),
+   *   header (8 doubles): magic 20260906, version 3, dim N, P (= 27 + m_max),
    *                       nrows, m_max, tau_assemble, spike (0/1)
    *   then nrows records of P doubles:
    *     [0]  gid            [1..2]  x, y                 (row centre, km)
@@ -519,7 +519,11 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
    *                       (membership: (x-c)^T W^-1 (x-c) <= 1)
    *     [24]     k0 = the smooth kernel at the row's own centre x (a check
    *              value for any offline evaluator)
-   *     [25..25+m_max-1] LG coefficients c, zero-padded, in the mode set's order
+   *     [25]     status: 0 the searched fit shipped, 1 gated out, 2 the BASELINE
+   *              shipped (the search did not beat it: Sigma_fit = the prior, and c
+   *              is NOT the shipped model's), 3 failed
+   *     [26]     released: 1 if the centre was fitted (0: pinned)
+   *     [27..27+m_max-1] LG coefficients c, zero-padded, in the mode set's order
    *   NaN in [6..] where the row has no model.
    * Sidecar <prefix>_c<call>_k<kfit>.modes (rank 0, text): the mode sets (id: p,ell,m
    * triples) and the evaluation convention:
@@ -540,14 +544,14 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
     const int           N = M.dim;
     const long          nrows = (long) b->x.rows ();
     const long          m_max = (long) M.c.cols ();
-    const long          P = 25 + m_max;
+    const long          P = 27 + m_max;
     const std::string   base = std::string (dump) + "_c" + std::to_string (++call)
                                + "_k" + std::to_string (kfit);
     std::FILE          *f = std::fopen ((base + ".rank" + std::to_string (b->rank)).c_str (), "wb");
 
     if (f != NULL && N == 2)
     {
-      double              hdr[8] = {20260906.0, 2.0, (double) N, (double) P, (double) nrows,
+      double              hdr[8] = {20260906.0, 3.0, (double) N, (double) P, (double) nrows,
                                     (double) m_max, o.tau_assemble, M.spike ? 1.0 : 0.0};
       std::vector<double> rec ((size_t) P);
 
@@ -564,6 +568,11 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
         rec[16] = M.m1_diag (r);
         rec[17] = (double) M.mode_set_id[(size_t) r];
         if (fit.fit.diagnostics.failures.count ((int) r)) rec[17] = -2.0;
+        {
+          const auto         &dg = fit.fit.diagnostics;
+          rec[25] = (r < (long) dg.status.size ()) ? (double) (int) dg.status[(size_t) r] : std::nan ("");
+          rec[26] = (r < (long) dg.released.size ()) ? (double) dg.released[(size_t) r] : std::nan ("");
+        }
         if (has)
         {
           Eigen::Matrix2d     L;
@@ -582,7 +591,7 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
             xq << b->x (r, 0), b->x (r, 1);
             rec[24] = lgpsf::detail::kernel_at (M, (int) r, xq).values (0);
           }
-          for (long q = 0; q < m_max; ++q) rec[(size_t) (25 + q)] = M.c (r, q);
+          for (long q = 0; q < m_max; ++q) rec[(size_t) (27 + q)] = M.c (r, q);
         }
         std::fwrite (rec.data (), sizeof (double), rec.size (), f);
       }
@@ -598,7 +607,7 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
 
       if (g != NULL)
       {
-        std::fprintf (g, "# LGH_FIT_DUMP v2: mode sets (id: n  p,ell,m ...), dim %d, m_max %ld, tau_assemble %g, spike %d\n",
+        std::fprintf (g, "# LGH_FIT_DUMP v3: mode sets (id: n  p,ell,m ...), dim %d, m_max %ld, tau_assemble %g, spike %d\n",
                       N, m_max, o.tau_assemble, M.spike ? 1 : 0);
         std::fprintf (g, "# kernel(x) = sum_i c_i sqrt(2 p_i!/Gamma(p_i+alpha_i+1)) Y_{ell_i,m_i}(u) L_{p_i}^{alpha_i}(|u|^2) exp(-|u|^2/2),"
                          " u = L^-1 (x - mu), alpha = ell + N/2 - 1; Y real harmonics orthonormal on S^(N-1); window: (x-c)^T W^-1 (x-c) <= 1\n");
@@ -611,7 +620,7 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
         }
         std::fclose (g);
       }
-      std::fprintf (stderr, "[LGH-FIT-DUMP] wrote %s.rank* + %s.modes (v2, k=%d, %ld doubles per row)\n",
+      std::fprintf (stderr, "[LGH-FIT-DUMP] wrote %s.rank* + %s.modes (v3, k=%d, %ld doubles per row)\n",
                     base.c_str (), base.c_str (), kfit, P);
     }
   }
