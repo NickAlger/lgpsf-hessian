@@ -106,7 +106,7 @@ if(NOT lgpsf_FOUND AND LGH_FETCH_LGPSF)
     # pinned commit (lgpsf main as validated with this repo's test suite;
     # carries the ellipsoid_tree v0.3.0 pin its MPI layer needs); move to
     # a release tag when lgpsf cuts one
-    GIT_TAG        9d3cd866d06878fe9ce003881f47aec432022251)
+    GIT_TAG        2bebcf6)   # window coarsening (coarsen_above / coarsen_eps, fit_points)
   set(LGPSF_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   set(LGPSF_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(lgpsf)

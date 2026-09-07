@@ -292,6 +292,8 @@ lgh_fit_opts_default (void)
   /* per-row fit: the validated production configuration */
   o.tau_window = 5.0;
   o.window_aspect_cap = 1.0;    /* ball windows */
+  o.coarsen_above = 0;          /* off: the a-priori window is the fit's quadrature */
+  o.coarsen_eps = 0.1;
   o.spike = 1;
   o.wedge_order = 10;
   o.wedge_step = 2;
@@ -458,6 +460,8 @@ make_config (const lgh_fit_opts_t &o, int num_threads)
 
   config.tau_window = o.tau_window;
   config.window_aspect_cap = o.window_aspect_cap;
+  config.coarsen_above = o.coarsen_above;
+  config.coarsen_eps = o.coarsen_eps;
   config.spike = (o.spike != 0);
   config.row.mode_policy =
       std::make_shared<lgpsf::WedgeLadder> (o.wedge_order, o.wedge_step);
@@ -674,6 +678,12 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
       rep->win_nodes_rank_max += wmax;
       rep->win_nodes_rank_mean += wsum / (double) b->size;
       rep->win_nodes_total += wsum;
+      /* and what the fits ran on (the coarsened count where coarsen_above hit) */
+      w = (double) fit.fit_points_total;
+      MPI_Allreduce (&w, &wmax, 1, MPI_DOUBLE, MPI_MAX, b->comm);
+      MPI_Allreduce (&w, &wsum, 1, MPI_DOUBLE, MPI_SUM, b->comm);
+      rep->fit_points_rank_max += wmax;
+      rep->fit_points_total += wsum;
     }
   }
   MPI_Barrier (b->comm);   /* so t_fit_symmetrize times the symmetrize only */

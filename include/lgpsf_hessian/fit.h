@@ -86,6 +86,12 @@ typedef struct lgh_fit_opts
    *    configuration; change only with cause) -------------------------- */
   double     tau_window;        /* row window radius, in sigma units       */
   double     window_aspect_cap; /* 1.0 = ball windows                      */
+  int        coarsen_above;     /* > 0: rows whose window holds more points
+                                   are FITTED on lgpsf's graded coarsening of
+                                   it (the deployed support stays the full
+                                   window; scores re-evaluated on it).  A
+                                   per-row work bound.  0 (default) = off.  */
+  double     coarsen_eps;       /* the coarsening's grading ratio (0.1)     */
   int        spike;             /* 1: include a Dirac-spike term per row   */
   int        wedge_order;       /* LG mode ladder: wedge order             */
   int        wedge_step;        /*                 wedge step              */
@@ -153,6 +159,10 @@ typedef struct lgh_fit_report
   double win_nodes_rank_max;
   double win_nodes_rank_mean;
   double win_nodes_total;
+  /* what the fits actually ran on: lgpsf's FitDiagnostics::fit_points summed
+   * per rank (= the window nodes unless coarsen_above triggered) */
+  double fit_points_rank_max;
+  double fit_points_total;
   /* spike diagnostics (mass-weighted Dirac content; mesh-independent —
    * the resolution meter) */
   double spike_mass;      /* sum over fitted rows of m|s|                 */
