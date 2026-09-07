@@ -535,8 +535,8 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
    *   kernel(x) = sum_i c_i psi_i(u)   inside the window, 0 outside;
    *   the operator's row applies kernel(x_col) * m2(col) to columns and adds
    *   the spike m1 * s on the row's own column.
-   * Offline: nicks_research_experiments/.../plot_apriori_quality.py (compare)
-   * and lg_psf_offline.py (reconstruct). */
+   * Offline readers (a-priori vs fitted comparison, impulse-response reconstruction)
+   * live in a separate research repo (maintainer-local); this header is the contract. */
   if (const char *dump = std::getenv ("LGH_FIT_DUMP"))
   {
     static int          call = 0;
