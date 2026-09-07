@@ -163,6 +163,21 @@ typedef struct lgh_fit_report
    * per rank (= the window nodes unless coarsen_above triggered) */
   double fit_points_rank_max;
   double fit_points_total;
+  /* the fit's WORK INSTRUMENT (2026-09-07), from lgpsf's per-row
+   * FitDiagnostics (evaluations, work, row_seconds), summed per rank and
+   * allreduced per rung like fit_points_total: rank max = MPI_MAX of the
+   * rank's own sum, row max = MPI_MAX of the rank's own max, both summed
+   * across ladder rungs.  A row's cost is fit_points x LM basis evaluations
+   * (summed over the row's candidates) x modes, plus a per-row floor; work is
+   * that product (dimensionless) -- the quantity a load balancer should
+   * balance, where fit_points alone is not it.  t_fit_rows_rank_max is the
+   * sum of the rows' own wall seconds on the busiest rank (telemetry: not
+   * deterministic, unlike the other four). */
+  double evaluations_total;
+  double work_total;
+  double work_rank_max;
+  double work_row_max;
+  double t_fit_rows_rank_max;
   /* spike diagnostics (mass-weighted Dirac content; mesh-independent —
    * the resolution meter) */
   double spike_mass;      /* sum over fitted rows of m|s|                 */

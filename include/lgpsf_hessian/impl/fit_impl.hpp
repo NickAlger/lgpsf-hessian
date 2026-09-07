@@ -502,14 +502,14 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
   in.row_own_gid = b->gids;
   in.HV_local = Y.leftCols (kfit);
   fit = lgpsf::mpi::dist_fit (plan, in, windows, config, o.tau_assemble);
-  /* LGH_FIT_DUMP=<prefix> (2026-09-06, v2): the fitted LG-PSF operator, row by
+  /* LGH_FIT_DUMP=<prefix> (2026-09-06 v2; v4 since 2026-09-07): the fitted LG-PSF operator, row by
    * row, next to the a-priori ellipsoid it started from -- enough to compare
    * the two AND to reconstruct every impulse response offline (Nick: broadly
    * useful for analysis and for pictures of how the method works).
    * One binary file per rank and fit call, <prefix>_c<call>_k<kfit>.rank<r>
    * (call = a per-process counter of fits: successive builds and ladder rungs
    * never overwrite each other; the highest call is the latest fit):
-   *   header (8 doubles): magic 20260906, version 3, dim N, P (= 27 + m_max),
+   *   header (8 doubles): magic 20260906, version 4, dim N, P (= 31 + m_max),
    *                       nrows, m_max, tau_assemble, spike (0/1)
    *   then nrows records of P doubles:
    *     [0]  gid            [1..2]  x, y                 (row centre, km)
@@ -527,8 +527,16 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
    *              shipped (the search did not beat it: Sigma_fit = the prior, and c
    *              is NOT the shipped model's), 3 failed
    *     [26]     released: 1 if the centre was fitted (0: pinned)
-   *     [27..27+m_max-1] LG coefficients c, zero-padded, in the mode set's order
-   *   NaN in [6..] where the row has no model.
+   *     [27]     fit_points: quadrature points the row's fit ran on (v4)
+   *     [28]     evaluations: LM basis evaluations summed over the row's
+   *              candidates (v4; 0 where the search did not run)
+   *     [29]     work = fit_points x evaluations x modes tried (v4; the
+   *              dimensionless cost proxy, lgpsf FitDiagnostics::work)
+   *     [30]     row_seconds: the row's fit wall time (v4; telemetry, NOT
+   *              deterministic)
+   *     [31..31+m_max-1] LG coefficients c, zero-padded, in the mode set's order
+   *              (v3: c started at 27 and [27..30] did not exist)
+   *   NaN in [6..] where the row has no model ([27..30] are always set).
    * Sidecar <prefix>_c<call>_k<kfit>.modes (rank 0, text): the mode sets (id: p,ell,m
    * triples) and the evaluation convention:
    *   u = L^{-1} (x - mu);  r^2 = |u|^2;  alpha = ell + N/2 - 1;
@@ -548,14 +556,14 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
     const int           N = M.dim;
     const long          nrows = (long) b->x.rows ();
     const long          m_max = (long) M.c.cols ();
-    const long          P = 27 + m_max;
+    const long          P = 31 + m_max;
     const std::string   base = std::string (dump) + "_c" + std::to_string (++call)
                                + "_k" + std::to_string (kfit);
     std::FILE          *f = std::fopen ((base + ".rank" + std::to_string (b->rank)).c_str (), "wb");
 
     if (f != NULL && N == 2)
     {
-      double              hdr[8] = {20260906.0, 3.0, (double) N, (double) P, (double) nrows,
+      double              hdr[8] = {20260906.0, 4.0, (double) N, (double) P, (double) nrows,
                                     (double) m_max, o.tau_assemble, M.spike ? 1.0 : 0.0};
       std::vector<double> rec ((size_t) P);
 
@@ -576,6 +584,11 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
           const auto         &dg = fit.fit.diagnostics;
           rec[25] = (r < (long) dg.status.size ()) ? (double) (int) dg.status[(size_t) r] : std::nan ("");
           rec[26] = (r < (long) dg.released.size ()) ? (double) dg.released[(size_t) r] : std::nan ("");
+          /* v4: the work instrument, set for every row (0 where nothing ran) */
+          rec[27] = (r < (long) dg.fit_points.size ()) ? (double) dg.fit_points (r) : std::nan ("");
+          rec[28] = (r < (long) dg.evaluations.size ()) ? (double) dg.evaluations (r) : std::nan ("");
+          rec[29] = (r < (long) dg.work.size ()) ? dg.work (r) : std::nan ("");
+          rec[30] = (r < (long) dg.row_seconds.size ()) ? dg.row_seconds (r) : std::nan ("");
         }
         if (has)
         {
@@ -595,7 +608,7 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
             xq << b->x (r, 0), b->x (r, 1);
             rec[24] = lgpsf::detail::kernel_at (M, (int) r, xq).values (0);
           }
-          for (long q = 0; q < m_max; ++q) rec[(size_t) (27 + q)] = M.c (r, q);
+          for (long q = 0; q < m_max; ++q) rec[(size_t) (31 + q)] = M.c (r, q);
         }
         std::fwrite (rec.data (), sizeof (double), rec.size (), f);
       }
@@ -611,7 +624,7 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
 
       if (g != NULL)
       {
-        std::fprintf (g, "# LGH_FIT_DUMP v3: mode sets (id: n  p,ell,m ...), dim %d, m_max %ld, tau_assemble %g, spike %d\n",
+        std::fprintf (g, "# LGH_FIT_DUMP v4: mode sets (id: n  p,ell,m ...), dim %d, m_max %ld, tau_assemble %g, spike %d\n",
                       N, m_max, o.tau_assemble, M.spike ? 1 : 0);
         std::fprintf (g, "# kernel(x) = sum_i c_i sqrt(2 p_i!/Gamma(p_i+alpha_i+1)) Y_{ell_i,m_i}(u) L_{p_i}^{alpha_i}(|u|^2) exp(-|u|^2/2),"
                          " u = L^-1 (x - mu), alpha = ell + N/2 - 1; Y real harmonics orthonormal on S^(N-1); window: (x-c)^T W^-1 (x-c) <= 1\n");
@@ -624,7 +637,7 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
         }
         std::fclose (g);
       }
-      std::fprintf (stderr, "[LGH-FIT-DUMP] wrote %s.rank* + %s.modes (v3, k=%d, %ld doubles per row)\n",
+      std::fprintf (stderr, "[LGH-FIT-DUMP] wrote %s.rank* + %s.modes (v4, k=%d, %ld doubles per row)\n",
                     base.c_str (), base.c_str (), kfit, P);
     }
   }
@@ -684,6 +697,21 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
       MPI_Allreduce (&w, &wsum, 1, MPI_DOUBLE, MPI_SUM, b->comm);
       rep->fit_points_rank_max += wmax;
       rep->fit_points_total += wsum;
+      /* the work instrument (fit.h: evaluations_total .. t_fit_rows_rank_max) */
+      w = (double) fit.evaluations_total;
+      MPI_Allreduce (&w, &wsum, 1, MPI_DOUBLE, MPI_SUM, b->comm);
+      rep->evaluations_total += wsum;
+      w = fit.work_total;
+      MPI_Allreduce (&w, &wmax, 1, MPI_DOUBLE, MPI_MAX, b->comm);
+      MPI_Allreduce (&w, &wsum, 1, MPI_DOUBLE, MPI_SUM, b->comm);
+      rep->work_rank_max += wmax;
+      rep->work_total += wsum;
+      w = fit.work_max_row;
+      MPI_Allreduce (&w, &wmax, 1, MPI_DOUBLE, MPI_MAX, b->comm);
+      rep->work_row_max += wmax;
+      w = fit.seconds_total;
+      MPI_Allreduce (&w, &wmax, 1, MPI_DOUBLE, MPI_MAX, b->comm);
+      rep->t_fit_rows_rank_max += wmax;
     }
   }
   MPI_Barrier (b->comm);   /* so t_fit_symmetrize times the symmetrize only */
