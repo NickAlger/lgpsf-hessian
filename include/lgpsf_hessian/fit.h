@@ -90,7 +90,10 @@ typedef struct lgh_fit_opts
                                    are FITTED on lgpsf's graded coarsening of
                                    it (the deployed support stays the full
                                    window; scores re-evaluated on it).  A
-                                   per-row work bound.  0 (default) = off.  */
+                                   per-row work bound.  DEFAULT 3000 since
+                                   2026-09-08 (was 0 = off); fits above the
+                                   trigger are not bitwise identical to
+                                   earlier releases.  0 restores that path. */
   double     coarsen_eps;       /* the coarsening's grading ratio (0.1)     */
   int        spike;             /* 1: include a Dirac-spike term per row   */
   int        wedge_order;       /* LG mode ladder: wedge order             */

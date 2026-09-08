@@ -292,7 +292,9 @@ lgh_fit_opts_default (void)
   /* per-row fit: the validated production configuration */
   o.tau_window = 5.0;
   o.window_aspect_cap = 1.0;    /* ball windows */
-  o.coarsen_above = 0;          /* off: the a-priori window is the fit's quadrature */
+  o.coarsen_above = 3000;       /* on since 2026-09-08 (was 0); 0 = the a-priori
+                                   window is the fit's quadrature, byte-identical
+                                   to before */
   o.coarsen_eps = 0.1;
   o.spike = 1;
   o.wedge_order = 10;
