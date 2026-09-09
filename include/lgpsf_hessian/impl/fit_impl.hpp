@@ -533,9 +533,23 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
                              * (double) dgw.evaluations (r);
       }
     }
-    rep->rows_migrated += (double) fit.balance.rows_migrated;
-    rep->rows_capped = (double) fit.balance.rows_capped;
-    rep->balance_bytes += (double) fit.balance.bytes_sent;
+    /* These three are RANK-LOCAL in lgpsf (a drop moves work, not an answer,
+     * so it needs no global agreement), so they have to be reduced here or the
+     * report shows only rank 0's share -- which is what the first continental
+     * run printed.  predicted_imbalance is the plan's and is already global. */
+    {
+      double            w, wsum;
+
+      w = (double) fit.balance.rows_migrated;
+      MPI_Allreduce (&w, &wsum, 1, MPI_DOUBLE, MPI_SUM, b->comm);
+      rep->rows_migrated += wsum;
+      w = (double) fit.balance.rows_capped;
+      MPI_Allreduce (&w, &wsum, 1, MPI_DOUBLE, MPI_SUM, b->comm);
+      rep->rows_capped += wsum;
+      w = (double) fit.balance.bytes_sent;
+      MPI_Allreduce (&w, &wsum, 1, MPI_DOUBLE, MPI_SUM, b->comm);
+      rep->balance_bytes += wsum;
+    }
     rep->balance_imbalance = fit.balance.predicted_imbalance;
   }
   /* LGH_FIT_DUMP=<prefix> (2026-09-06 v2; v4 since 2026-09-07): the fitted LG-PSF operator, row by
