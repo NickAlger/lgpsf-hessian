@@ -536,9 +536,19 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
    *              dimensionless cost proxy, lgpsf FitDiagnostics::work)
    *     [30]     row_seconds: the row's fit wall time (v4; telemetry, NOT
    *              deterministic)
-   *     [31..31+m_max-1] LG coefficients c, zero-padded, in the mode set's order
-   *              (v3: c started at 27 and [27..30] did not exist)
-   *   NaN in [6..] where the row has no model ([27..30] are always set).
+   *     [31]     coarsen_seconds: the graded coarsening alone (v5; 0 where the
+   *              row was not coarsened; telemetry)
+   *     [32]     search_seconds: the mode-set ladder and its searches, i.e.
+   *              everything that reads only the coarse quadrature (v5).  This
+   *              is the ONLY phase a fitting-only row redistribution could move
+   *              to another rank, so the resident share of a row is
+   *              1 - search_seconds / row_seconds (lgpsf dev/row-balance-plan.md)
+   *     [33]     rescore_seconds: the full-window re-score of the finalists and
+   *              its guard (v5; telemetry)
+   *     [34..34+m_max-1] LG coefficients c, zero-padded, in the mode set's order
+   *              (v4: c started at 31 and [31..33] did not exist; v3: c started
+   *              at 27 and [27..30] did not exist)
+   *   NaN in [6..] where the row has no model ([27..33] are always set).
    * Sidecar <prefix>_c<call>_k<kfit>.modes (rank 0, text): the mode sets (id: p,ell,m
    * triples) and the evaluation convention:
    *   u = L^{-1} (x - mu);  r^2 = |u|^2;  alpha = ell + N/2 - 1;
@@ -558,14 +568,14 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
     const int           N = M.dim;
     const long          nrows = (long) b->x.rows ();
     const long          m_max = (long) M.c.cols ();
-    const long          P = 31 + m_max;
+    const long          P = 34 + m_max;
     const std::string   base = std::string (dump) + "_c" + std::to_string (++call)
                                + "_k" + std::to_string (kfit);
     std::FILE          *f = std::fopen ((base + ".rank" + std::to_string (b->rank)).c_str (), "wb");
 
     if (f != NULL && N == 2)
     {
-      double              hdr[8] = {20260906.0, 4.0, (double) N, (double) P, (double) nrows,
+      double              hdr[8] = {20260906.0, 5.0, (double) N, (double) P, (double) nrows,
                                     (double) m_max, o.tau_assemble, M.spike ? 1.0 : 0.0};
       std::vector<double> rec ((size_t) P);
 
@@ -591,6 +601,10 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
           rec[28] = (r < (long) dg.evaluations.size ()) ? (double) dg.evaluations (r) : std::nan ("");
           rec[29] = (r < (long) dg.work.size ()) ? dg.work (r) : std::nan ("");
           rec[30] = (r < (long) dg.row_seconds.size ()) ? dg.row_seconds (r) : std::nan ("");
+          /* v5: the phase split of row_seconds, for the load-balance study */
+          rec[31] = (r < (long) dg.coarsen_seconds.size ()) ? dg.coarsen_seconds (r) : std::nan ("");
+          rec[32] = (r < (long) dg.search_seconds.size ()) ? dg.search_seconds (r) : std::nan ("");
+          rec[33] = (r < (long) dg.rescore_seconds.size ()) ? dg.rescore_seconds (r) : std::nan ("");
         }
         if (has)
         {
@@ -610,7 +624,7 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
             xq << b->x (r, 0), b->x (r, 1);
             rec[24] = lgpsf::detail::kernel_at (M, (int) r, xq).values (0);
           }
-          for (long q = 0; q < m_max; ++q) rec[(size_t) (31 + q)] = M.c (r, q);
+          for (long q = 0; q < m_max; ++q) rec[(size_t) (34 + q)] = M.c (r, q);
         }
         std::fwrite (rec.data (), sizeof (double), rec.size (), f);
       }
@@ -639,7 +653,7 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
         }
         std::fclose (g);
       }
-      std::fprintf (stderr, "[LGH-FIT-DUMP] wrote %s.rank* + %s.modes (v4, k=%d, %ld doubles per row)\n",
+      std::fprintf (stderr, "[LGH-FIT-DUMP] wrote %s.rank* + %s.modes (v5, k=%d, %ld doubles per row)\n",
                     base.c_str (), base.c_str (), kfit, P);
     }
   }
