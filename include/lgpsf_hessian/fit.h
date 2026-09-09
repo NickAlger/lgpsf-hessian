@@ -99,6 +99,22 @@ typedef struct lgh_fit_opts
   int        wedge_order;       /* LG mode ladder: wedge order             */
   int        wedge_step;        /*                 wedge step              */
   int        mu_pinned;         /* 1: pin the PSF center to the node       */
+  double     balance_tolerance; /* > 0: move the LM SEARCH of some rows to
+                                   another rank and bring the answers back,
+                                   to the given per-rank imbalance tolerance
+                                   (0.1 is a sane value).  The fit's wall time
+                                   is set by its busiest rank, and the
+                                   expensive rows cluster spatially.  The
+                                   operator is BITWISE identical either way --
+                                   a row's fit is a pure function of the
+                                   package that travels with it.  0 = off
+                                   (default).  See lgpsf
+                                   dev/row-balance-plan.md                  */
+  size_t     balance_bytes_cap; /* bytes one rank may pack, and bytes one may
+                                   receive, per fit (64 MiB).  The rule
+                                   balances SECONDS, and a row heavy in points
+                                   but short in search is heavy in bytes and
+                                   light in time                            */
   double     tau_assemble;      /* sparsity truncation radius (sigma units)*/
   lgh_wsym_t wsym;              /* symmetrization convention               */
   int        verbose;           /* 1 (default): print ladder rungs to
@@ -181,6 +197,14 @@ typedef struct lgh_fit_report
   double work_rank_max;
   double work_row_max;
   double t_fit_rows_rank_max;
+  /* the redistribution (balance_tolerance > 0; zeros when it is off).
+   * rows_migrated is summed over ranks and rungs, bytes likewise;
+   * balance_imbalance is the LAST rung's predicted max/mean, which is what
+   * the rule achieved on the plan it acted on. */
+  double rows_migrated;
+  double rows_capped;
+  double balance_bytes;
+  double balance_imbalance;
   /* spike diagnostics (mass-weighted Dirac content; mesh-independent —
    * the resolution meter) */
   double spike_mass;      /* sum over fitted rows of m|s|                 */

@@ -273,6 +273,12 @@ struct lgh_fit
   std::vector<long>   b_colgids;
   std::vector<double> b_vals;
   bool                ready = false;
+  /* the previous ladder rung's per-row weight for the redistribution rule,
+   * fit_points x evaluations; empty before the first rung, where the window
+   * size is all that exists.  It survives across builds too, since the fit
+   * object does and the row set does not change -- so only the very first
+   * rung of the very first build has nothing better than the window size. */
+  Eigen::VectorXd     prev_weight;
   void               *Bmat = NULL;  /* cached PETSc Mat (lgh_fit_get_mat) */
 };
 
@@ -299,6 +305,8 @@ lgh_fit_opts_default (void)
   o.spike = 1;
   o.wedge_order = 10;
   o.wedge_step = 2;
+  o.balance_tolerance = 0.0;   /* off: every rank fits the rows it owns */
+  o.balance_bytes_cap = lgpsf::mpi::RowExchangeOptions ().bytes_cap;
   o.mu_pinned = 1;
   o.tau_assemble = 6.0;
   o.wsym = LGH_WSYM_WEIGHTED;
@@ -503,7 +511,33 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
   in.sigma = sigma;
   in.row_own_gid = b->gids;
   in.HV_local = Y.leftCols (kfit);
+  in.balance_tolerance = o.balance_tolerance;
+  in.balance_bytes_cap = o.balance_bytes_cap;
+  if (o.balance_tolerance > 0. && b->prev_weight.size () == nloc)
+  {
+    in.prev_evaluations = b->prev_weight;
+  }
   fit = lgpsf::mpi::dist_fit (plan, in, windows, config, o.tau_assemble);
+  if (o.balance_tolerance > 0.)
+  {
+    /* this rung's weight for the next one.  The cell structure is geometry
+     * only, so fit_points does not change between rungs; the evaluation count
+     * does, and is the half that is ever a prediction. */
+    const lgpsf::FitDiagnostics &dgw = fit.fit.diagnostics;
+    b->prev_weight.setZero (nloc);
+    for (int r = 0; r < nloc; ++r)
+    {
+      if (r < (int) dgw.fit_points.size () && r < (int) dgw.evaluations.size ())
+      {
+        b->prev_weight (r) = (double) dgw.fit_points (r)
+                             * (double) dgw.evaluations (r);
+      }
+    }
+    rep->rows_migrated += (double) fit.balance.rows_migrated;
+    rep->rows_capped = (double) fit.balance.rows_capped;
+    rep->balance_bytes += (double) fit.balance.bytes_sent;
+    rep->balance_imbalance = fit.balance.predicted_imbalance;
+  }
   /* LGH_FIT_DUMP=<prefix> (2026-09-06 v2; v4 since 2026-09-07): the fitted LG-PSF operator, row by
    * row, next to the a-priori ellipsoid it started from -- enough to compare
    * the two AND to reconstruct every impulse response offline (Nick: broadly
