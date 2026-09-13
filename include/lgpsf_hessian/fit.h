@@ -252,6 +252,25 @@ int lgh_fit_probes (lgh_fit_t *fit, int k, const double *V, const double *HV,
                     const double *sigma, const lgh_fit_opts_t *opts,
                     lgh_fit_report_t *report);
 
+/* Draw one probe column into out[0..nloc-1], exactly as lgh_fit_hessian's own pool
+ * does: hashed_normal(seed, gid, index), a pure function of the three, so the column
+ * is identical at any rank count or partition.
+ *
+ * For callers that drive lgh_fit_probes with a pool they control -- holding ONE
+ * validation set fixed while the fit count varies, say, which lgh_fit_hessian cannot
+ * do because its held-out columns sit at indices [k0, k0 + n_qc) and therefore move
+ * with k0.  Use this rather than reimplementing the hash: a private copy would drift
+ * from the library's silently, and nothing downstream would notice.
+ *
+ * whiten != 0 applies the z = M^(-1/2) randn scaling that makes the energy-ratio QC
+ * an estimate of the relative Hilbert-Schmidt error; pass it for every column unless
+ * you specifically want coordinate-iid fit probes.  Note lgh_fit_probes then uses the
+ * pairs AS IS -- it cannot scale them for you, since the probe covariance is yours.
+ *
+ * Local, not collective.  Returns nloc, or -1 if fit or out is NULL. */
+int lgh_fit_draw_probe (const lgh_fit_t *fit, unsigned long seed, int index,
+                        int whiten, double *out);
+
 /* This rank's rows of B: CSR over local rows with GLOBAL column ids.
  * Zero-copy; pointers valid until the next fit/destroy.  Returns local nnz,
  * or -1 before a successful fit.  (For B as a PETSc Mat, see

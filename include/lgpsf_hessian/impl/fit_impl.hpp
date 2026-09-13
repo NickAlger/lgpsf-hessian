@@ -1189,6 +1189,30 @@ lgh_fit_hessian (lgh_fit_t *b, lgh_hessian_fn hessian_apply, void *ctx,
 }
 
 int
+lgh_fit_draw_probe (const lgh_fit_t *b, unsigned long seed, int index,
+                    int whiten, double *out)
+{
+  if (b == NULL || out == NULL)
+  {
+    return -1;
+  }
+  /* the same two steps lgh_fit_hessian's draw lambda takes, in the same order:
+   * hashed_normal(seed, gid, index), then the optional 1/sqrt(mass) whitening */
+  const int           nloc = b->nloc;
+  for (int i = 0; i < nloc; i++)
+  {
+    double              v = lgh::hashed_normal (seed, b->gids[(size_t) i], index);
+
+    if (whiten)
+    {
+      v /= std::sqrt (b->mass (i));
+    }
+    out[i] = v;
+  }
+  return nloc;
+}
+
+int
 lgh_fit_probes (lgh_fit_t *b, int k, const double *V, const double *HV,
                 const double *sigma_in, const lgh_fit_opts_t *opts,
                 lgh_fit_report_t *rep)
