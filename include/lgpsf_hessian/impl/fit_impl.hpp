@@ -609,16 +609,23 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
    *   the spike m1 * s on the row's own column.
    * Offline readers (a-priori vs fitted comparison, impulse-response reconstruction)
    * live in a separate research repo (maintainer-local); this header is the contract. */
+  /* Formed here rather than inside the block because the per-row QC sidecar written
+   * after the held-out QC below shares this base name.  The counter still advances only
+   * when LGH_FIT_DUMP is set. */
+  static int          dump_call = 0;
+  std::string         dump_base;
+
   if (const char *dump = std::getenv ("LGH_FIT_DUMP"))
   {
-    static int          call = 0;
     const lgpsf::LGOperator &M = fit.fit.model;
     const int           N = M.dim;
     const long          nrows = (long) b->x.rows ();
     const long          m_max = (long) M.c.cols ();
     const long          P = 34 + m_max;
-    const std::string   base = std::string (dump) + "_c" + std::to_string (++call)
-                               + "_k" + std::to_string (kfit);
+
+    dump_base = std::string (dump) + "_c" + std::to_string (++dump_call)
+                + "_k" + std::to_string (kfit);
+    const std::string  &base = dump_base;
     std::FILE          *f = std::fopen ((base + ".rank" + std::to_string (b->rank)).c_str (), "wb");
 
     if (f != NULL && N == 2)
@@ -893,12 +900,29 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
      * dual norm |v|^2_{M^-1} (lgpsf::dual_norm2; whitening notes,
      * operator-level QC section) */
     double              total_rel = 0.0, num2 = 0.0, den2 = 0.0;
+    /* Per-row split of the SAME two sums qc_energy is built from, so an offline reader can
+     * re-form the energy ratio over ANY subset of rows -- a fixed evaluation core well
+     * inside a truncated domain, a basin, one speed class.  qc_energy itself is global and
+     * says nothing about where the error sits.
+     *
+     * Accumulated ALONGSIDE dual_norm2, never instead of it: the reported qc_energy stays
+     * bit-for-bit what it was, and the agreement between the two is then a gate rather than
+     * an assumption.  They sum in different orders, so expect agreement to round-off, not
+     * to the last bit; LGH_QC_DEBUG prints the discrepancy. */
+    Eigen::VectorXd     qcnum_row = Eigen::VectorXd::Zero (nloc);
+    Eigen::VectorXd     qcden_row = Eigen::VectorXd::Zero (nloc);
     for (int q = 0; q < n_qc; q++)
     {
       Eigen::VectorXd     r = -Yq.col (q);
       for (const auto &t : bsym)
       {
         r ((Eigen::Index) (t.row - b->gid0)) += t.value * zval (t.col, q);
+      }
+      for (int i = 0; i < nloc; i++)
+      {
+        /* the dual norm's summand, ||v||^2_{M1^-1} = sum_i v_i^2 / m1_i */
+        qcnum_row (i) += r (i) * r (i) / b->mass (i);
+        qcden_row (i) += Yq (i, q) * Yq (i, q) / b->mass (i);
       }
       double              loc[2] = { lgpsf::dual_norm2 (r, b->mass),
                                      lgpsf::dual_norm2 (Yq.col (q),
@@ -919,6 +943,68 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
     }
     rep->qc_rowmean = total_rel / (double) n_qc;
     rep->qc_energy = std::sqrt (num2 / den2);
+
+    /* THE GATE: the per-row split must re-form the global sums.  Checked every time the
+     * sidecar is written, and under LGH_QC_DEBUG regardless, because a silent
+     * disagreement here would make every spatially-restricted qcE wrong while the
+     * headline number stayed right. */
+    {
+      double              locs[2] = { qcnum_row.sum (), qcden_row.sum () }, globs[2];
+
+      MPI_Allreduce (locs, globs, 2, MPI_DOUBLE, MPI_SUM, b->comm);
+      const double        enum2 = std::abs (globs[0] - num2) / (num2 > 0. ? num2 : 1.);
+      const double        eden2 = std::abs (globs[1] - den2) / (den2 > 0. ? den2 : 1.);
+
+      if (b->rank == 0
+          && (std::getenv ("LGH_QC_DEBUG") != NULL
+              || enum2 > 1e-10 || eden2 > 1e-10))
+      {
+        std::fprintf (stderr, "[LGH-QC-ROWS] per-row vs global: numerator rel diff %.3e, "
+                              "denominator rel diff %.3e%s\n", enum2, eden2,
+                      (enum2 > 1e-10 || eden2 > 1e-10)
+                          ? "   <-- EXCEEDS 1e-10, the per-row split is WRONG" : "");
+      }
+    }
+
+    /* Per-row QC sidecar, alongside the LGH_FIT_DUMP record for the same fit.
+     *
+     * A sidecar rather than two more columns in the main record because bsym -- and so the
+     * residual this measures -- does not exist yet when that record is written, and moving
+     * the dump would change a format several offline readers already parse.  Same rank, same
+     * row order, and the gid is repeated so the join needs no assumptions.
+     *
+     *   <prefix>_c<call>_k<kfit>.qc.rank<r>, binary:
+     *     header (4 doubles): magic 20260913, version 1, nrows, n_qc
+     *     nrows records of 3 doubles: gid, qc_num2, qc_den2
+     *
+     * qcE over any set S of rows is then sqrt(sum_S qc_num2 / sum_S qc_den2), and over all
+     * rows on all ranks it reproduces lgh_fit_report_t::qc_energy. */
+    if (!dump_base.empty ())
+    {
+      const long          nrows = (long) b->x.rows ();
+      std::FILE          *f = std::fopen ((dump_base + ".qc.rank"
+                                           + std::to_string (b->rank)).c_str (), "wb");
+
+      if (f != NULL)
+      {
+        double              hdr[4] = {20260913.0, 1.0, (double) nrows, (double) n_qc};
+
+        std::fwrite (hdr, sizeof (double), 4, f);
+        for (long r = 0; r < nrows; ++r)
+        {
+          double            rec[3] = {(double) b->gids[(size_t) r],
+                                      qcnum_row (r), qcden_row (r)};
+
+          std::fwrite (rec, sizeof (double), 3, f);
+        }
+        std::fclose (f);
+        if (b->rank == 0)
+        {
+          std::fprintf (stderr, "[LGH-QC-DUMP] wrote %s.qc.rank* (v1, n_qc=%d, "
+                                "3 doubles per row)\n", dump_base.c_str (), n_qc);
+        }
+      }
+    }
   }
   return 0;
 }

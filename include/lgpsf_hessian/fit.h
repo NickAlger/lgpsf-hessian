@@ -26,6 +26,13 @@
 #include <mpi.h>
 #endif
 
+#include <stddef.h>     /* size_t, for lgh_fit_opts_t::balance_bytes_cap.  A public header
+                           must not rely on its includer having pulled this in: without it
+                           the struct stops parsing at that member, and every later use of
+                           ANY member reports "no member named ..." instead of the real
+                           cause.  ymir's build happened to include it first, so this only
+                           surfaced when the standalone tests were next rebuilt. */
+
 #ifdef __cplusplus
 extern "C"
 {
