@@ -552,14 +552,14 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
     }
     rep->balance_imbalance = fit.balance.predicted_imbalance;
   }
-  /* LGH_FIT_DUMP=<prefix> (2026-09-06 v2; v4 since 2026-09-07): the fitted LG-PSF operator, row by
+  /* LGH_FIT_DUMP=<prefix> (2026-09-06 v2; v4 since 2026-09-07; v6 since 2026-09-22): the fitted LG-PSF operator, row by
    * row, next to the a-priori ellipsoid it started from -- enough to compare
    * the two AND to reconstruct every impulse response offline (Nick: broadly
    * useful for analysis and for pictures of how the method works).
    * One binary file per rank and fit call, <prefix>_c<call>_k<kfit>.rank<r>
    * (call = a per-process counter of fits: successive builds and ladder rungs
    * never overwrite each other; the highest call is the latest fit):
-   *   header (8 doubles): magic 20260906, version 4, dim N, P (= 31 + m_max),
+   *   header (8 doubles): magic 20260906, version 6, dim N, P (= 34 + m_max),
    *                       nrows, m_max, tau_assemble, spike (0/1)
    *   then nrows records of P doubles:
    *     [0]  gid            [1..2]  x, y                 (row centre, km)
@@ -597,8 +597,11 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
    *              (v4: c started at 31 and [31..33] did not exist; v3: c started
    *              at 27 and [27..30] did not exist)
    *   NaN in [6..] where the row has no model ([27..33] are always set).
-   * Sidecar <prefix>_c<call>_k<kfit>.modes (rank 0, text): the mode sets (id: p,ell,m
-   * triples) and the evaluation convention:
+   * Sidecar <prefix>_c<call>_k<kfit>.modes.rank<r> (text, ONE PER RANK since v6, 2026-09-22:
+   * the ids in [17] are rank-local -- LGOperator numbers the distinct mode lists per rank in
+   * the order it meets them; rank 0 also writes <prefix>_c<call>_k<kfit>.modes, its own
+   * table, for older readers): the rank's mode sets (id: p,ell,m triples) and the evaluation
+   * convention:
    *   u = L^{-1} (x - mu);  r^2 = |u|^2;  alpha = ell + N/2 - 1;
    *   psi_{p,ell,m}(u) = sqrt(2 p! / Gamma(p+alpha+1)) * Y_{ell,m}(u) *
    *                      L_p^alpha(r^2) * exp(-r^2 / 2)
@@ -630,7 +633,7 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
 
     if (f != NULL && N == 2)
     {
-      double              hdr[8] = {20260906.0, 5.0, (double) N, (double) P, (double) nrows,
+      double              hdr[8] = {20260906.0, 6.0, (double) N, (double) P, (double) nrows,
                                     (double) m_max, o.tau_assemble, M.spike ? 1.0 : 0.0};
       std::vector<double> rec ((size_t) P);
 
@@ -689,28 +692,39 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
     {
       std::fclose (f);
     }
-    if (b->rank == 0)
+    /* The mode table is RANK-LOCAL: LGOperator numbers the distinct mode lists in the order
+     * it meets them while assembling, per rank, so a row's mode_set_id [17] indexes ITS
+     * rank's table.  v6 (2026-09-22): every rank writes its own table, <base>.modes.rank<r>;
+     * rank 0 also writes <base>.modes (its table, as before) for older readers.  Before v6
+     * only rank 0's table was written and 69% of a 192-rank continental dump's ids pointed
+     * at the wrong set in it (found by the offline impulse-response reconstruction). */
     {
-      std::FILE          *g = std::fopen ((base + ".modes").c_str (), "w");
-
-      if (g != NULL)
+      const std::string   mode_files[2] = { base + ".modes.rank" + std::to_string (b->rank),
+                                            base + ".modes" };
+      for (int which = 0; which < (b->rank == 0 ? 2 : 1); ++which)
       {
-        std::fprintf (g, "# LGH_FIT_DUMP v4: mode sets (id: n  p,ell,m ...), dim %d, m_max %ld, tau_assemble %g, spike %d\n",
-                      N, m_max, o.tau_assemble, M.spike ? 1 : 0);
-        std::fprintf (g, "# kernel(x) = sum_i c_i sqrt(2 p_i!/Gamma(p_i+alpha_i+1)) Y_{ell_i,m_i}(u) L_{p_i}^{alpha_i}(|u|^2) exp(-|u|^2/2),"
-                         " u = L^-1 (x - mu), alpha = ell + N/2 - 1; Y real harmonics orthonormal on S^(N-1); window: (x-c)^T W^-1 (x-c) <= 1\n");
-        for (size_t sid = 0; sid < M.mode_sets.size (); ++sid)
+        std::FILE          *g = std::fopen (mode_files[which].c_str (), "w");
+
+        if (g != NULL)
         {
-          std::fprintf (g, "%ld %ld", (long) sid, (long) M.mode_sets[sid].size ());
-          for (const lgpsf::Mode &md : M.mode_sets[sid])
-            std::fprintf (g, "  %d,%d,%d", md.p, md.ell, md.m);
-          std::fprintf (g, "\n");
+          std::fprintf (g, "# LGH_FIT_DUMP v6: mode sets of rank %d (id: n  p,ell,m ...), dim %d, m_max %ld, tau_assemble %g, spike %d\n",
+                        b->rank, N, m_max, o.tau_assemble, M.spike ? 1 : 0);
+          std::fprintf (g, "# kernel(x) = sum_i c_i sqrt(2 p_i!/Gamma(p_i+alpha_i+1)) Y_{ell_i,m_i}(u) L_{p_i}^{alpha_i}(|u|^2) exp(-|u|^2/2),"
+                           " u = L^-1 (x - mu), alpha = ell + N/2 - 1; Y real harmonics orthonormal on S^(N-1); window: (x-c)^T W^-1 (x-c) <= 1\n");
+          for (size_t sid = 0; sid < M.mode_sets.size (); ++sid)
+          {
+            std::fprintf (g, "%ld %ld", (long) sid, (long) M.mode_sets[sid].size ());
+            for (const lgpsf::Mode &md : M.mode_sets[sid])
+              std::fprintf (g, "  %d,%d,%d", md.p, md.ell, md.m);
+            std::fprintf (g, "\n");
+          }
+          std::fclose (g);
         }
-        std::fclose (g);
       }
-      std::fprintf (stderr, "[LGH-FIT-DUMP] wrote %s.rank* + %s.modes (v5, k=%d, %ld doubles per row)\n",
-                    base.c_str (), base.c_str (), kfit, P);
     }
+    if (b->rank == 0)
+      std::fprintf (stderr, "[LGH-FIT-DUMP] wrote %s.rank* + %s.modes.rank* (v6, k=%d, %ld doubles per row; the mode table is per rank)\n",
+                    base.c_str (), base.c_str (), kfit, P);
   }
   if (b->rank == 0 && std::getenv ("LGH_QC_DEBUG") != NULL)
   {
