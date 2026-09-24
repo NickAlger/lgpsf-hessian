@@ -11,6 +11,13 @@ foreach(t test_glr test_prior_mat test_deflate)
   target_link_libraries(${t} PRIVATE lgpsf_hessian::glr)
 endforeach()
 
+# The CHOLMOD prior: only when CHOLMOD was found (LGH_HAVE_CHOLMOD).
+if(LGH_HAVE_CHOLMOD)
+  add_executable(test_prior_cholmod test_prior_cholmod.cpp)
+  target_link_libraries(test_prior_cholmod PRIVATE lgpsf_hessian::glr)
+  list(APPEND _lgh_tests prior_cholmod)
+endif()
+
 if(TARGET lgpsf_hessian::lgpsf_hessian)
   add_executable(test_fit test_fit.cpp)
   target_link_libraries(test_fit PRIVATE lgpsf_hessian::lgpsf_hessian)
