@@ -112,7 +112,10 @@ implicit `U` (the object dispatches by representation from then on).
   operations come for free, and the whitening sandwich lives inside the library
   instead of in every consumer. `lgh_prior_create_mat` is the easy on-ramp (give
   it `Z` as a Mat); `lgh_prior_create_callbacks` is for applications that own a
-  tuned `Z` solver. **Callbacks are RAW `Z` actions** — the library composes the
+  tuned `Z` solver; `lgh_prior_create_cholmod` (optional, CHOLMOD) replaces the
+  iterative `Z` solves by an exact sparse Cholesky factor replicated on every
+  rank, either of `Z` itself or of `R`, in which case `Z = P^T L P` is not
+  symmetric (see `prior.h`). **Callbacks are RAW `Z` actions** — the library composes the
   mass scalings itself.
 - **Sigma is caller-supplied.** The per-node kernel covariances are the one
   genuinely problem-specific input of the fit (in the originating ice-sheet
@@ -160,7 +163,8 @@ The integration surface is deliberately small. What your code provides:
    ids).
 3. **The prior**: either `Z` as an assembled `Mat` (`lgh_prior_create_mat`), or
    raw `applyZ`/`solveZ` callbacks over your own solver
-   (`lgh_prior_create_callbacks`; blocked variants optional, for BLAS-3 builds).
+   (`lgh_prior_create_callbacks`; blocked variants optional, for BLAS-3 builds),
+   or an assembled `Z` or `R` factored by CHOLMOD (`lgh_prior_create_cholmod`).
 
 Then the quickstart in the README is the whole integration. Using
 `lgh_glr_solve` as a Newton-CG preconditioner is a 3-line `PCShell`.

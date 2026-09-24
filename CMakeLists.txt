@@ -93,6 +93,45 @@ else()
   message(STATUS "lgpsf-hessian: hypre hierarchy source OFF (LGH_WITH_HYPRE=OFF)")
 endif()
 
+# CHOLMOD (SuiteSparse): OPTIONAL, for lgh_prior_create_cholmod (an exact
+# sparse Cholesky factor as the prior's square root).  Found through
+# SuiteSparse's CMake config (point CHOLMOD_ROOT or CMAKE_PREFIX_PATH at the
+# install prefix), else by a plain header/library search under CHOLMOD_ROOT.
+# When found, the glr target defines LGH_HAVE_CHOLMOD and links CHOLMOD;
+# -DLGH_WITH_CHOLMOD=OFF opts out.
+option(LGH_WITH_CHOLMOD "provide lgh_prior_create_cholmod when CHOLMOD is found" ON)
+set(LGH_HAVE_CHOLMOD OFF)
+set(LGH_CHOLMOD_VIA_CONFIG OFF)   # installed config re-finds CHOLMOD
+if(LGH_WITH_CHOLMOD)
+  find_package(CHOLMOD 5 CONFIG QUIET)
+  if(TARGET SuiteSparse::CHOLMOD)
+    set(LGH_CHOLMOD_LINK SuiteSparse::CHOLMOD)
+    set(LGH_HAVE_CHOLMOD ON)
+    set(LGH_CHOLMOD_VIA_CONFIG ON)
+    message(STATUS "lgpsf-hessian: CHOLMOD prior ON (CHOLMOD ${CHOLMOD_VERSION}, "
+                   "config in ${CHOLMOD_DIR})")
+  else()
+    find_path(LGH_CHOLMOD_INCLUDE_DIR NAMES cholmod.h
+              HINTS ${CHOLMOD_ROOT} $ENV{CHOLMOD_ROOT}
+              PATH_SUFFIXES include/suitesparse include suitesparse)
+    find_library(LGH_CHOLMOD_LIBRARY NAMES cholmod
+                 HINTS ${CHOLMOD_ROOT} $ENV{CHOLMOD_ROOT} PATH_SUFFIXES lib lib64)
+    find_library(LGH_SUITESPARSECONFIG_LIBRARY NAMES suitesparseconfig
+                 HINTS ${CHOLMOD_ROOT} $ENV{CHOLMOD_ROOT} PATH_SUFFIXES lib lib64)
+    if(LGH_CHOLMOD_INCLUDE_DIR AND LGH_CHOLMOD_LIBRARY AND LGH_SUITESPARSECONFIG_LIBRARY)
+      set(LGH_CHOLMOD_LINK ${LGH_CHOLMOD_LIBRARY} ${LGH_SUITESPARSECONFIG_LIBRARY})
+      set(LGH_HAVE_CHOLMOD ON)
+      message(STATUS "lgpsf-hessian: CHOLMOD prior ON (${LGH_CHOLMOD_LIBRARY}, "
+                     "headers in ${LGH_CHOLMOD_INCLUDE_DIR})")
+    else()
+      message(STATUS "lgpsf-hessian: CHOLMOD not found -- lgh_prior_create_cholmod "
+                     "is unavailable (set CHOLMOD_ROOT to a SuiteSparse install)")
+    endif()
+  endif()
+else()
+  message(STATUS "lgpsf-hessian: CHOLMOD prior OFF (LGH_WITH_CHOLMOD=OFF)")
+endif()
+
 # lgpsf (header-only; brings ellipsoid_tree and Eigen) — needed by the fit
 # component only.  find_package first, then a pinned FetchContent fallback;
 # local checkouts via -DFETCHCONTENT_SOURCE_DIR_LGPSF=/path/to/lgpsf (and
@@ -145,6 +184,13 @@ target_compile_features(lgpsf_hessian_glr INTERFACE c_std_99)
 # carry ("DSO missing from command line" at link).  We use only the C API.
 target_compile_definitions(lgpsf_hessian_glr INTERFACE
   OMPI_SKIP_MPICXX=1 MPICH_SKIP_MPICXX=1)
+if(LGH_HAVE_CHOLMOD)
+  target_link_libraries(lgpsf_hessian_glr INTERFACE ${LGH_CHOLMOD_LINK})
+  if(NOT LGH_CHOLMOD_VIA_CONFIG)
+    target_include_directories(lgpsf_hessian_glr INTERFACE ${LGH_CHOLMOD_INCLUDE_DIR})
+  endif()
+  target_compile_definitions(lgpsf_hessian_glr INTERFACE LGH_HAVE_CHOLMOD)
+endif()
 if(LGH_WITH_SCALAPACK)
   target_link_libraries(lgpsf_hessian_glr INTERFACE ${LGH_SCALAPACK_LIBRARY})
   target_compile_definitions(lgpsf_hessian_glr INTERFACE LGH_WITH_SCALAPACK)

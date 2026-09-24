@@ -25,6 +25,11 @@
 #endif
 #include "lgpsf_hessian/impl/correct_impl.h"
 #include "lgpsf_hessian/impl/zsolve_impl.h"
+#ifdef LGH_HAVE_CHOLMOD /* defined by the lgpsf_hessian::glr CMake target
+                           when CHOLMOD was found; make-based consumers add
+                           -DLGH_HAVE_CHOLMOD and CHOLMOD's flags */
+#include "lgpsf_hessian/impl/cholmod_impl.h"
+#endif
 #ifdef LGH_HAVE_LGPSF /* defined by the lgpsf_hessian::fit CMake target;
                          fit-only consumers may instead include
                          impl/fit_impl.hpp directly (it is self-contained,

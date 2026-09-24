@@ -6,6 +6,12 @@ find_dependency(MPI COMPONENTS C CXX)
 find_dependency(PkgConfig)
 pkg_check_modules(PETSC REQUIRED IMPORTED_TARGET PETSc)
 
+# Built with the CHOLMOD prior through SuiteSparse's CMake config: the glr
+# target links SuiteSparse::CHOLMOD.
+if(@LGH_CHOLMOD_VIA_CONFIG@)
+  find_dependency(CHOLMOD 5 CONFIG)
+endif()
+
 # The fit component depends on lgpsf; tolerate its absence the same way the
 # build does (glr-only installs simply do not export the fit targets).
 find_package(lgpsf 0.1 QUIET CONFIG)

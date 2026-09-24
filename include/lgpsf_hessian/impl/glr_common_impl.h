@@ -77,6 +77,8 @@ lgh_randn_at (unsigned long seed, PetscInt i, PetscInt j)
 
 struct lgh_zs_ctx;                  /* Z-solve machinery for the Mat path
                                        (impl/zsolve_impl.h)              */
+struct lgh_chol_ctx;                /* CHOLMOD factor for the Cholesky
+                                       path (impl/cholmod_impl.h)        */
 
 struct lgh_prior
 {
@@ -91,10 +93,16 @@ struct lgh_prior
   Mat                   Z;          /* referenced                        */
   KSP                   zksp;       /* owned CG + AMG solver for Z       */
   struct lgh_zs_ctx    *zs;         /* blocked-solve machinery           */
+  /* Cholesky path (lgh_prior_create_cholmod; LGH_HAVE_CHOLMOD only)     */
+  struct lgh_chol_ctx  *chol;
 };
 
 /* defined in impl/zsolve_impl.h (same TU, included after) */
 static void lgh_zs_prior_teardown (lgh_prior_t *p);
+#ifdef LGH_HAVE_CHOLMOD
+/* defined in impl/cholmod_impl.h (same TU, included after) */
+static void lgh_chol_prior_teardown (lgh_prior_t *p);
+#endif
 
 lgh_prior_mat_opts_t
 lgh_prior_mat_opts_default (void)
@@ -172,6 +180,9 @@ lgh_prior_destroy (lgh_prior_t *prior)
 {
   if (prior == NULL || --prior->refs > 0) return;
   lgh_zs_prior_teardown (prior);    /* Mat-path machinery, if any */
+#ifdef LGH_HAVE_CHOLMOD
+  lgh_chol_prior_teardown (prior);  /* Cholesky factor, if any */
+#endif
   (void) VecDestroy (&prior->msqrt);
   (void) VecDestroy (&prior->minvsqrt);
   (void) VecDestroy (&prior->work);

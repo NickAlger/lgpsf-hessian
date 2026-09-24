@@ -1,25 +1,47 @@
 /* prior.h — the user's prior / regularization, wrapped once.
  *
- * The library assumes the standard square-root structure for the prior
- * precision (bilaplacian-like, as in hIPPYlib and the ice-sheet inversion
- * literature):
+ * The library assumes a square-root structure for the prior precision
+ * (bilaplacian-like, as in hIPPYlib and the ice-sheet inversion literature):
  *
- *     R = Z M^{-1} Z,
+ *     R = Z M^{-1} Z^T,
  *
- * where M is the diagonal (lumped) mass matrix and Z is a symmetric
- * "square-root factor" — typically a shifted Laplacian (stiffness + mass)
- * at a reference regularization scale.  Keep any regularization weight
- * OUTSIDE Z: downstream operations take the shift c explicitly
- * (H(c) = B + c R), so one GLR build serves every shift, and rescaling the
- * regularization is free.
+ * where M is a diagonal matrix given by the vector mass_lumps (typically the
+ * lumped mass matrix) and Z is a "square-root factor" — typically a shifted
+ * Laplacian (stiffness + mass) at a reference regularization scale, which
+ * is symmetric, but Z need not be symmetric (see the Cholesky path below).
+ * The library applies M^{+-1/2} itself: the GLR operator is
+ * F = M^{1/2} Z^{-1} B Z^{-T} M^{1/2}, i.e. the square root of R it uses is
+ * S = Z M^{-1/2} (R = S S^T).  Nothing else reads the prior's M; the fit
+ * stage uses its own mass.  Keep any regularization weight OUTSIDE Z (or
+ * fold it into M, as the Cholesky path does): downstream operations take
+ * the shift c explicitly (H(c) = B + c R), so one GLR build serves every
+ * shift, and rescaling the regularization is free.
  *
- * Two ways in:
+ * Four ways in:
  *   lgh_prior_create_mat        — give Z as an assembled Mat; the library
  *                                 builds the solver machinery internally
  *                                 (spectral bounds + blocked Chebyshev
  *                                 around a multigrid V-cycle).  The easy
  *                                 on-ramp, and the right choice unless you
  *                                 already own a tuned Z solver.
+ *   lgh_prior_create_ksp        — the same, around your own configured KSP.
+ *   lgh_prior_create_cholmod    — an exact sparse Cholesky factor of an
+ *                                 assembled SPD Mat A (CHOLMOD; compiled
+ *                                 only with LGH_HAVE_CHOLMOD).  With
+ *                                 P A P^T = L L^T (AMD ordering P, true
+ *                                 LL^T), two modes:
+ *       LGH_CHOL_A_IS_Z:  Z = A (symmetric), solved exactly:
+ *                           Z x = A x,  Z^{-1} y = P^T L^{-T} L^{-1} P y.
+ *                         R = A M^{-1} A, as with lgh_prior_create_mat.
+ *       LGH_CHOL_A_IS_R:  A is (a multiple of) R itself.  Z = P^T L P,
+ *                         NOT symmetric:
+ *                           Z x      = P^T L   P x,   Z^{-1} y = P^T L^{-1} P y,
+ *                           Z^T x    = P^T L^T P x,   Z^{-T} y = P^T L^{-T} P y,
+ *                         so Z Z^T = A and R = Z M^{-1} Z^T.  With
+ *                         M = (1/gamma) I, R = gamma A and S =
+ *                         sqrt(gamma) P^T L P.  (Any diagonal D in
+ *                         Z = P^T L P D with M = D^2/gamma gives the same S;
+ *                         D = I is simplest.)
  *   lgh_prior_create_callbacks  — bring your own applies/solves.
  */
 
@@ -131,9 +153,73 @@ int lgh_prior_create_ksp (KSP ksp, Vec mass_lumps,
                           const lgh_prior_mat_opts_t *opts,
                           lgh_prior_t **prior);
 
+/* ---- the Cholesky path (CHOLMOD) ------------------------------------- */
+
+#ifdef LGH_HAVE_CHOLMOD
+
+#define LGH_CHOL_A_IS_R 1   /* Z = P^T L P  (A is R; pass M = I/gamma) */
+#define LGH_CHOL_A_IS_Z 2   /* Z = A        (symmetric; R = A M^-1 A)  */
+
+typedef struct lgh_prior_cholmod_opts
+{
+  int    verbose;      /* 1 (default): print the [LGH-PRIOR-CHOL] setup
+                          lines (n, nnz(L), factor bytes, peak memory,
+                          analyse/factor times); 0: silent              */
+}
+lgh_prior_cholmod_opts_t;
+
+lgh_prior_cholmod_opts_t lgh_prior_cholmod_opts_default (void);
+
+/* A: assembled symmetric positive definite Mat (any type MatGetRow
+ * supports, e.g. MPIAIJ), with the same row layout as mass_lumps; mode
+ * LGH_CHOL_A_IS_R or LGH_CHOL_A_IS_Z (see the top of this file).
+ *
+ * Every rank gathers the whole of A (one triangle), factors it redundantly
+ * with CHOLMOD (AMD ordering, supernodal LL^T; the factor is checked to be
+ * LL^T, not LDL^T) and frees the gathered copy; the factors are identical
+ * on every rank (CHOLMOD and its BLAS run single-threaded).  Memory per
+ * rank: the factor, plus the gathered A and CHOLMOD's workspace during
+ * setup.  A is used once more: a two-probe symmetry check (an error above
+ * 1e-10 relative).  A_IS_Z keeps a reference to A for its applies (MatMult);
+ * A_IS_R keeps nothing of A.
+ *
+ * Single-vector applies/solves: all-gather the vector, apply to the full
+ * vector (serial, redundant on every rank), keep the local rows.  Blocked
+ * solves: the columns of the MATDENSE block are redistributed so that each
+ * rank holds whole columns (MPI_Alltoallv), solved there with multi-column
+ * triangular solves, and redistributed back; ranks without a column idle. */
+int lgh_prior_create_cholmod (Mat A, Vec mass_lumps, int mode,
+                              const lgh_prior_cholmod_opts_t *opts,
+                              lgh_prior_t **prior);
+
+/* Setup sizes and cumulative timers of a Cholesky prior (this rank's
+ * values; not collective).  Single-vector work is every Vec-wise apply or
+ * solve (gather + serial work + scatter); blocked work is every blocked
+ * solve, with its redistribution time also reported separately. */
+typedef struct lgh_prior_cholmod_stats
+{
+  int    mode;
+  long   n;              /* rows of A                                    */
+  double nnz_A;          /* entries of the gathered triangle of A        */
+  double nnz_L;          /* nnz(L) (CHOLMOD's count, without padding)    */
+  double factor_bytes;   /* supernodal factor incl. indices and Perm      */
+  double peak_bytes;     /* CHOLMOD's peak (incl. the gathered A)        */
+  double t_gather, t_analyse, t_factor;          /* setup, seconds        */
+  double t_single;  long n_single;               /* Vec-wise ops          */
+  double t_blocked; double t_blocked_comm;       /* blocked solves        */
+  long   n_blocked; long n_blocked_cols;
+}
+lgh_prior_cholmod_stats_t;
+
+/* Returns nonzero when prior was not created by lgh_prior_create_cholmod. */
+int lgh_prior_cholmod_get_stats (const lgh_prior_t *prior,
+                                 lgh_prior_cholmod_stats_t *stats);
+
+#endif /* LGH_HAVE_CHOLMOD */
+
 void lgh_prior_destroy (lgh_prior_t *prior);
 
-/* y = R x = Z M^{-1} Z x.  (Completeness / testing; cheap.) */
+/* y = R x = Z M^{-1} Z^T x.  (Completeness / testing; cheap.) */
 int lgh_prior_apply (lgh_prior_t *prior, Vec x, Vec y);
 
 #ifdef __cplusplus

@@ -9,8 +9,8 @@
  *                       matrix approximation B.
  *   Stage 2  (glr.h)    Randomized eigendecomposition of the
  *                       prior-preconditioned approximation
- *                       F = M^{1/2} Z^{-1} B Z^{-1} M^{1/2}  ~=  U diag(lam) U^T,
- *                       where the prior precision is R = Z M^{-1} Z (prior.h)
+ *                       F = M^{1/2} Z^{-1} B Z^{-T} M^{1/2}  ~=  U diag(lam) U^T,
+ *                       where the prior precision is R = Z M^{-1} Z^T (prior.h)
  *                       and M is the (diagonal, lumped) mass matrix.
  *   Stage 3  (glr.h)    Downstream operations with H(c) = B + c R: solves,
  *                       sampling (covariance H(c)^{-1}), log-determinant and
@@ -32,7 +32,8 @@
  *
  * Dependencies: MPI and PETSc always; the lgpsf library (and Eigen, via
  * lgpsf) for stage 1; ScaLAPACK for the distributed eigensolver backend
- * (optional — the replicated backend needs only LAPACK).
+ * (optional — the replicated backend needs only LAPACK); CHOLMOD for the
+ * Cholesky prior (optional; LGH_HAVE_CHOLMOD).
  */
 
 #ifndef LGPSF_HESSIAN_H
