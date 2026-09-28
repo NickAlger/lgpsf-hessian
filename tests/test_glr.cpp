@@ -315,6 +315,53 @@ run_scenario (int spd, lgh_glr_backend_t backend)
     lgh_glr_destroy (glr2);
   }
 
+  /* adaptive sketch (exact rank 10): from ell0 = 4 the sketch is saturated
+   * at 4 and 8, doubles to 16, and stops there by the oversampling rule
+   * (10 <= 0.7 * 16); == one-shot at 16.  From ell0 = 12 (not saturated)
+   * one jump to ceil(1.1 * 10 / 0.7) = 16.  ell_max = 8 stops CAPPED.
+   * NOTE: the ScaLAPACK eigensolve prints "PDORMTR parameter 16 illegal"
+   * at ell <= 8 (a pre-existing small-size edge case of one-shot builds,
+   * 2026-09-28; results still exact); the saturation path needs ell below
+   * the rank 10, so these cases show it.  Production ell >= 4000.      */
+  {
+    lgh_glr_opts_t      go2 = go;
+    lgh_glr_adapt_t     ad = lgh_glr_adapt_default ();
+    lgh_glr_adapt_report_t ar;
+    lgh_glr_t          *ga, *g1;
+    lgh_glr_report_t    ra, r1;
+    int                 na, n1;
+    const double       *la, *l1;
+    double              worst = 0.;
+
+    ad.ell0 = 4;
+    PetscCall (lgh_glr_compute_adaptive (B, prior, &go, &ad, &ga, &ra, &ar));
+    check (ar.ell_final == 16 && ar.steps == 3 && !ar.capped,
+           "adaptive: 4 -> 8 -> 16, stop by rho", (double) ar.ell_final);
+    check (ra.kept == RANK_B, "adaptive: kept == rank(B)", (double) ra.kept);
+    go2.ell = 16;
+    PetscCall (lgh_glr_compute (B, prior, &go2, &g1, &r1));
+    PetscCall ((PetscErrorCode) lgh_glr_eigs (ga, &na, &la));
+    PetscCall ((PetscErrorCode) lgh_glr_eigs (g1, &n1, &l1));
+    check (na == n1, "adaptive: kept matches one-shot at the final ell", (double) na);
+    for (int i = 0; i < na && i < n1; i++)
+      worst = fmax (worst, fabs (la[i] - l1[i]) / fabs (la[i]));
+    check (worst < 1e-10, "adaptive: spectrum matches one-shot at the final ell", worst);
+    lgh_glr_destroy (g1);
+    lgh_glr_destroy (ga);
+
+    ad.ell0 = 12;
+    PetscCall (lgh_glr_compute_adaptive (B, prior, &go, &ad, &ga, &ra, &ar));
+    check (ar.ell_final == 16 && ar.steps == 2 && !ar.capped && ra.kept == RANK_B,
+           "adaptive: 12 -> 16 in one jump", (double) ar.ell_final);
+    lgh_glr_destroy (ga);
+
+    ad.ell0 = 4; ad.ell_max = 8;
+    PetscCall (lgh_glr_compute_adaptive (B, prior, &go, &ad, &ga, &ra, &ar));
+    check (ar.ell_final == 8 && ar.capped == 1 && ra.kept == 8,
+           "adaptive: capped at ell_max", (double) ar.ell_final);
+    lgh_glr_destroy (ga);
+  }
+
   lgh_glr_destroy (glr);
   lgh_prior_destroy (prior);
   PetscCall (VecDestroy (&mass));

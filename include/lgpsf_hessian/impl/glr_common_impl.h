@@ -742,6 +742,74 @@ lgh_glr_extend (lgh_glr_t *glr, int k_new, lgh_glr_report_t *report)
   return PETSC_SUCCESS;
 }
 
+lgh_glr_adapt_t
+lgh_glr_adapt_default (void)
+{
+  lgh_glr_adapt_t     a;
+  a.rho = 0.7;
+  a.ell_max = 30000;
+  a.ell0 = 4000;
+  a.growth = 2.0;
+  a.on_step = NULL;
+  a.ctx = NULL;
+  return a;
+}
+
+int
+lgh_glr_compute_adaptive (Mat B, lgh_prior_t *prior, const lgh_glr_opts_t *opts,
+                          const lgh_glr_adapt_t *adapt, lgh_glr_t **glr,
+                          lgh_glr_report_t *report,
+                          lgh_glr_adapt_report_t *areport)
+{
+  lgh_glr_opts_t      o = (opts != NULL) ? *opts : lgh_glr_opts_default ();
+  lgh_glr_adapt_t     ad = (adapt != NULL) ? *adapt : lgh_glr_adapt_default ();
+  lgh_glr_report_t    rep;
+  lgh_glr_adapt_report_t ar;
+  lgh_glr_t          *g = NULL;
+  PetscInt            Nglob;
+  int                 ell, emax;
+  MPI_Comm            comm;
+
+  PetscCall (PetscObjectGetComm ((PetscObject) B, &comm));
+  PetscCheck (ad.rho > 0. && ad.rho < 1., comm, PETSC_ERR_ARG_OUTOFRANGE,
+              "lgh_glr_compute_adaptive: rho must be in (0, 1), got %g", ad.rho);
+  PetscCheck (ad.growth > 1., comm, PETSC_ERR_ARG_OUTOFRANGE,
+              "lgh_glr_compute_adaptive: growth must exceed 1, got %g", ad.growth);
+  PetscCheck (ad.ell0 > 0 && ad.ell_max > 0, comm, PETSC_ERR_ARG_OUTOFRANGE,
+              "lgh_glr_compute_adaptive: ell0 and ell_max must be positive");
+  PetscCall (MatGetSize (B, &Nglob, NULL));
+  emax = (int) PetscMin ((PetscInt) ad.ell_max, Nglob);
+  ell = PetscMin (ad.ell0, emax);
+  PetscCall (PetscMemzero (&ar, sizeof (ar)));
+
+  o.ell = ell;
+  PetscCall (lgh_glr_compute (B, prior, &o, &g, &rep));
+  ar.steps = 1;
+  ar.t_operator += rep.t_operator;
+  ar.t_dense += rep.t_dense;
+  if (ad.on_step != NULL) ad.on_step (ar.steps, ell, &rep, ad.ctx);
+  for (;;) {
+    int                 enew;
+    if ((double) rep.kept <= ad.rho * (double) ell) break;      /* tolerance */
+    if (ell >= emax) { ar.capped = 1; break; }                  /* ceiling   */
+    if (rep.kept >= ell) enew = (int) ceil (ad.growth * (double) ell);
+    else enew = (int) ceil (1.1 * (double) rep.kept / ad.rho);
+    if (enew <= ell) enew = ell + 1;
+    enew = PetscMin (enew, emax);
+    PetscCall (lgh_glr_extend (g, enew - ell, &rep));
+    ell = enew;
+    ar.steps++;
+    ar.t_operator += rep.t_operator;
+    ar.t_dense += rep.t_dense;
+    if (ad.on_step != NULL) ad.on_step (ar.steps, ell, &rep, ad.ctx);
+  }
+  ar.ell_final = ell;
+  *glr = g;
+  if (report != NULL) *report = rep;
+  if (areport != NULL) *areport = ar;
+  return PETSC_SUCCESS;
+}
+
 void
 lgh_glr_destroy (lgh_glr_t *glr)
 {

@@ -117,6 +117,46 @@ int lgh_glr_compute (Mat B, lgh_prior_t *prior, const lgh_glr_opts_t *opts,
  * Not available after lgh_glr_correct (correct last; see below). */
 int lgh_glr_extend (lgh_glr_t *glr, int k_new, lgh_glr_report_t *report);
 
+/* Adaptive sketch: build at ell0, then extend until the OVERSAMPLING
+ * condition kept <= rho * ell holds (the sketch is at least 1/rho wider
+ * than the rank at the cut: with q = 1 the last Ritz values of a randomized
+ * sketch are biased low, so "next_abs < trunc_abs" alone can stop early),
+ * or ell reaches ell_max (the build is then RANK-CAPPED).  While saturated
+ * (kept == ell) ell grows by `growth`; otherwise it jumps to
+ * ceil(1.1 * kept / rho).  Each step is lgh_glr_extend, so the result is the
+ * one-shot build at the final ell (span-equivalent).  opts->ell is ignored.
+ * on_step (optional) is called after every build/extension on every rank. */
+typedef void (*lgh_glr_adapt_step_fn) (int step, int ell,
+                                       const lgh_glr_report_t *rep, void *ctx);
+typedef struct lgh_glr_adapt
+{
+  double                rho;      /* stop once kept <= rho * ell (0.7)      */
+  int                   ell_max;  /* ceiling; capped beyond it (30000)      */
+  int                   ell0;     /* first width (4000); callers warm-start *
+                                   * later builds with ceil(prev_kept/rho)  */
+  double                growth;   /* width factor while saturated (2.0)     */
+  lgh_glr_adapt_step_fn on_step;  /* optional per-step report               */
+  void                 *ctx;
+}
+lgh_glr_adapt_t;
+
+lgh_glr_adapt_t lgh_glr_adapt_default (void);
+
+typedef struct lgh_glr_adapt_report
+{
+  int    ell_final;               /* sketch width at the end                */
+  int    steps;                   /* 1 build + (steps - 1) extensions       */
+  int    capped;                  /* 1: stopped at ell_max, not by rho      */
+  double t_operator, t_dense;     /* seconds, summed over the steps         */
+}
+lgh_glr_adapt_report_t;
+
+int lgh_glr_compute_adaptive (Mat B, lgh_prior_t *prior,
+                              const lgh_glr_opts_t *opts,
+                              const lgh_glr_adapt_t *adapt, lgh_glr_t **glr,
+                              lgh_glr_report_t *report,
+                              lgh_glr_adapt_report_t *areport);
+
 void lgh_glr_destroy (lgh_glr_t *glr);
 
 /* ---- full space: H(c) = B + c R --------------------------------------- */
