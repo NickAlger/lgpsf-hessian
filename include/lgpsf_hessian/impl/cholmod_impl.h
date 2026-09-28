@@ -26,6 +26,7 @@
 
 #include <cholmod.h>
 #include <limits.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -330,11 +331,13 @@ lgh_chol_grow (double **buf, size_t *len, size_t need)
   return PETSC_SUCCESS;
 }
 
-/* Y = op(X) on row-distributed MATDENSE blocks (nloc x ncols each).
- * Columns [cstart[r], cstart[r+1]) go to rank r (balanced contiguous
- * split; with ncols < size some ranks get none).                       */
+/* Y = op(X) on row-distributed MATDENSE blocks (nloc x ncols each), ONE
+ * exchange: columns [cstart[r], cstart[r+1]) go to rank r (balanced
+ * contiguous split; with ncols < size some ranks get none).  Its buffers
+ * are sized to the block it is given; lgh_chol_block_op below feeds it
+ * column tiles so that they stay bounded.                              */
 static PetscErrorCode
-lgh_chol_block_op (lgh_prior_t *p, lgh_chol_op_t op, Mat X, Mat Y)
+lgh_chol_block_op_one (lgh_prior_t *p, lgh_chol_op_t op, Mat X, Mat Y)
 {
   struct lgh_chol_ctx *c = p->chol;
   const double        t0 = MPI_Wtime ();
@@ -429,7 +432,45 @@ lgh_chol_block_op (lgh_prior_t *p, lgh_chol_op_t op, Mat X, Mat Y)
 
   c->st.t_blocked += MPI_Wtime () - t0;
   c->st.t_blocked_comm += tc;
-  c->st.n_blocked++;
+  return PETSC_SUCCESS;
+}
+
+/* Y = op(X) in column TILES of at most `tile` columns, one exchange each.
+ * Without tiling every rank held four buffers sized to the whole block
+ * (nloc x ncols to send, three of n x ncols/size for the whole columns):
+ * 1.38 GB per rank at ncols = 20200 on 192 ranks, an out-of-memory in the
+ * GLR build (2026-09-28).  Tiles bound them by nloc x tile + 3 n x
+ * tile/size.  Every column gets the same solve; only the number of columns
+ * CHOLMOD handles together changes, so results agree to rounding (the test
+ * checks blocked == column-by-column to 1e-12, also with forced tiles).  tile = max(LGH_CHOL_BLOCK_TILE_MIN, 8 x size)
+ * (at least 8 columns per rank per tile); the environment variable
+ * LGH_CHOL_BLOCK_TILE overrides it (tests force small tiles with it).   */
+#ifndef LGH_CHOL_BLOCK_TILE_MIN
+#define LGH_CHOL_BLOCK_TILE_MIN 2048
+#endif
+static PetscErrorCode
+lgh_chol_block_op (lgh_prior_t *p, lgh_chol_op_t op, Mat X, Mat Y)
+{
+  struct lgh_chol_ctx *c = p->chol;
+  PetscInt            ncols, tile, c0;
+  const char         *env = getenv ("LGH_CHOL_BLOCK_TILE");
+
+  PetscCall (MatGetSize (X, NULL, &ncols));
+  tile = PetscMax ((PetscInt) LGH_CHOL_BLOCK_TILE_MIN, (PetscInt) 8 * (PetscInt) c->size);
+  if (env != NULL && atoi (env) > 0) tile = (PetscInt) atoi (env);
+  if (ncols <= tile) PetscCall (lgh_chol_block_op_one (p, op, X, Y));
+  else {
+    for (c0 = 0; c0 < ncols; c0 += tile) {
+      const PetscInt      c1 = PetscMin (ncols, c0 + tile);
+      Mat                 Xs, Ys;
+      PetscCall (MatDenseGetSubMatrix (X, PETSC_DECIDE, PETSC_DECIDE, c0, c1, &Xs));
+      PetscCall (MatDenseGetSubMatrix (Y, PETSC_DECIDE, PETSC_DECIDE, c0, c1, &Ys));
+      PetscCall (lgh_chol_block_op_one (p, op, Xs, Ys));
+      PetscCall (MatDenseRestoreSubMatrix (Y, &Ys));
+      PetscCall (MatDenseRestoreSubMatrix (X, &Xs));
+    }
+  }
+  c->st.n_blocked++;                       /* per caller's call, not per tile */
   c->st.n_blocked_cols += (long) ncols;
   return PETSC_SUCCESS;
 }
