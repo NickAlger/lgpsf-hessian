@@ -109,9 +109,10 @@ lgh_glrd_lidx (int gidx, int nb, int np)
 /* panel-blocked BCGS2 on the local slab of an N x ell MATDENSE.        */
 
 static PetscErrorCode
-lgh_glrd_panel_cholqr (double *pa, PetscInt nloc, PetscInt lda, int bw,
-                       MPI_Comm comm)
+lgh_glrd_panel_cholqr (lgh_glr_t *g, double *pa, PetscInt nloc, PetscInt lda,
+                       int bw)
 {
+  MPI_Comm            comm = g->comm;
   double             *G, *Gl;
   int                 pass, i, j, info;
   int                 bm = (int) nloc, bn = bw, blda = (int) lda;
@@ -119,18 +120,24 @@ lgh_glrd_panel_cholqr (double *pa, PetscInt nloc, PetscInt lda, int bw,
 
   PetscCall (PetscMalloc2 ((size_t) bw * bw, &G, (size_t) bw * bw, &Gl));
   for (pass = 0; pass < 2; pass++) {   /* CholQR2 */
+    PetscCall (lgh_gt_begin (g, LGH_GT_ORTH_LOCAL));
     if (nloc > 0) {
       LGH_BLAS_DGEMM ("T", "N", &bn, &bn, &bm, &one, pa, &blda, pa, &blda,
                       &zero, Gl, &bn);
     }
     else { for (i = 0; i < bw * bw; i++) Gl[i] = 0.; }
+    PetscCall (lgh_gt_end (g, LGH_GT_ORTH_LOCAL));
+    PetscCall (lgh_gt_begin (g, LGH_GT_ORTH_RED));
     PetscCallMPI (MPI_Allreduce (Gl, G, bw * bw, MPI_DOUBLE, MPI_SUM, comm));
+    PetscCall (lgh_gt_end (g, LGH_GT_ORTH_RED));
+    lgh_gt_count (g, LGH_GT_ORTH_RED, 8. * bw * bw, 1.);
+    PetscCall (lgh_gt_begin (g, LGH_GT_ORTH_LOCAL));
     info = 0;
     LGH_LAPACK_DPOTRF ("U", &bn, G, &bn, &info);
     if (info != 0) {                 /* jitter once */
       double              dmax = 0.;
       PetscCallMPI (MPI_Allreduce (Gl, G, bw * bw, MPI_DOUBLE, MPI_SUM,
-                                   comm));
+                                   comm));   /* rare: charged to local */
       for (i = 0; i < bw; i++) dmax = PetscMax (dmax, G[i + i * bw]);
       for (i = 0; i < bw; i++) G[i + i * bw] += 1.e-12 * PetscMax (dmax, 1.);
       info = 0;
@@ -143,6 +150,7 @@ lgh_glrd_panel_cholqr (double *pa, PetscInt nloc, PetscInt lda, int bw,
     if (nloc > 0) {
       LGH_BLAS_DTRSM ("R", "U", "N", "N", &bm, &bn, &one, G, &bn, pa, &blda);
     }
+    PetscCall (lgh_gt_end (g, LGH_GT_ORTH_LOCAL));
   }
   PetscCall (PetscFree2 (G, Gl));
   return PETSC_SUCCESS;
@@ -152,8 +160,9 @@ lgh_glrd_panel_cholqr (double *pa, PetscInt nloc, PetscInt lda, int bw,
  * (assumed already orthonormal) and each other; p_start = 0 is the full
  * factorization.  Used with p_start = ell1 for incremental extension.   */
 static PetscErrorCode
-lgh_glrd_bcgs2 (Mat Y, int ell, int b, int p_start, MPI_Comm comm)
+lgh_glrd_bcgs2 (lgh_glr_t *g, Mat Y, int ell, int b, int p_start)
 {
+  MPI_Comm            comm = g->comm;
   PetscScalar        *ya;
   PetscInt            nloc, lda;
   double             *C, *Cl;
@@ -175,19 +184,26 @@ lgh_glrd_bcgs2 (Mat Y, int ell, int b, int p_start, MPI_Comm comm)
         double              one = 1.0, zero = 0.0, mone = -1.0;
         int                 i;
 
+        PetscCall (lgh_gt_begin (g, LGH_GT_ORTH_LOCAL));
         if (nloc > 0) {
           LGH_BLAS_DGEMM ("T", "N", &bj, &bb, &bm, &one, ya, &blda, pa,
                           &blda, &zero, Cl, &bj);
         }
         else { for (i = 0; i < p0 * bw; i++) Cl[i] = 0.; }
+        PetscCall (lgh_gt_end (g, LGH_GT_ORTH_LOCAL));
+        PetscCall (lgh_gt_begin (g, LGH_GT_ORTH_RED));
         PetscCallMPI (MPI_Allreduce (Cl, C, p0 * bw, MPI_DOUBLE, MPI_SUM,
                                      comm));
+        PetscCall (lgh_gt_end (g, LGH_GT_ORTH_RED));
+        lgh_gt_count (g, LGH_GT_ORTH_RED, 8. * p0 * bw, 1.);
+        PetscCall (lgh_gt_begin (g, LGH_GT_ORTH_LOCAL));
         if (nloc > 0) {
           LGH_BLAS_DGEMM ("N", "N", &bm, &bb, &bj, &mone, ya, &blda, C,
                           &bj, &one, pa, &blda);
         }
+        PetscCall (lgh_gt_end (g, LGH_GT_ORTH_LOCAL));
       }
-      PetscCall (lgh_glrd_panel_cholqr (pa, nloc, lda, bw, comm));
+      PetscCall (lgh_glrd_panel_cholqr (g, pa, nloc, lda, bw));
     }
   }
   PetscCall (PetscFree2 (C, Cl));
@@ -225,19 +241,27 @@ lgh_glrd_form_T (lgh_glr_t *g, Mat Q, Mat Y, int b, double *Tloc,
     int                 bldq = (int) ldq, bldy = (int) ldy;
     double              one = 1.0, zero = 0.0;
 
+    PetscCall (lgh_gt_begin (g, LGH_GT_T_GEMM));
     if (nloc > 0) {
       LGH_BLAS_DGEMM ("T", "N", &bl, &bb, &bm, &one, qa, &bldq,
                       ya + (size_t) p0 * ldy, &bldy, &zero, Cl, &bl);
     }
     else { for (i = 0; i < ell * bw; i++) Cl[i] = 0.; }
+    PetscCall (lgh_gt_end (g, LGH_GT_T_GEMM));
+    PetscCall (lgh_gt_begin (g, LGH_GT_T_RED));
     PetscCallMPI (MPI_Allreduce (Cl, C, ell * bw, MPI_DOUBLE, MPI_SUM,
                                  g->comm));
+    PetscCall (lgh_gt_end (g, LGH_GT_T_RED));
+    lgh_gt_count (g, LGH_GT_T_RED, 8. * ell * bw, 1.);
 
     if (Arep != NULL && s->rank == 0) {     /* cross-check replicated A */
+      PetscCall (lgh_gt_begin (g, LGH_GT_CHECK));
       for (jj = 0; jj < bw; jj++)
         for (i = 0; i < ell; i++)
           Arep[i + (size_t) (p0 + jj) * ell] = C[i + (size_t) jj * ell];
+      PetscCall (lgh_gt_end (g, LGH_GT_CHECK));
     }
+    PetscCall (lgh_gt_begin (g, LGH_GT_T_SCATTER));
 
     /* 1D cyclic column store of raw A (extension source): j = lc*P + rank */
     for (jj = 0; jj < bw; jj++) {
@@ -273,6 +297,7 @@ lgh_glrd_form_T (lgh_glr_t *g, Mat Q, Mat Y, int b, double *Tloc,
         }
       }
     }
+    PetscCall (lgh_gt_end (g, LGH_GT_T_SCATTER));
   }
   PetscCall (PetscFree2 (C, Cl));
   PetscCall (MatDenseRestoreArrayRead (Y, &ya));
@@ -373,6 +398,18 @@ lgh_glrd_Umult (lgh_glr_t *g, const double *w, Vec y, PetscBool add)
 /* ------------------------------------------------------------------ */
 /* selection: rank by |lam_raw| descending, truncate, treat.  Fills
  * g->{lam, kept} and s->{keep, kpos}; reports.  Shared by build/extend. */
+/* |lam| descending, index ascending on ties (deterministic) */
+typedef struct { double a; int i; } lgh_glrd_absidx_t;
+static int
+lgh_glrd_absidx_cmp (const void *pa, const void *pb)
+{
+  const lgh_glrd_absidx_t *x = (const lgh_glrd_absidx_t *) pa;
+  const lgh_glrd_absidx_t *y = (const lgh_glrd_absidx_t *) pb;
+  if (x->a > y->a) return -1;
+  if (x->a < y->a) return 1;
+  return (x->i > y->i) - (x->i < y->i);
+}
+
 static PetscErrorCode
 lgh_glrd_select (lgh_glr_t *g, lgh_glr_report_t *rep)
 {
@@ -380,15 +417,18 @@ lgh_glrd_select (lgh_glr_t *g, lgh_glr_report_t *rep)
   const int           ell = s->ell;
   int                *order;
   double              absmax, cut;
-  int                 kept = 0, i, j;
+  int                 kept = 0, i;
 
+  PetscCall (lgh_gt_begin (g, LGH_GT_SELECT));
   PetscCall (PetscMalloc1 (ell, &order));
-  for (i = 0; i < ell; i++) order[i] = i;
-  for (i = 0; i < ell; i++)
-    for (j = i + 1; j < ell; j++)
-      if (fabs (s->lam_raw[order[j]]) > fabs (s->lam_raw[order[i]])) {
-        int                 t = order[i]; order[i] = order[j]; order[j] = t;
-      }
+  {
+    lgh_glrd_absidx_t  *ai;
+    PetscCall (PetscMalloc1 (ell, &ai));
+    for (i = 0; i < ell; i++) { ai[i].a = fabs (s->lam_raw[i]); ai[i].i = i; }
+    qsort (ai, (size_t) ell, sizeof (*ai), lgh_glrd_absidx_cmp);
+    for (i = 0; i < ell; i++) order[i] = ai[i].i;
+    PetscCall (PetscFree (ai));
+  }
   absmax = fabs (s->lam_raw[order[0]]);
   cut = 0.;
   if (g->opts.trunc_abs > 0.) cut = PetscMax (cut, g->opts.trunc_abs);
@@ -422,6 +462,7 @@ lgh_glrd_select (lgh_glr_t *g, lgh_glr_report_t *rep)
     }
   }
   PetscCall (PetscFree (order));
+  PetscCall (lgh_gt_end (g, LGH_GT_SELECT));
   return PETSC_SUCCESS;
 }
 
@@ -454,14 +495,16 @@ lgh_glrd_set_desc (struct lgh_glrd_state *s)
 }
 
 static PetscErrorCode
-lgh_glrd_pdsyevd (struct lgh_glrd_state *s, double *Tloc)
+lgh_glrd_pdsyevd (lgh_glr_t *g, double *Tloc)
 {
+  struct lgh_glrd_state *s = g->dist;
   int                 nell = s->ell, ione = 1, info = 0;
   int                 lwork = -1, liwork = -1, iwkopt = 0;
   double              wkopt;
   double             *work;
   int                *iwork;
 
+  PetscCall (lgh_gt_begin (g, LGH_GT_EIG_WORK));
   LGH_SCALAPACK_PDSYEVD ("V", "L", &nell, Tloc, &ione, &ione, s->desc,
                          s->lam_raw, s->Vloc, &ione, &ione, s->desc, &wkopt,
                          &lwork, &iwkopt, &liwork, &info);
@@ -491,11 +534,16 @@ lgh_glrd_pdsyevd (struct lgh_glrd_state *s, double *Tloc)
   }
   PetscCall (PetscMalloc1 (lwork, &work));
   PetscCall (PetscMalloc1 (liwork, &iwork));
+  PetscCall (lgh_gt_end (g, LGH_GT_EIG_WORK));
+  PetscCall (lgh_gt_begin (g, LGH_GT_EIG));
   LGH_SCALAPACK_PDSYEVD ("V", "L", &nell, Tloc, &ione, &ione, s->desc,
                          s->lam_raw, s->Vloc, &ione, &ione, s->desc, work,
                          &lwork, iwork, &liwork, &info);
+  PetscCall (lgh_gt_end (g, LGH_GT_EIG));
+  PetscCall (lgh_gt_begin (g, LGH_GT_EIG_WORK));
   PetscCall (PetscFree (work));
   PetscCall (PetscFree (iwork));
+  PetscCall (lgh_gt_end (g, LGH_GT_EIG_WORK));
   PetscCheck (info == 0, PETSC_COMM_SELF, PETSC_ERR_LIB,
               "lgh_glrd: pdsyevd failed");
   return PETSC_SUCCESS;
@@ -538,6 +586,7 @@ lgh_glrd_build (lgh_glr_t *g, lgh_glr_report_t *rep)
   int                 i, j, p;
 
   PetscCall (PetscMemzero (rep, sizeof (*rep)));
+  PetscCall (lgh_gt_begin (g, LGH_GT_SETUP));
   PetscCall (PetscNew (&s));
   g->dist = s;
   PetscCallMPI (MPI_Comm_size (g->comm, &s->P));
@@ -578,10 +627,12 @@ lgh_glrd_build (lgh_glr_t *g, lgh_glr_report_t *rep)
                              &Y));
   PetscCall (MatCreateDense (g->comm, nloc, PETSC_DECIDE, Nglob, ell, NULL,
                              &W));
+  PetscCall (lgh_gt_end (g, LGH_GT_SETUP));
   {
     PetscScalar        *qa;
     PetscInt            rlo, rhi, lda;
 
+    PetscCall (lgh_gt_begin (g, LGH_GT_OMEGA));
     PetscCall (MatGetOwnershipRange (Q, &rlo, &rhi));
     PetscCall (MatDenseGetLDA (Q, &lda));
     PetscCall (MatDenseGetArrayWrite (Q, &qa));
@@ -589,6 +640,8 @@ lgh_glrd_build (lgh_glr_t *g, lgh_glr_report_t *rep)
       for (i = 0; i < (int) (rhi - rlo); i++)
         qa[i + (size_t) j * lda] = lgh_randn_at (g->opts.seed, rlo + i, j);
     PetscCall (MatDenseRestoreArrayWrite (Q, &qa));
+    PetscCall (lgh_gt_end (g, LGH_GT_OMEGA));
+    lgh_gt_count (g, LGH_GT_OMEGA, 0., (double) ell);
   }
 
   /* Y = F Omega; q power passes with BCGS2 re-orthonormalization */
@@ -597,21 +650,27 @@ lgh_glrd_build (lgh_glr_t *g, lgh_glr_report_t *rep)
   rep->t_operator += MPI_Wtime () - t0;
   for (p = 0; p < g->opts.q_power; p++) {
     t0 = MPI_Wtime ();
-    PetscCall (lgh_glrd_bcgs2 (Y, ell, panel_b, 0, g->comm));
+    PetscCall (lgh_glrd_bcgs2 (g, Y, ell, panel_b, 0));
     rep->t_dense += MPI_Wtime () - t0;
+    PetscCall (lgh_gt_begin (g, LGH_GT_COPY));
     PetscCall (MatCopy (Y, Q, SAME_NONZERO_PATTERN));
+    PetscCall (lgh_gt_end (g, LGH_GT_COPY));
     t0 = MPI_Wtime ();
     PetscCall (lgh_glr_apply_F_block (g, Q, Y, W));
     rep->t_operator += MPI_Wtime () - t0;
   }
   t0 = MPI_Wtime ();
-  PetscCall (lgh_glrd_bcgs2 (Y, ell, panel_b, 0, g->comm));
+  PetscCall (lgh_glrd_bcgs2 (g, Y, ell, panel_b, 0));
   rep->t_dense += MPI_Wtime () - t0;
+  PetscCall (lgh_gt_begin (g, LGH_GT_COPY));
   PetscCall (MatCopy (Y, Q, SAME_NONZERO_PATTERN));
+  PetscCall (lgh_gt_end (g, LGH_GT_COPY));
+  g->gmem[0] = lgh_rss_mb ();              /* range finder done */
   t0 = MPI_Wtime ();
   PetscCall (lgh_glr_apply_F_block (g, Q, Y, W));
   rep->t_operator += MPI_Wtime () - t0;
 
+  if (g->opts.check) PetscCall (lgh_gt_begin (g, LGH_GT_CHECK));
   if (g->opts.check) {   /* streamed orthonormality check, no ell^2 storage */
     const PetscScalar  *qa;
     PetscInt            ldq;
@@ -648,13 +707,17 @@ lgh_glrd_build (lgh_glr_t *g, lgh_glr_report_t *rep)
                           "lgh_glrd: BCGS2 orthonormality |Q^T Q - I|_max "
                           "= %.3e\n", gmax));
   }
+  if (g->opts.check) PetscCall (lgh_gt_end (g, LGH_GT_CHECK));
 
   /* T = sym(Q^T Y), streamed into block-cyclic; then pdsyevd (V in place) */
   t0 = MPI_Wtime ();
   PetscCall (lgh_glrd_form_T (g, Q, Y, panel_b, Tloc, Arep));
-  PetscCall (lgh_glrd_pdsyevd (s, Tloc));
+  g->gmem[1] = lgh_rss_mb ();
+  PetscCall (lgh_glrd_pdsyevd (g, Tloc));
+  g->gmem[2] = lgh_rss_mb ();
   rep->t_dense += MPI_Wtime () - t0;
 
+  if (g->opts.check) PetscCall (lgh_gt_begin (g, LGH_GT_CHECK));
   if (g->opts.check) {          /* replicated dsyevd cross-check, rank 0 */
     double              dmax = 0., amax = 0., rel = 0.;
 
@@ -693,12 +756,15 @@ lgh_glrd_build (lgh_glr_t *g, lgh_glr_report_t *rep)
     rep->resid_max = rel;   /* this backend: pdsyevd-vs-dsyevd rel |dlam| */
     PetscCall (PetscFree (Arep));
   }
+  if (g->opts.check) PetscCall (lgh_gt_end (g, LGH_GT_CHECK));
 
   PetscCall (lgh_glrd_select (g, rep));
 
+  PetscCall (lgh_gt_begin (g, LGH_GT_SETUP));
   PetscCall (PetscFree (Tloc));
   PetscCall (MatDestroy (&Y));
   PetscCall (MatDestroy (&W));
+  PetscCall (lgh_gt_end (g, LGH_GT_SETUP));
   s->Q = Q;
   return PETSC_SUCCESS;
 }
@@ -724,6 +790,7 @@ lgh_glrd_extend_incr (lgh_glr_t *g, int k_new, lgh_glr_report_t *rep)
   PetscCall (PetscMemzero (rep, sizeof (*rep)));
 
   /* Q grows: new N x ell2 slab, old columns copied, new ones hashed */
+  PetscCall (lgh_gt_begin (g, LGH_GT_SETUP));
   PetscCall (MatCreateDense (g->comm, g->nloc, PETSC_DECIDE, g->Nglob, ell2,
                              NULL, &Qb));
   PetscCall (MatCreateDense (g->comm, g->nloc, PETSC_DECIDE, g->Nglob,
@@ -732,11 +799,13 @@ lgh_glrd_extend_incr (lgh_glr_t *g, int k_new, lgh_glr_report_t *rep)
                              k_new, NULL, &Yn));
   PetscCall (MatCreateDense (g->comm, g->nloc, PETSC_DECIDE, g->Nglob,
                              k_new, NULL, &Wn));
+  PetscCall (lgh_gt_end (g, LGH_GT_SETUP));
   {
     const PetscScalar  *qa;
     PetscScalar        *qb, *qn;
     PetscInt            rlo, rhi, ldq, ldb, ldn;
 
+    PetscCall (lgh_gt_begin (g, LGH_GT_COPY));
     PetscCall (MatGetOwnershipRange (Qb, &rlo, &rhi));
     PetscCall (MatDenseGetLDA (s->Q, &ldq));
     PetscCall (MatDenseGetLDA (Qb, &ldb));
@@ -747,10 +816,14 @@ lgh_glrd_extend_incr (lgh_glr_t *g, int k_new, lgh_glr_report_t *rep)
     for (j = 0; j < ell1; j++)
       for (i = 0; i < (int) (rhi - rlo); i++)
         qb[i + (size_t) j * ldb] = qa[i + (size_t) j * ldq];
+    PetscCall (lgh_gt_end (g, LGH_GT_COPY));
+    PetscCall (lgh_gt_begin (g, LGH_GT_OMEGA));
     for (j = 0; j < k_new; j++)
       for (i = 0; i < (int) (rhi - rlo); i++)
         qn[i + (size_t) j * ldn] =
             lgh_randn_at (g->opts.seed, rlo + i, ell1 + j);
+    PetscCall (lgh_gt_end (g, LGH_GT_OMEGA));
+    lgh_gt_count (g, LGH_GT_OMEGA, 0., (double) k_new);
     PetscCall (MatDenseRestoreArrayWrite (Qn, &qn));
     PetscCall (MatDenseRestoreArrayWrite (Qb, &qb));
     PetscCall (MatDenseRestoreArrayRead (s->Q, &qa));
@@ -762,9 +835,11 @@ lgh_glrd_extend_incr (lgh_glr_t *g, int k_new, lgh_glr_report_t *rep)
   rep->t_operator += MPI_Wtime () - t0;
   for (p = 0; p < g->opts.q_power; p++) {
     t0 = MPI_Wtime ();
-    PetscCall (lgh_glrd_bcgs2 (Yn, k_new, panel_b, 0, g->comm));
+    PetscCall (lgh_glrd_bcgs2 (g, Yn, k_new, panel_b, 0));
     rep->t_dense += MPI_Wtime () - t0;
+    PetscCall (lgh_gt_begin (g, LGH_GT_COPY));
     PetscCall (MatCopy (Yn, Qn, SAME_NONZERO_PATTERN));
+    PetscCall (lgh_gt_end (g, LGH_GT_COPY));
     t0 = MPI_Wtime ();
     PetscCall (lgh_glr_apply_F_block (g, Qn, Yn, Wn));
     rep->t_operator += MPI_Wtime () - t0;
@@ -776,6 +851,7 @@ lgh_glrd_extend_incr (lgh_glr_t *g, int k_new, lgh_glr_report_t *rep)
     PetscScalar        *qb;
     PetscInt            ldn, ldb, rlo, rhi;
 
+    PetscCall (lgh_gt_begin (g, LGH_GT_COPY));
     PetscCall (MatGetOwnershipRange (Qb, &rlo, &rhi));
     PetscCall (MatDenseGetLDA (Yn, &ldn));
     PetscCall (MatDenseGetLDA (Qb, &ldb));
@@ -786,9 +862,10 @@ lgh_glrd_extend_incr (lgh_glr_t *g, int k_new, lgh_glr_report_t *rep)
         qb[i + (size_t) (ell1 + j) * ldb] = yn[i + (size_t) j * ldn];
     PetscCall (MatDenseRestoreArray (Qb, &qb));
     PetscCall (MatDenseRestoreArrayRead (Yn, &yn));
+    PetscCall (lgh_gt_end (g, LGH_GT_COPY));
   }
   t0 = MPI_Wtime ();
-  PetscCall (lgh_glrd_bcgs2 (Qb, ell2, panel_b, ell1, g->comm));
+  PetscCall (lgh_glrd_bcgs2 (g, Qb, ell2, panel_b, ell1));
   rep->t_dense += MPI_Wtime () - t0;
 
   /* one more F apply on the orthonormalized new block; border columns
@@ -798,6 +875,7 @@ lgh_glrd_extend_incr (lgh_glr_t *g, int k_new, lgh_glr_report_t *rep)
     const PetscScalar  *qb;
     PetscInt            ldn, ldb, rlo, rhi;
 
+    PetscCall (lgh_gt_begin (g, LGH_GT_COPY));
     PetscCall (MatGetOwnershipRange (Qb, &rlo, &rhi));
     PetscCall (MatDenseGetLDA (Qn, &ldn));
     PetscCall (MatDenseGetLDA (Qb, &ldb));
@@ -808,7 +886,9 @@ lgh_glrd_extend_incr (lgh_glr_t *g, int k_new, lgh_glr_report_t *rep)
         qn[i + (size_t) j * ldn] = qb[i + (size_t) (ell1 + j) * ldb];
     PetscCall (MatDenseRestoreArrayWrite (Qn, &qn));
     PetscCall (MatDenseRestoreArrayRead (Qb, &qb));
+    PetscCall (lgh_gt_end (g, LGH_GT_COPY));
   }
+  g->gmem[0] = lgh_rss_mb ();              /* new block through the range finder */
   t0 = MPI_Wtime ();
   PetscCall (lgh_glr_apply_F_block (g, Qn, Yn, Wn));
   rep->t_operator += MPI_Wtime () - t0;
@@ -825,14 +905,19 @@ lgh_glrd_extend_incr (lgh_glr_t *g, int k_new, lgh_glr_report_t *rep)
     PetscCall (MatDenseGetLDA (Yn, &ldn));
     PetscCall (MatDenseGetArrayRead (Qb, &qb));
     PetscCall (MatDenseGetArrayRead (Yn, &yn));
+    PetscCall (lgh_gt_begin (g, LGH_GT_T_GEMM));
     if (nloc > 0) {
       int                 bldb = (int) ldb, bldn = (int) ldn;
       LGH_BLAS_DGEMM ("T", "N", &bl2, &bk, &bm, &one, qb, &bldb, yn, &bldn,
                       &zero, Cl, &bl2);
     }
     else { for (i = 0; i < ell2 * k_new; i++) Cl[i] = 0.; }
+    PetscCall (lgh_gt_end (g, LGH_GT_T_GEMM));
+    PetscCall (lgh_gt_begin (g, LGH_GT_T_RED));
     PetscCallMPI (MPI_Allreduce (Cl, Cnew, ell2 * k_new, MPI_DOUBLE,
                                  MPI_SUM, g->comm));
+    PetscCall (lgh_gt_end (g, LGH_GT_T_RED));
+    lgh_gt_count (g, LGH_GT_T_RED, 8. * ell2 * k_new, 1.);
     PetscCall (MatDenseRestoreArrayRead (Yn, &yn));
     PetscCall (MatDenseRestoreArrayRead (Qb, &qb));
   }
@@ -840,6 +925,7 @@ lgh_glrd_extend_incr (lgh_glr_t *g, int k_new, lgh_glr_report_t *rep)
   /* grow the 1D column store to ell2 rows; fill old columns' new rows by
    * symmetry (A(i_new, j_old) := A(j_old, i_new) = Cnew[j_old, i_new-ell1]);
    * append owned new columns                                            */
+  PetscCall (lgh_gt_begin (g, LGH_GT_T_SCATTER));
   {
     double             *Anew;
     const int           acn2 = (ell2 + s->P - 1 - s->rank) / s->P;
@@ -862,6 +948,8 @@ lgh_glrd_extend_incr (lgh_glr_t *g, int k_new, lgh_glr_report_t *rep)
     s->Acols = Anew;
     s->acn = acn2;
   }
+  PetscCall (lgh_gt_end (g, LGH_GT_T_SCATTER));
+  PetscCall (lgh_gt_begin (g, LGH_GT_SETUP));
   PetscCall (MatDestroy (&Qn));
   PetscCall (MatDestroy (&Yn));
   PetscCall (MatDestroy (&Wn));
@@ -877,6 +965,7 @@ lgh_glrd_extend_incr (lgh_glr_t *g, int k_new, lgh_glr_report_t *rep)
                            &s->Vloc));
   PetscCall (PetscCalloc1 ((size_t) PetscMax (s->tl_rows * s->tl_cols, 1),
                            &Tloc));
+  PetscCall (lgh_gt_end (g, LGH_GT_SETUP));
 
   /* rebuild sym(T) block-cyclic from the column store: per panel, owners
    * write their columns into a zeroed replicated buffer, allreduce(SUM)
@@ -886,6 +975,7 @@ lgh_glrd_extend_incr (lgh_glr_t *g, int k_new, lgh_glr_report_t *rep)
     const int           bw = PetscMin (panel_b, ell2 - p0);
     double             *Cp = Cnew;   /* reuse as replicated panel buffer */
 
+    PetscCall (lgh_gt_begin (g, LGH_GT_T_SCATTER));
     for (i = 0; i < ell2 * bw; i++) Cl[i] = 0.;
     for (jj = 0; jj < bw; jj++) {
       j = p0 + jj;
@@ -894,8 +984,13 @@ lgh_glrd_extend_incr (lgh_glr_t *g, int k_new, lgh_glr_report_t *rep)
           Cl[i + (size_t) jj * ell2] =
               s->Acols[i + (size_t) (j / s->P) * ell2];
     }
+    PetscCall (lgh_gt_end (g, LGH_GT_T_SCATTER));
+    PetscCall (lgh_gt_begin (g, LGH_GT_T_RED));
     PetscCallMPI (MPI_Allreduce (Cl, Cp, ell2 * bw, MPI_DOUBLE, MPI_SUM,
                                  g->comm));
+    PetscCall (lgh_gt_end (g, LGH_GT_T_RED));
+    lgh_gt_count (g, LGH_GT_T_RED, 8. * ell2 * bw, 1.);
+    PetscCall (lgh_gt_begin (g, LGH_GT_T_SCATTER));
     for (jj = 0; jj < bw; jj++) {
       j = p0 + jj;
       if (lgh_glrd_owner (j, s->nb, s->pcol) != s->mycol) continue;
@@ -921,20 +1016,25 @@ lgh_glrd_extend_incr (lgh_glr_t *g, int k_new, lgh_glr_report_t *rep)
         }
       }
     }
+    PetscCall (lgh_gt_end (g, LGH_GT_T_SCATTER));
   }
   PetscCall (PetscFree2 (Cnew, Cl));
+  g->gmem[1] = lgh_rss_mb ();
 
   /* eig at ell2 + re-selection */
   PetscCall (PetscFree (s->lam_raw));
   PetscCall (PetscMalloc1 (ell2, &s->lam_raw));
-  PetscCall (lgh_glrd_pdsyevd (s, Tloc));
+  PetscCall (lgh_glrd_pdsyevd (g, Tloc));
+  g->gmem[2] = lgh_rss_mb ();
   rep->t_dense += MPI_Wtime () - t0;
   PetscCall (PetscFree (Tloc));
 
   PetscCall (lgh_glrd_select (g, rep));
 
+  PetscCall (lgh_gt_begin (g, LGH_GT_SETUP));
   PetscCall (PetscFree (s->cwork));
   PetscCall (PetscMalloc1 (3 * ell2, &s->cwork));
+  PetscCall (lgh_gt_end (g, LGH_GT_SETUP));
   return PETSC_SUCCESS;
 }
 

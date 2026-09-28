@@ -21,6 +21,8 @@
 #define LGPSF_HESSIAN_GLR_COMMON_IMPL_H
 
 #include <petsc.h>
+#include <stdlib.h>
+#include <sys/resource.h>
 
 #include "lgpsf_hessian/prior.h"
 #include "lgpsf_hessian/glr.h"
@@ -299,7 +301,178 @@ struct lgh_glr
   double             *wbuf;         /* kept-sized coefficient work      */
   double             *wbuf2;        /* kept-sized local reduction stage */
   double             *fbuf;         /* kept-sized filter values         */
+  /* build-time breakdown (lgh_glr_timer_t), this rank; reset per build or
+   * extension, reduced into the report by lgh_gt_finish                 */
+  double              gt[LGH_GT_N], gt0[LGH_GT_N]; /* seconds, open stamps */
+  double              gb[LGH_GT_N], gc[LGH_GT_N];  /* bytes, calls         */
+  double              gmem[3];      /* RSS MB: range, T, eig             */
+  double              gstart;
 };
+
+/* ------------------------------------------------------------------ */
+/* build-time breakdown: wall-clock accumulators + PETSc log events     */
+
+static const char *const lgh_gt_names[LGH_GT_N] = {
+  "setup", "omega", "f_scale", "zt_solve", "matvec", "z_solve",
+  "orth_local", "orth_red", "copy", "t_gemm", "t_red", "t_scatter",
+  "eig_work", "eig", "select", "check", "zs_exch", "zs_copy", "zs_local"
+};
+static const char *const lgh_gt_evnames[LGH_GT_N] = {
+  "LghGlrSetup", "LghGlrOmega", "LghGlrFScale", "LghGlrZtSolve",
+  "LghGlrMatvec", "LghGlrZSolve", "LghGlrOrthLocal", "LghGlrOrthRed",
+  "LghGlrCopy", "LghGlrTGemm", "LghGlrTRed", "LghGlrTScatter",
+  "LghGlrEigWork", "LghGlrEig", "LghGlrSelect", "LghGlrCheck",
+  "LghGlrZsExch", "LghGlrZsCopy", "LghGlrZsLocal"
+};
+static PetscLogEvent lgh_gt_ev[LGH_GT_N];
+static int           lgh_gt_registered = 0;
+
+const char *
+lgh_glr_timer_name (int k)
+{
+  return (k >= 0 && k < LGH_GT_N) ? lgh_gt_names[k] : NULL;
+}
+
+static PetscErrorCode
+lgh_gt_register (void)
+{
+  PetscClassId        cid;
+  int                 k;
+
+  if (lgh_gt_registered) return PETSC_SUCCESS;
+  PetscCall (PetscClassIdRegister ("LGH GLR", &cid));
+  for (k = 0; k < LGH_GT_N; k++)
+    PetscCall (PetscLogEventRegister (lgh_gt_evnames[k], cid, &lgh_gt_ev[k]));
+  lgh_gt_registered = 1;
+  return PETSC_SUCCESS;
+}
+
+static PetscErrorCode
+lgh_gt_begin (lgh_glr_t *g, int k)
+{
+  if (g == NULL) return PETSC_SUCCESS;
+  if (lgh_gt_registered) PetscCall (PetscLogEventBegin (lgh_gt_ev[k], 0, 0, 0, 0));
+  g->gt0[k] = MPI_Wtime ();
+  return PETSC_SUCCESS;
+}
+
+static PetscErrorCode
+lgh_gt_end (lgh_glr_t *g, int k)
+{
+  if (g == NULL) return PETSC_SUCCESS;
+  g->gt[k] += MPI_Wtime () - g->gt0[k];
+  if (lgh_gt_registered) PetscCall (PetscLogEventEnd (lgh_gt_ev[k], 0, 0, 0, 0));
+  return PETSC_SUCCESS;
+}
+
+static void
+lgh_gt_count (lgh_glr_t *g, int k, double bytes, double calls)
+{
+  if (g == NULL) return;
+  g->gb[k] += bytes;
+  g->gc[k] += calls;
+}
+
+static double
+lgh_rss_mb (void)               /* peak resident set of this process */
+{
+  struct rusage       ru;
+
+  if (getrusage (RUSAGE_SELF, &ru) != 0) return 0.;
+#ifdef __APPLE__
+  return (double) ru.ru_maxrss / 1048576.;   /* bytes */
+#else
+  return (double) ru.ru_maxrss / 1024.;      /* KB    */
+#endif
+}
+
+static void
+lgh_gt_reset (lgh_glr_t *g)
+{
+  int                 k;
+
+  for (k = 0; k < LGH_GT_N; k++) g->gt[k] = g->gb[k] = g->gc[k] = 0.;
+  g->gmem[0] = g->gmem[1] = g->gmem[2] = 0.;
+  g->gstart = MPI_Wtime ();
+}
+
+/* the CHOLMOD prior's blocked-solve counters (zeros for other priors):
+ * s = {exchange s, copy s, local s, bytes, exchanges}                  */
+static void
+lgh_gt_zs_snap (const lgh_glr_t *g, double s[5])
+{
+#ifdef LGH_HAVE_CHOLMOD
+  lgh_prior_cholmod_stats_t st;
+  if (lgh_prior_cholmod_get_stats (g->prior, &st) == 0) {
+    s[0] = st.t_blocked_comm; s[1] = st.t_blocked_copy;
+    s[2] = st.t_blocked_local; s[3] = st.b_blocked_comm;
+    s[4] = (double) st.n_blocked_exch;
+    return;
+  }
+#endif
+  s[0] = s[1] = s[2] = s[3] = s[4] = 0.;
+}
+
+static void
+lgh_gt_zs_add (lgh_glr_t *g, const double s0[5], const double s1[5])
+{
+  g->gt[LGH_GT_ZS_EXCH] += s1[0] - s0[0];
+  g->gt[LGH_GT_ZS_COPY] += s1[1] - s0[1];
+  g->gt[LGH_GT_ZS_LOCAL] += s1[2] - s0[2];
+  g->gb[LGH_GT_ZS_EXCH] += s1[3] - s0[3];
+  g->gc[LGH_GT_ZS_EXCH] += s1[4] - s0[4];
+}
+
+/* reduce this rank's accumulators into rep (collective) */
+static PetscErrorCode
+lgh_gt_finish (lgh_glr_t *g, lgh_glr_report_t *rep)
+{
+  enum { NMX = 3 * LGH_GT_N + 7, NSM = LGH_GT_N + 3 };
+  double              mx[NMX], mxg[NMX], sm[NSM], smg[NSM], nnzB = -1.;
+  PetscMPIInt         P;
+  PetscBool           isaij = PETSC_FALSE;
+  int                 k;
+
+  PetscCall (PetscObjectTypeCompareAny ((PetscObject) g->B, &isaij,
+                                        MATSEQAIJ, MATMPIAIJ, ""));
+  if (isaij) {
+    MatInfo             info;
+    PetscCall (MatGetInfo (g->B, MAT_LOCAL, &info));
+    nnzB = info.nz_used;
+  }
+  for (k = 0; k < LGH_GT_N; k++) {
+    mx[k] = g->gt[k];
+    mx[LGH_GT_N + k] = g->gb[k];
+    mx[2 * LGH_GT_N + k] = g->gc[k];
+    sm[k] = g->gt[k];
+  }
+  mx[3 * LGH_GT_N + 0] = sm[LGH_GT_N + 0] = MPI_Wtime () - g->gstart;
+  mx[3 * LGH_GT_N + 1] = g->gmem[0];
+  mx[3 * LGH_GT_N + 2] = g->gmem[1];
+  mx[3 * LGH_GT_N + 3] = g->gmem[2];
+  mx[3 * LGH_GT_N + 4] = sm[LGH_GT_N + 1] = (double) g->nloc;
+  mx[3 * LGH_GT_N + 5] = sm[LGH_GT_N + 2] = nnzB;
+  mx[3 * LGH_GT_N + 6] = 0.;
+  PetscCallMPI (MPI_Allreduce (mx, mxg, NMX, MPI_DOUBLE, MPI_MAX, g->comm));
+  PetscCallMPI (MPI_Allreduce (sm, smg, NSM, MPI_DOUBLE, MPI_SUM, g->comm));
+  PetscCallMPI (MPI_Comm_size (g->comm, &P));
+  for (k = 0; k < LGH_GT_N; k++) {
+    rep->t_max[k] = mxg[k];
+    rep->t_mean[k] = smg[k] / P;
+    rep->bytes_max[k] = mxg[LGH_GT_N + k];
+    rep->calls_max[k] = mxg[2 * LGH_GT_N + k];
+  }
+  rep->t_total_max = mxg[3 * LGH_GT_N + 0];
+  rep->t_total_mean = smg[LGH_GT_N + 0] / P;
+  rep->mem_mb_range = mxg[3 * LGH_GT_N + 1];
+  rep->mem_mb_T = mxg[3 * LGH_GT_N + 2];
+  rep->mem_mb_eig = mxg[3 * LGH_GT_N + 3];
+  rep->nloc_max = mxg[3 * LGH_GT_N + 4];
+  rep->nloc_mean = smg[LGH_GT_N + 1] / P;
+  rep->nnzB_max = isaij ? mxg[3 * LGH_GT_N + 5] : -1.;
+  rep->nnzB_mean = isaij ? smg[LGH_GT_N + 2] / P : -1.;
+  return PETSC_SUCCESS;
+}
 
 #ifdef LGH_WITH_SCALAPACK
 /* defined in impl/glr_scalapack_impl.h (same TU, included after) */
@@ -341,11 +514,20 @@ static PetscErrorCode
 lgh_glr_apply_F_block (lgh_glr_t *g, Mat X, Mat Y, Mat W)
 {
   PetscInt            j, ncols;
+  double              s0[5], s1[5];
 
+  PetscCall (lgh_gt_begin (g, LGH_GT_F_SCALE));
   PetscCall (MatCopy (X, W, SAME_NONZERO_PATTERN));
   PetscCall (MatDiagonalScale (W, g->prior->msqrt, NULL));
+  PetscCall (lgh_gt_end (g, LGH_GT_F_SCALE));
+  lgh_gt_zs_snap (g, s0);
+  PetscCall (lgh_gt_begin (g, LGH_GT_ZT_SOLVE));
   PetscCall (lgh_prior_solve_block (g->prior, LGH_PRIOR_SOLVEZT, W, Y));
+  PetscCall (lgh_gt_end (g, LGH_GT_ZT_SOLVE));
+  lgh_gt_zs_snap (g, s1);
+  lgh_gt_zs_add (g, s0, s1);
   PetscCall (MatGetSize (X, NULL, &ncols));
+  PetscCall (lgh_gt_begin (g, LGH_GT_MATVEC));
   for (j = 0; j < ncols; j++) {
     Vec                 yj, wj;
     PetscCall (MatDenseGetColumnVecRead (Y, j, &yj));
@@ -354,8 +536,17 @@ lgh_glr_apply_F_block (lgh_glr_t *g, Mat X, Mat Y, Mat W)
     PetscCall (MatDenseRestoreColumnVecWrite (W, j, &wj));
     PetscCall (MatDenseRestoreColumnVecRead (Y, j, &yj));
   }
+  PetscCall (lgh_gt_end (g, LGH_GT_MATVEC));
+  lgh_gt_count (g, LGH_GT_MATVEC, 0., (double) ncols);
+  lgh_gt_zs_snap (g, s0);
+  PetscCall (lgh_gt_begin (g, LGH_GT_Z_SOLVE));
   PetscCall (lgh_prior_solve_block (g->prior, LGH_PRIOR_SOLVEZ, W, Y));
+  PetscCall (lgh_gt_end (g, LGH_GT_Z_SOLVE));
+  lgh_gt_zs_snap (g, s1);
+  lgh_gt_zs_add (g, s0, s1);
+  PetscCall (lgh_gt_begin (g, LGH_GT_F_SCALE));
   PetscCall (MatDiagonalScale (Y, g->prior->msqrt, NULL));
+  PetscCall (lgh_gt_end (g, LGH_GT_F_SCALE));
   return PETSC_SUCCESS;
 }
 
@@ -693,13 +884,18 @@ lgh_glr_compute (Mat B, lgh_prior_t *prior, const lgh_glr_opts_t *opts,
   g->prior = prior;
   lgh_prior_ref (prior);
 
+  PetscCall (lgh_gt_register ());
+  lgh_gt_reset (g);
 #ifdef LGH_WITH_SCALAPACK
   if (g->opts.backend == LGH_GLR_SCALAPACK)
     PetscCall (lgh_glrd_build (g, &local_rep));
   else
 #endif
   PetscCall (lgh_glr_build_replicated (g, &local_rep));
+  PetscCall (lgh_gt_begin (g, LGH_GT_SETUP));
   PetscCall (lgh_glr_setup_scratch (g));
+  PetscCall (lgh_gt_end (g, LGH_GT_SETUP));
+  PetscCall (lgh_gt_finish (g, &local_rep));
   if (report != NULL) *report = local_rep;
   *glr = g;
   return PETSC_SUCCESS;
@@ -726,6 +922,8 @@ lgh_glr_extend (lgh_glr_t *glr, int k_new, lgh_glr_report_t *report)
               PETSC_ERR_ARG_OUTOFRANGE,
               "lgh_glr_extend: extended ell (%d) exceeds N (%d)",
               (int) glr->opts.ell + k_new, (int) glr->Nglob);
+  PetscCall (lgh_gt_register ());
+  lgh_gt_reset (glr);
 #ifdef LGH_WITH_SCALAPACK
   if (glr->opts.backend == LGH_GLR_SCALAPACK) {
     PetscCall (lgh_glrd_extend_incr (glr, k_new, &local_rep));
@@ -737,7 +935,10 @@ lgh_glr_extend (lgh_glr_t *glr, int k_new, lgh_glr_report_t *report)
     PetscCall (lgh_glr_teardown_build (glr));
     PetscCall (lgh_glr_build_replicated (glr, &local_rep));
   }
+  PetscCall (lgh_gt_begin (glr, LGH_GT_SETUP));
   PetscCall (lgh_glr_setup_scratch (glr));
+  PetscCall (lgh_gt_end (glr, LGH_GT_SETUP));
+  PetscCall (lgh_gt_finish (glr, &local_rep));
   if (report != NULL) *report = local_rep;
   return PETSC_SUCCESS;
 }
@@ -753,6 +954,21 @@ lgh_glr_adapt_default (void)
   a.on_step = NULL;
   a.ctx = NULL;
   return a;
+}
+
+static void
+lgh_glr_adapt_accum (lgh_glr_adapt_report_t *ar, const lgh_glr_report_t *rep)
+{
+  int                 k;
+
+  ar->t_operator += rep->t_operator;
+  ar->t_dense += rep->t_dense;
+  for (k = 0; k < LGH_GT_N; k++) {
+    ar->t_max[k] += rep->t_max[k];
+    ar->t_mean[k] += rep->t_mean[k];
+  }
+  ar->t_total_max += rep->t_total_max;
+  ar->t_total_mean += rep->t_total_mean;
 }
 
 int
@@ -785,8 +1001,7 @@ lgh_glr_compute_adaptive (Mat B, lgh_prior_t *prior, const lgh_glr_opts_t *opts,
   o.ell = ell;
   PetscCall (lgh_glr_compute (B, prior, &o, &g, &rep));
   ar.steps = 1;
-  ar.t_operator += rep.t_operator;
-  ar.t_dense += rep.t_dense;
+  lgh_glr_adapt_accum (&ar, &rep);
   if (ad.on_step != NULL) ad.on_step (ar.steps, ell, &rep, ad.ctx);
   for (;;) {
     int                 enew;
@@ -799,8 +1014,7 @@ lgh_glr_compute_adaptive (Mat B, lgh_prior_t *prior, const lgh_glr_opts_t *opts,
     PetscCall (lgh_glr_extend (g, enew - ell, &rep));
     ell = enew;
     ar.steps++;
-    ar.t_operator += rep.t_operator;
-    ar.t_dense += rep.t_dense;
+    lgh_glr_adapt_accum (&ar, &rep);
     if (ad.on_step != NULL) ad.on_step (ar.steps, ell, &rep, ad.ctx);
   }
   ar.ell_final = ell;

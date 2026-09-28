@@ -207,6 +207,10 @@ typedef struct lgh_prior_cholmod_stats
   double t_gather, t_analyse, t_factor;          /* setup, seconds        */
   double t_single;  long n_single;               /* Vec-wise ops          */
   double t_blocked; double t_blocked_comm;       /* blocked solves        */
+  double t_blocked_copy, t_blocked_local;        /* pack/unpack; local    *
+                                                  * triangular solves     */
+  double b_blocked_comm;   /* bytes this rank sent in blocked exchanges    */
+  long   n_blocked_exch;   /* Alltoallv calls (two per tile)               */
   long   n_blocked; long n_blocked_cols;
 }
 lgh_prior_cholmod_stats_t;

@@ -516,6 +516,19 @@ run_prior_level (int layout)
            && st.n_blocked_cols == 2 * (1 + 2 + 3 + 5 + 9) && st.nnz_L > 0
            && st.mode == LGH_CHOL_A_IS_R,
            "A_IS_R: stats accessor", (double) st.n_blocked);
+    /* breakdown of the blocked solves: one tile per call here, two
+     * exchanges each; bytes = both ways x nloc x columns                */
+    {
+      PetscInt            nloc;
+      PetscCall (VecGetLocalSize (v, &nloc));
+      check (st.n_blocked_exch == 20
+             && st.b_blocked_comm == 2. * 8. * (double) nloc * (double) st.n_blocked_cols
+             && st.t_blocked_local >= 0. && st.t_blocked_copy >= -1e-12
+             && fabs (st.t_blocked_comm + st.t_blocked_copy + st.t_blocked_local
+                      - st.t_blocked) < 1e-9,
+             "A_IS_R: blocked breakdown (exchanges, bytes, parts add up)",
+             (double) st.n_blocked_exch);
+    }
   }
 
   /* ---- A_IS_Z vs the Mat path */

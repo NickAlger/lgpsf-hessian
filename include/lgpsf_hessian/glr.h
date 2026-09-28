@@ -87,6 +87,45 @@ lgh_glr_opts_t;
 
 lgh_glr_opts_t lgh_glr_opts_default (void);
 
+/* Build-time breakdown, for strong-scaling diagnosis.  Each region is timed
+ * on every rank; the report carries the max and the mean over ranks
+ * (max / mean = load imbalance).  Collectives have regions of their own, so
+ * time spent waiting at one is charged there, not to the local work before
+ * it.  The top-level regions (LGH_GT_SETUP .. LGH_GT_CHECK) partition the
+ * build; the LGH_GT_ZS_* rows split the two solve rows further (CHOLMOD
+ * priors only; zero otherwise).  Each region is also a PETSc log event
+ * ("LghGlr..."), so -log_view cross-checks it with flop, message and
+ * message-length counts.  The ScaLAPACK backend fills every row; the
+ * replicated backend fills the F rows only.                              */
+typedef enum
+{
+  LGH_GT_SETUP = 0,  /* BLACS grid, descriptors, tall-block allocation     */
+  LGH_GT_OMEGA,      /* hashed random fill                                 */
+  LGH_GT_F_SCALE,    /* copies + M^{1/2} scalings inside F                 */
+  LGH_GT_ZT_SOLVE,   /* Z^{-T} block solves                                */
+  LGH_GT_MATVEC,     /* column-wise MatMult with B                         */
+  LGH_GT_Z_SOLVE,    /* Z^{-1} block solves                                */
+  LGH_GT_ORTH_LOCAL, /* BCGS2 local GEMM / POTRF / TRSM                    */
+  LGH_GT_ORTH_RED,   /* BCGS2 allreduces                                   */
+  LGH_GT_COPY,       /* Y -> Q copies; Q slab growth on extension          */
+  LGH_GT_T_GEMM,     /* Q^T Y panels; extension border Q_all^T F Q_new     */
+  LGH_GT_T_RED,      /* their allreduces; extension T rebuild allreduces   */
+  LGH_GT_T_SCATTER,  /* block-cyclic scatter + symmetrize; column store    */
+  LGH_GT_EIG_WORK,   /* pdsyevd workspace query + allocation               */
+  LGH_GT_EIG,        /* pdsyevd                                            */
+  LGH_GT_SELECT,     /* sort, truncation, treatment                        */
+  LGH_GT_CHECK,      /* opts.check gates (keep off in production)          */
+  LGH_GT_ZS_EXCH,    /* of the solve rows: Alltoallv redistribution        */
+  LGH_GT_ZS_COPY,    /*   pack / unpack copies                             */
+  LGH_GT_ZS_LOCAL,   /*   local permuted triangular solves                 */
+  LGH_GT_N
+}
+lgh_glr_timer_t;
+#define LGH_GT_NTOP (LGH_GT_CHECK + 1)   /* the partitioning rows */
+
+/* "setup", "omega", ... (stable keys for logs); NULL out of range. */
+const char *lgh_glr_timer_name (int k);
+
 typedef struct lgh_glr_report
 {
   int    kept;                  /* modes surviving treatment + truncation  */
@@ -98,6 +137,18 @@ typedef struct lgh_glr_report
   int    n_negative_raw;        /* raw negative eigenvalues (FLIP count)   */
   double resid_max;             /* optional residual check (opts.check)    */
   double t_operator, t_dense;   /* seconds: F sweeps vs dense eigensolve   */
+  /* breakdown of this build / extension (see lgh_glr_timer_t) */
+  double t_max[LGH_GT_N], t_mean[LGH_GT_N];   /* seconds over ranks        */
+  double bytes_max[LGH_GT_N];   /* payload this rank put into the region's
+                                   collectives, max over ranks             */
+  double calls_max[LGH_GT_N];   /* collective calls (MatMults for MATVEC,
+                                   columns for OMEGA), max over ranks      */
+  double t_total_max, t_total_mean;            /* the whole build / step   */
+  double mem_mb_range, mem_mb_T, mem_mb_eig;   /* peak RSS (MB, max over
+                                   ranks) after the range finder, after T,
+                                   after the eigensolve; 0 if unavailable  */
+  double nloc_max, nloc_mean;   /* rows per rank                           */
+  double nnzB_max, nnzB_mean;   /* local nnz of B per rank (-1: not AIJ)   */
 }
 lgh_glr_report_t;
 
@@ -148,6 +199,9 @@ typedef struct lgh_glr_adapt_report
   int    steps;                   /* 1 build + (steps - 1) extensions       */
   int    capped;                  /* 1: stopped at ell_max, not by rho      */
   double t_operator, t_dense;     /* seconds, summed over the steps         */
+  double t_max[LGH_GT_N], t_mean[LGH_GT_N];  /* per-step max / mean over
+                                     ranks, summed over the steps           */
+  double t_total_max, t_total_mean;          /* likewise                    */
 }
 lgh_glr_adapt_report_t;
 

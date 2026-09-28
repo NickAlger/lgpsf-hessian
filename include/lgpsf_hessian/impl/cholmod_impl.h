@@ -341,7 +341,7 @@ lgh_chol_block_op_one (lgh_prior_t *p, lgh_chol_op_t op, Mat X, Mat Y)
 {
   struct lgh_chol_ctx *c = p->chol;
   const double        t0 = MPI_Wtime ();
-  double              tc = 0., tc0;
+  double              tc = 0., tc0, tl = 0., tl0;
   PetscInt            ncols, nrow_chk, xlda, ylda, mycols, nloc = c->nloc;
   const PetscScalar  *xa;
   PetscScalar        *ya;
@@ -395,11 +395,13 @@ lgh_chol_block_op_one (lgh_prior_t *p, lgh_chol_op_t op, Mat X, Mat Y)
     PetscCall (PetscArraycpy (c->bsend + (size_t) j * nloc,
                               xa + (size_t) j * xlda, (size_t) nloc));
   PetscCall (MatDenseRestoreArrayRead (X, &xa));
+  if (lgh_gt_registered) PetscCall (PetscLogEventBegin (lgh_gt_ev[LGH_GT_ZS_EXCH], 0, 0, 0, 0));
   tc0 = MPI_Wtime ();
   PetscCallMPI (MPI_Alltoallv (c->bsend, c->scnt, c->sdsp, MPIU_SCALAR,
                                c->brecv, c->rcnt, c->rdsp, MPIU_SCALAR,
                                c->comm));
   tc += MPI_Wtime () - tc0;
+  if (lgh_gt_registered) PetscCall (PetscLogEventEnd (lgh_gt_ev[LGH_GT_ZS_EXCH], 0, 0, 0, 0));
   /* unpack into whole columns: from q, [col][q's rows]                   */
   for (r = 0; r < size; r++)
     for (PetscInt j = 0; j < mycols; j++)
@@ -408,8 +410,12 @@ lgh_chol_block_op_one (lgh_prior_t *p, lgh_chol_op_t op, Mat X, Mat Y)
                                   + (size_t) j * c->rcounts[r],
                                 (size_t) c->rcounts[r]));
 
+  if (lgh_gt_registered) PetscCall (PetscLogEventBegin (lgh_gt_ev[LGH_GT_ZS_LOCAL], 0, 0, 0, 0));
+  tl0 = MPI_Wtime ();
   if (mycols > 0)
     PetscCall (lgh_chol_full_op (c, op, c->bfull, c->bfull2, mycols));
+  tl = MPI_Wtime () - tl0;
+  if (lgh_gt_registered) PetscCall (PetscLogEventEnd (lgh_gt_ev[LGH_GT_ZS_LOCAL], 0, 0, 0, 0));
 
   /* back: the same exchange reversed                                    */
   for (r = 0; r < size; r++)
@@ -418,11 +424,13 @@ lgh_chol_block_op_one (lgh_prior_t *p, lgh_chol_op_t op, Mat X, Mat Y)
                                   + (size_t) j * c->rcounts[r],
                                 c->bfull + (size_t) j * c->n + c->rdispls[r],
                                 (size_t) c->rcounts[r]));
+  if (lgh_gt_registered) PetscCall (PetscLogEventBegin (lgh_gt_ev[LGH_GT_ZS_EXCH], 0, 0, 0, 0));
   tc0 = MPI_Wtime ();
   PetscCallMPI (MPI_Alltoallv (c->brecv, c->rcnt, c->rdsp, MPIU_SCALAR,
                                c->bsend, c->scnt, c->sdsp, MPIU_SCALAR,
                                c->comm));
   tc += MPI_Wtime () - tc0;
+  if (lgh_gt_registered) PetscCall (PetscLogEventEnd (lgh_gt_ev[LGH_GT_ZS_EXCH], 0, 0, 0, 0));
   PetscCall (MatDenseGetLDA (Y, &ylda));
   PetscCall (MatDenseGetArrayWrite (Y, &ya));
   for (PetscInt j = 0; j < ncols; j++)
@@ -430,8 +438,16 @@ lgh_chol_block_op_one (lgh_prior_t *p, lgh_chol_op_t op, Mat X, Mat Y)
                               c->bsend + (size_t) j * nloc, (size_t) nloc));
   PetscCall (MatDenseRestoreArrayWrite (Y, &ya));
 
-  c->st.t_blocked += MPI_Wtime () - t0;
-  c->st.t_blocked_comm += tc;
+  {
+    const double        tt = MPI_Wtime () - t0;
+    c->st.t_blocked += tt;
+    c->st.t_blocked_comm += tc;
+    c->st.t_blocked_local += tl;
+    c->st.t_blocked_copy += tt - tc - tl;   /* pack/unpack + bookkeeping */
+    c->st.b_blocked_comm += 2. * sizeof (PetscScalar) * (double) nloc
+                            * (double) ncols;   /* both ways, incl. self  */
+    c->st.n_blocked_exch += 2;
+  }
   return PETSC_SUCCESS;
 }
 

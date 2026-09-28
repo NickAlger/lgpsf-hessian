@@ -242,6 +242,38 @@ run_scenario (int spd, lgh_glr_backend_t backend)
     check (rep.n_negative_raw >= RANK_B / 2, "negatives present pre-FLIP",
            (double) rep.n_negative_raw);
 
+  /* build-time breakdown: exact counts, and the top-level rows partition
+   * the build (ScaLAPACK backend; the replicated one fills F rows only) */
+  {
+    PetscMPIInt         P;
+    double              top = 0.;
+    PetscCallMPI (MPI_Comm_size (PETSC_COMM_WORLD, &P));
+    /* the replicated backend's residual gate applies F to the kept modes */
+    check (rep.calls_max[LGH_GT_MATVEC]
+             == 3. * go.ell + (backend == LGH_GLR_REPLICATED ? rep.kept : 0),
+           "breakdown: 3 ell MatMults at q = 1", rep.calls_max[LGH_GT_MATVEC]);
+    check (fabs (rep.nloc_mean * P - N_GLOBAL) < 1e-9,
+           "breakdown: rows per rank add up", rep.nloc_mean * P);
+    check (rep.nnzB_max == -1., "breakdown: nnz(B) -1 for a dense B",
+           rep.nnzB_max);
+    check (rep.t_total_max >= rep.t_total_mean && rep.t_total_mean > 0.,
+           "breakdown: total max >= mean > 0", rep.t_total_max);
+    if (backend == LGH_GLR_SCALAPACK) {
+      for (int k = 0; k < LGH_GT_NTOP; k++) top += rep.t_mean[k];
+      check (top <= 1.0001 * rep.t_total_mean + 1e-6 && top >= 0.5 * rep.t_total_mean,
+             "breakdown: top-level rows partition the build",
+             top / rep.t_total_mean);
+      check (rep.calls_max[LGH_GT_OMEGA] == go.ell && rep.calls_max[LGH_GT_ORTH_RED] > 0.
+             && rep.calls_max[LGH_GT_T_RED] == (double) ((go.ell + go.panel - 1) / go.panel),
+             "breakdown: omega columns, orth and T allreduce counts",
+             rep.calls_max[LGH_GT_T_RED]);
+      check (rep.bytes_max[LGH_GT_T_RED] == 8. * go.ell * go.ell,
+             "breakdown: T allreduce moves ell^2 doubles", rep.bytes_max[LGH_GT_T_RED]);
+      check (rep.mem_mb_eig > 0. && rep.t_max[LGH_GT_EIG] > 0.,
+             "breakdown: memory and eigensolve recorded", rep.mem_mb_eig);
+    }
+  }
+
   /* logdet vs dense (flipped values; truncated modes contribute 0) */
   {
     double              ref = 0.;
@@ -306,6 +338,10 @@ run_scenario (int spd, lgh_glr_backend_t backend)
     go2.ell = 30;
     PetscCall (lgh_glr_compute (B, prior, &go2, &glr2, &rep2));
     PetscCall (lgh_glr_extend (glr2, 10, &rep2));
+    if (backend == LGH_GLR_SCALAPACK)   /* replicated: full rebuild */
+      check (rep2.calls_max[LGH_GT_MATVEC] == 30.,
+             "extend: 3 k_new MatMults (the new columns only)",
+             rep2.calls_max[LGH_GT_MATVEC]);
     PetscCall ((PetscErrorCode) lgh_glr_eigs (glr, &nk1, &l1));
     PetscCall ((PetscErrorCode) lgh_glr_eigs (glr2, &nk2, &l2));
     check (nk1 == nk2, "extend: kept matches one-shot", (double) nk2);
