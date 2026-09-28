@@ -52,6 +52,7 @@ extern void         Cblacs_gridinfo (int ictxt, int *nprow, int *npcol,
                                      int *myrow, int *mycol);
 extern void         Cblacs_gridexit (int ictxt);
 
+#include <limits.h>
 #define LGH_SCALAPACK_PDSYEVD LGH_F77_FUNC (pdsyevd, PDSYEVD)
 #define LGH_SCALAPACK_DESCINIT LGH_F77_FUNC (descinit, DESCINIT)
 extern void LGH_SCALAPACK_PDSYEVD (const char *jobz, const char *uplo,
@@ -465,6 +466,29 @@ lgh_glrd_pdsyevd (struct lgh_glrd_state *s, double *Tloc)
                          s->lam_raw, s->Vloc, &ione, &ione, s->desc, &wkopt,
                          &lwork, &iwkopt, &liwork, &info);
   lwork = (int) wkopt; liwork = iwkopt;
+  /* The reference ScaLAPACK's workspace query UNDER-REPORTS when ell is
+   * small against nb x P (few blocks per rank): PDORMTR (param 16) or
+   * PDLASRT (param 9) inside pdsyevd then reject LWORK on some ranks, which
+   * return while the others wait in collectives -- a HANG (2026-09-28, 4
+   * ranks at ell = 100).  Pad with the documented requirements of pdsyevd
+   * and of the two routines, summed for margin (np, nq = this rank's local
+   * rows / columns of T):
+   *   pdsyevd  max(1 + 6N + 2 np nq, 3N + max(nb (np + 1), 3 nb)) + 2N
+   *   pdormtr  max(nb (nb - 1) / 2, (np + nq) nb) + nb nb
+   *   pdlasrt  max(N, np (nb + nq))
+   * and LIWORK by 7N + 8 npcol + 2, plus 2N.                             */
+  {
+    const long long     N = nell, np = s->tl_rows, nq = s->tl_cols, nb = s->nb;
+    const long long     doc = PetscMax (1 + 6 * N + 2 * np * nq,
+                                        3 * N + PetscMax (nb * (np + 1), 3 * nb)) + 2 * N;
+    const long long     ormtr = PetscMax (nb * (nb - 1) / 2, (np + nq) * nb) + nb * nb;
+    const long long     lasrt = PetscMax (N, np * (nb + nq));
+    const long long     lw = (long long) lwork + doc + ormtr + lasrt;
+    const long long     liw = PetscMax ((long long) liwork, 7 * N + 8 * (long long) s->pcol + 2) + 2 * N;
+    PetscCheck (lw <= INT_MAX && liw <= INT_MAX, PETSC_COMM_SELF, PETSC_ERR_SUP,
+                "lgh_glrd: pdsyevd workspace exceeds int");
+    lwork = (int) lw; liwork = (int) liw;
+  }
   PetscCall (PetscMalloc1 (lwork, &work));
   PetscCall (PetscMalloc1 (liwork, &iwork));
   LGH_SCALAPACK_PDSYEVD ("V", "L", &nell, Tloc, &ione, &ione, s->desc,

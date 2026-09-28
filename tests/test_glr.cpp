@@ -319,10 +319,8 @@ run_scenario (int spd, lgh_glr_backend_t backend)
    * at 4 and 8, doubles to 16, and stops there by the oversampling rule
    * (10 <= 0.7 * 16); == one-shot at 16.  From ell0 = 12 (not saturated)
    * one jump to ceil(1.1 * 10 / 0.7) = 16.  ell_max = 8 stops CAPPED.
-   * NOTE: the ScaLAPACK eigensolve prints "PDORMTR parameter 16 illegal"
-   * at ell <= 8 (a pre-existing small-size edge case of one-shot builds,
-   * 2026-09-28; results still exact); the saturation path needs ell below
-   * the rank 10, so these cases show it.  Production ell >= 4000.      */
+   * (These small widths also exercise the pdsyevd workspace padding: the
+   * reference ScaLAPACK's query under-reported here, 2026-09-28.)       */
   {
     lgh_glr_opts_t      go2 = go;
     lgh_glr_adapt_t     ad = lgh_glr_adapt_default ();
