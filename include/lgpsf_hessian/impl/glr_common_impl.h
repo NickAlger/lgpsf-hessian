@@ -21,6 +21,7 @@
 #define LGPSF_HESSIAN_GLR_COMMON_IMPL_H
 
 #include <petsc.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <sys/resource.h>
 
@@ -307,6 +308,9 @@ struct lgh_glr
   double              gb[LGH_GT_N], gc[LGH_GT_N];  /* bytes, calls         */
   double              gmem[3];      /* RSS MB: range, T, eig             */
   double              gstart;
+  struct lgh_mv      *mv;           /* balanced / blocked matvec (impl/  *
+                                     * balance_impl.h); NULL: the column  *
+                                     * loop on B                          */
 };
 
 /* ------------------------------------------------------------------ */
@@ -315,13 +319,15 @@ struct lgh_glr
 static const char *const lgh_gt_names[LGH_GT_N] = {
   "setup", "omega", "f_scale", "zt_solve", "matvec", "z_solve",
   "orth_local", "orth_red", "copy", "t_gemm", "t_red", "t_scatter",
-  "eig_work", "eig", "select", "check", "zs_exch", "zs_copy", "zs_local"
+  "eig_work", "eig", "select", "bal_setup", "bal_exch", "check",
+  "zs_exch", "zs_copy", "zs_local"
 };
 static const char *const lgh_gt_evnames[LGH_GT_N] = {
   "LghGlrSetup", "LghGlrOmega", "LghGlrFScale", "LghGlrZtSolve",
   "LghGlrMatvec", "LghGlrZSolve", "LghGlrOrthLocal", "LghGlrOrthRed",
   "LghGlrCopy", "LghGlrTGemm", "LghGlrTRed", "LghGlrTScatter",
-  "LghGlrEigWork", "LghGlrEig", "LghGlrSelect", "LghGlrCheck",
+  "LghGlrEigWork", "LghGlrEig", "LghGlrSelect", "LghGlrBalSetup",
+  "LghGlrBalExch", "LghGlrCheck",
   "LghGlrZsExch", "LghGlrZsCopy", "LghGlrZsLocal"
 };
 static PetscLogEvent lgh_gt_ev[LGH_GT_N];
@@ -423,6 +429,8 @@ lgh_gt_zs_add (lgh_glr_t *g, const double s0[5], const double s1[5])
   g->gc[LGH_GT_ZS_EXCH] += s1[4] - s0[4];
 }
 
+#include "lgpsf_hessian/impl/balance_impl.h"   /* the matvec's layout */
+
 /* reduce this rank's accumulators into rep (collective) */
 static PetscErrorCode
 lgh_gt_finish (lgh_glr_t *g, lgh_glr_report_t *rep)
@@ -471,6 +479,18 @@ lgh_gt_finish (lgh_glr_t *g, lgh_glr_report_t *rep)
   rep->nloc_mean = smg[LGH_GT_N + 1] / P;
   rep->nnzB_max = isaij ? mxg[3 * LGH_GT_N + 5] : -1.;
   rep->nnzB_mean = isaij ? smg[LGH_GT_N + 2] / P : -1.;
+  if (g->mv != NULL) {
+    rep->balanced = g->mv->balanced; rep->blocked = g->mv->blocked;
+    rep->nnzBal_max = g->mv->nnz_max; rep->nnzBal_mean = g->mv->nnz_mean;
+    rep->rowsBal_max = g->mv->rows_max; rep->bal_predicted = g->mv->predicted;
+    rep->bal_floor = g->mv->floor_binds;
+  }
+  else {
+    rep->balanced = rep->blocked = 0;
+    rep->nnzBal_max = rep->nnzB_max; rep->nnzBal_mean = rep->nnzB_mean;
+    rep->rowsBal_max = mxg[3 * LGH_GT_N + 4]; rep->bal_predicted = 0.;
+    rep->bal_floor = 0;
+  }
   return PETSC_SUCCESS;
 }
 
@@ -505,6 +525,10 @@ lgh_glr_opts_default (void)
   o.panel = 64;
   o.grid2d = 0;
   o.check = 1;
+  o.balance = 0;
+  o.balance_row_cost = 1;
+  o.matvec_block = 0;
+  o.matvec_tile = 256;
   return o;
 }
 
@@ -527,17 +551,22 @@ lgh_glr_apply_F_block (lgh_glr_t *g, Mat X, Mat Y, Mat W)
   lgh_gt_zs_snap (g, s1);
   lgh_gt_zs_add (g, s0, s1);
   PetscCall (MatGetSize (X, NULL, &ncols));
-  PetscCall (lgh_gt_begin (g, LGH_GT_MATVEC));
-  for (j = 0; j < ncols; j++) {
-    Vec                 yj, wj;
-    PetscCall (MatDenseGetColumnVecRead (Y, j, &yj));
-    PetscCall (MatDenseGetColumnVecWrite (W, j, &wj));
-    PetscCall (MatMult (g->B, yj, wj));
-    PetscCall (MatDenseRestoreColumnVecWrite (W, j, &wj));
-    PetscCall (MatDenseRestoreColumnVecRead (Y, j, &yj));
+  if (g->mv != NULL) {                 /* balanced and/or blocked, by tile */
+    PetscCall (lgh_mv_apply (g, Y, W));
   }
-  PetscCall (lgh_gt_end (g, LGH_GT_MATVEC));
-  lgh_gt_count (g, LGH_GT_MATVEC, 0., (double) ncols);
+  else {
+    PetscCall (lgh_gt_begin (g, LGH_GT_MATVEC));
+    for (j = 0; j < ncols; j++) {
+      Vec                 yj, wj;
+      PetscCall (MatDenseGetColumnVecRead (Y, j, &yj));
+      PetscCall (MatDenseGetColumnVecWrite (W, j, &wj));
+      PetscCall (MatMult (g->B, yj, wj));
+      PetscCall (MatDenseRestoreColumnVecWrite (W, j, &wj));
+      PetscCall (MatDenseRestoreColumnVecRead (Y, j, &yj));
+    }
+    PetscCall (lgh_gt_end (g, LGH_GT_MATVEC));
+    lgh_gt_count (g, LGH_GT_MATVEC, 0., (double) ncols);
+  }
   lgh_gt_zs_snap (g, s0);
   PetscCall (lgh_gt_begin (g, LGH_GT_Z_SOLVE));
   PetscCall (lgh_prior_solve_block (g->prior, LGH_PRIOR_SOLVEZ, W, Y));
@@ -886,6 +915,7 @@ lgh_glr_compute (Mat B, lgh_prior_t *prior, const lgh_glr_opts_t *opts,
 
   PetscCall (lgh_gt_register ());
   lgh_gt_reset (g);
+  PetscCall (lgh_mv_setup (g));        /* no-op unless balance / matvec_block */
 #ifdef LGH_WITH_SCALAPACK
   if (g->opts.backend == LGH_GLR_SCALAPACK)
     PetscCall (lgh_glrd_build (g, &local_rep));
@@ -1028,6 +1058,7 @@ void
 lgh_glr_destroy (lgh_glr_t *glr)
 {
   if (glr == NULL) return;
+  lgh_mv_destroy (glr);
   (void) MatDestroy (&glr->U);
 #ifdef LGH_WITH_SCALAPACK
   lgh_glrd_destroy_state (glr);

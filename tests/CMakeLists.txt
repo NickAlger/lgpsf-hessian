@@ -4,9 +4,9 @@
 # Build memory: each test TU that includes impl.hpp will become Eigen-heavy
 # once the fit stage lands (~3 GB peak); keep -j <= 2.
 
-set(_lgh_tests glr prior_mat deflate)
+set(_lgh_tests glr prior_mat deflate balance)
 
-foreach(t test_glr test_prior_mat test_deflate)
+foreach(t test_glr test_prior_mat test_deflate test_balance)
   add_executable(${t} ${t}.cpp)
   target_link_libraries(${t} PRIVATE lgpsf_hessian::glr)
 endforeach()

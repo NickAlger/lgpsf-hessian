@@ -82,6 +82,20 @@ typedef struct lgh_glr_opts
                                 * ScaLAPACK free of the zero-byte-type     *
                                 * MPICH bug; see docs/platform-notes.md)   */
   int               check;     /* run internal self-check gates on build   */
+  /* The sparse matvec with B inside F (GLR-BALANCE-DESIGN.md).  Both need an
+   * AIJ B; a shell B keeps the column loop whatever is set here.          */
+  int               balance;   /* 1: B's matvec runs in a contiguous layout *
+                                * balanced by row weight nnz_i + row_cost   *
+                                * (a view of B built once per build); the   *
+                                * vectors move there and back in column     *
+                                * tiles.  0 (default): B's own layout.      */
+  int               balance_row_cost; /* per-row weight constant (1)        */
+  int               matvec_block;     /* 1: one sparse x dense product per   *
+                                       * tile (MatMatMult) instead of one    *
+                                       * MatMult per column.  0 (default).   */
+  int               matvec_tile;      /* columns per tile (256): bounds the  *
+                                       * balanced layout's scratch and       *
+                                       * PETSc's ghost buffer                */
 }
 lgh_glr_opts_t;
 
@@ -114,6 +128,10 @@ typedef enum
   LGH_GT_EIG_WORK,   /* pdsyevd workspace query + allocation               */
   LGH_GT_EIG,        /* pdsyevd                                            */
   LGH_GT_SELECT,     /* sort, truncation, treatment                        */
+  LGH_GT_BAL_SETUP,  /* balanced / blocked matvec setup: row weights,      *
+                      * gather, split, the balanced view of B, scratch     */
+  LGH_GT_BAL_EXCH,   /* moving column tiles into the matvec layout and back*
+                      * (a local copy when only blocking is on)            */
   LGH_GT_CHECK,      /* opts.check gates (keep off in production)          */
   LGH_GT_ZS_EXCH,    /* of the solve rows: Alltoallv redistribution        */
   LGH_GT_ZS_COPY,    /*   pack / unpack copies                             */
@@ -149,6 +167,12 @@ typedef struct lgh_glr_report
                                    after the eigensolve; 0 if unavailable  */
   double nloc_max, nloc_mean;   /* rows per rank                           */
   double nnzB_max, nnzB_mean;   /* local nnz of B per rank (-1: not AIJ)   */
+  /* the matvec's layout (opts.balance / opts.matvec_block) */
+  int    balanced, blocked;     /* what ran (0 when not applicable)        */
+  double nnzBal_max, nnzBal_mean;/* nnz per rank in the matvec's layout    */
+  double rowsBal_max;           /* rows per rank there, max                */
+  double bal_predicted;         /* the split's predicted weight max/mean   */
+  int    bal_floor;             /* 1: the longest row set the split's cap  */
 }
 lgh_glr_report_t;
 
