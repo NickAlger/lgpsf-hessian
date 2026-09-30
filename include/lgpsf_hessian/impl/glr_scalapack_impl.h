@@ -868,8 +868,9 @@ lgh_glrd_extend_incr (lgh_glr_t *g, int k_new, lgh_glr_report_t *rep)
   PetscCall (lgh_glrd_bcgs2 (g, Qb, ell2, panel_b, ell1));
   rep->t_dense += MPI_Wtime () - t0;
 
-  /* one more F apply on the orthonormalized new block; border columns
-   * Cnew = Q_all^T (F Q_new), replicated panel-wise                     */
+  /* one more F apply on the orthonormalized new block; then the border
+   * columns Cnew = Q_all^T (F Q_new), reduced panel by panel (never a whole
+   * ell2 x k_new block on a rank)                                        */
   {
     PetscScalar        *qn;
     const PetscScalar  *qb;
@@ -893,62 +894,84 @@ lgh_glrd_extend_incr (lgh_glr_t *g, int k_new, lgh_glr_report_t *rep)
   PetscCall (lgh_glr_apply_F_block (g, Qn, Yn, Wn));
   rep->t_operator += MPI_Wtime () - t0;
 
-  PetscCall (PetscMalloc2 ((size_t) ell2 * PetscMax (k_new, panel_b), &Cnew,
-                           (size_t) ell2 * PetscMax (k_new, panel_b), &Cl));
+  /* Border and column-store growth, streamed in panels of width panel_b over
+   * the NEW columns (2026-09-30): the two buffers are ell2 x panel_b, never
+   * ell2 x k_new.  Before this the border was one replicated ell2 x k_new
+   * block: 2.3 GB per rank (110 GB per node at 48 ranks) for the extension
+   * 15415 -> 21971 of the continental A4 test, which ran out of memory.  The
+   * sym(T) rebuild below reuses the same two panel buffers.               */
+  PetscCall (PetscMalloc2 ((size_t) ell2 * panel_b, &Cnew,
+                           (size_t) ell2 * panel_b, &Cl));
   {
     const PetscScalar  *qb, *yn;
     PetscInt            ldb, ldn, nloc = g->nloc;
-    int                 bm = (int) nloc, bl2 = ell2, bk = k_new;
-    double              one = 1.0, zero = 0.0;
+    const int           acn2 = (ell2 + s->P - 1 - s->rank) / s->P;
+    double             *Anew;
+
+    /* grow the 1D column store to ell2 rows: owned old columns keep their
+     * old rows; their new rows and the owned new columns are filled from
+     * the border panels as they are reduced                              */
+    PetscCall (lgh_gt_begin (g, LGH_GT_T_SCATTER));
+    PetscCall (PetscMalloc1 ((size_t) PetscMax (acn2, 1) * ell2, &Anew));
+    for (lc = 0; lc < s->acn; lc++)
+      for (i = 0; i < ell1; i++)
+        Anew[i + (size_t) lc * ell2] = s->Acols[i + (size_t) lc * ell1];
+    PetscCall (lgh_gt_end (g, LGH_GT_T_SCATTER));
 
     PetscCall (MatDenseGetLDA (Qb, &ldb));
     PetscCall (MatDenseGetLDA (Yn, &ldn));
     PetscCall (MatDenseGetArrayRead (Qb, &qb));
     PetscCall (MatDenseGetArrayRead (Yn, &yn));
-    PetscCall (lgh_gt_begin (g, LGH_GT_T_GEMM));
-    if (nloc > 0) {
-      int                 bldb = (int) ldb, bldn = (int) ldn;
-      LGH_BLAS_DGEMM ("T", "N", &bl2, &bk, &bm, &one, qb, &bldb, yn, &bldn,
-                      &zero, Cl, &bl2);
+    for (p0 = 0; p0 < k_new; p0 += panel_b) {
+      const int           bw = PetscMin (panel_b, k_new - p0);
+      int                 bm = (int) nloc, bl2 = ell2, bk = bw;
+      double              one = 1.0, zero = 0.0;
+
+      /* Cnew[:, jj] = Q_all^T (F Q_new)[:, p0 + jj], jj < bw           */
+      PetscCall (lgh_gt_begin (g, LGH_GT_T_GEMM));
+      if (nloc > 0) {
+        int                 bldb = (int) ldb, bldn = (int) ldn;
+        LGH_BLAS_DGEMM ("T", "N", &bl2, &bk, &bm, &one, qb, &bldb,
+                        yn + (size_t) p0 * ldn, &bldn, &zero, Cl, &bl2);
+      }
+      else { for (i = 0; i < ell2 * bw; i++) Cl[i] = 0.; }
+      PetscCall (lgh_gt_end (g, LGH_GT_T_GEMM));
+      PetscCall (lgh_gt_begin (g, LGH_GT_T_RED));
+      PetscCallMPI (MPI_Allreduce (Cl, Cnew, ell2 * bw, MPI_DOUBLE,
+                                   MPI_SUM, g->comm));
+      PetscCall (lgh_gt_end (g, LGH_GT_T_RED));
+      lgh_gt_count (g, LGH_GT_T_RED, 8. * ell2 * bw, 1.);
+
+      PetscCall (lgh_gt_begin (g, LGH_GT_T_SCATTER));
+      /* owned old columns j_old = lc*P + rank: new rows ell1+p0+jj by
+       * symmetry, A(ell1+p0+jj, j_old) = A(j_old, ell1+p0+jj) = Cnew[j_old, jj] */
+      for (lc = 0; lc < s->acn; lc++) {
+        const int           jold = lc * s->P + s->rank;
+        for (jj = 0; jj < bw; jj++)
+          Anew[(ell1 + p0 + jj) + (size_t) lc * ell2] =
+              Cnew[jold + (size_t) jj * ell2];
+      }
+      /* owned new columns gj = ell1 + p0 + jj in this panel: whole column  */
+      for (jj = 0; jj < bw; jj++) {
+        const int           gj = ell1 + p0 + jj;
+        if (gj % s->P != s->rank) continue;
+        {
+          const int           lcn = gj / s->P;
+          for (i = 0; i < ell2; i++)
+            Anew[i + (size_t) lcn * ell2] = Cnew[i + (size_t) jj * ell2];
+        }
+      }
+      PetscCall (lgh_gt_end (g, LGH_GT_T_SCATTER));
     }
-    else { for (i = 0; i < ell2 * k_new; i++) Cl[i] = 0.; }
-    PetscCall (lgh_gt_end (g, LGH_GT_T_GEMM));
-    PetscCall (lgh_gt_begin (g, LGH_GT_T_RED));
-    PetscCallMPI (MPI_Allreduce (Cl, Cnew, ell2 * k_new, MPI_DOUBLE,
-                                 MPI_SUM, g->comm));
-    PetscCall (lgh_gt_end (g, LGH_GT_T_RED));
-    lgh_gt_count (g, LGH_GT_T_RED, 8. * ell2 * k_new, 1.);
     PetscCall (MatDenseRestoreArrayRead (Yn, &yn));
     PetscCall (MatDenseRestoreArrayRead (Qb, &qb));
-  }
 
-  /* grow the 1D column store to ell2 rows; fill old columns' new rows by
-   * symmetry (A(i_new, j_old) := A(j_old, i_new) = Cnew[j_old, i_new-ell1]);
-   * append owned new columns                                            */
-  PetscCall (lgh_gt_begin (g, LGH_GT_T_SCATTER));
-  {
-    double             *Anew;
-    const int           acn2 = (ell2 + s->P - 1 - s->rank) / s->P;
-
-    PetscCall (PetscMalloc1 ((size_t) PetscMax (acn2, 1) * ell2, &Anew));
-    for (lc = 0; lc < s->acn; lc++) {
-      for (i = 0; i < ell1; i++)
-        Anew[i + (size_t) lc * ell2] = s->Acols[i + (size_t) lc * ell1];
-      for (i = ell1; i < ell2; i++)
-        Anew[i + (size_t) lc * ell2] =
-            Cnew[(lc * s->P + s->rank) + (size_t) (i - ell1) * ell2];
-    }
-    for (lc = s->acn; lc < acn2; lc++) {
-      const int           gj = lc * s->P + s->rank;   /* a new column */
-      for (i = 0; i < ell2; i++)
-        Anew[i + (size_t) lc * ell2] =
-            Cnew[i + (size_t) (gj - ell1) * ell2];
-    }
+    PetscCall (lgh_gt_begin (g, LGH_GT_T_SCATTER));
     PetscCall (PetscFree (s->Acols));
     s->Acols = Anew;
     s->acn = acn2;
+    PetscCall (lgh_gt_end (g, LGH_GT_T_SCATTER));
   }
-  PetscCall (lgh_gt_end (g, LGH_GT_T_SCATTER));
   PetscCall (lgh_gt_begin (g, LGH_GT_SETUP));
   PetscCall (MatDestroy (&Qn));
   PetscCall (MatDestroy (&Yn));

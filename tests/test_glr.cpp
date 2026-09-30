@@ -351,6 +351,31 @@ run_scenario (int spd, lgh_glr_backend_t backend)
     lgh_glr_destroy (glr2);
   }
 
+  /* extend(20) from ell=20 == one-shot ell=40: k_new = 20 > panel = 16, so the
+   * border Q_all^T (F Q_new) is formed in TWO panels (16 + 4): the panelled
+   * border of 2026-09-30 (before it, one replicated ell2 x k_new block)      */
+  {
+    lgh_glr_opts_t      go3 = go;
+    int                 nk1, nk3;
+    const double       *l1, *l3;
+    double              worst = 0.;
+
+    go3.ell = 20;
+    PetscCall (lgh_glr_compute (B, prior, &go3, &glr2, &rep2));
+    PetscCall (lgh_glr_extend (glr2, 20, &rep2));
+    if (backend == LGH_GLR_SCALAPACK)
+      check (rep2.calls_max[LGH_GT_MATVEC] == 60.,
+             "extend (2 panels): 3 k_new MatMults (the new columns only)",
+             rep2.calls_max[LGH_GT_MATVEC]);
+    PetscCall ((PetscErrorCode) lgh_glr_eigs (glr, &nk1, &l1));
+    PetscCall ((PetscErrorCode) lgh_glr_eigs (glr2, &nk3, &l3));
+    check (nk1 == nk3, "extend (2 panels): kept matches one-shot", (double) nk3);
+    for (int i = 0; i < nk1 && i < nk3; i++)
+      worst = fmax (worst, fabs (l1[i] - l3[i]) / fabs (l1[i]));
+    check (worst < 1e-10, "extend (2 panels): spectrum matches one-shot", worst);
+    lgh_glr_destroy (glr2);
+  }
+
   /* adaptive sketch (exact rank 10): from ell0 = 4 the sketch is saturated
    * at 4 and 8, doubles to 16, and stops there by the oversampling rule
    * (10 <= 0.7 * 16); == one-shot at 16.  From ell0 = 12 (not saturated)
