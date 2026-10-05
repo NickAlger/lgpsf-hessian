@@ -178,6 +178,17 @@ Then the quickstart in the README is the whole integration. Using
   target is met. Probe demand grows with dimension and `wedge_order`; if the fit
   comes back globally empty the library says so (error 6) with the row-level
   reason.
+  Two guards on the fitted ellipsoids pass through to lgpsf and are OFF by
+  default here (lgpsf's own defaults are on): `opts.frame_ceiling > 0` clamps
+  the best candidate of a row whose search found nothing admissible (every
+  fitted ellipsoid larger than its window) to that many window radii and
+  re-solves its linear coefficients; `opts.frame_floor > 0` makes an ellipsoid
+  whose minor axis is under that many local spacings inadmissible. The report
+  counts the rows that ended in the clamped fallback (`rows_clamped`) and how
+  many of those shipped (`rows_clamped_fit`). Tentative values 1.0 and 0.1; off
+  reproduces every fit made before 2026-10-04 except that lgpsf's assembly now
+  keeps a row's smooth part and spike together (it differs only for a row whose
+  fitted covariance is not finite).
 - **Stage 2**: `trunc_abs`/`trunc_rel` set the spectral cut; `report.next_abs`
   (the largest |λ| *below* the cut) is the evidence the rank converged — extend
   until it clears the cut with margin.
