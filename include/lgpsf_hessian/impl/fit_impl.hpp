@@ -308,6 +308,8 @@ lgh_fit_opts_default (void)
   o.balance_tolerance = 0.0;   /* off: every rank fits the rows it owns */
   o.balance_bytes_cap = lgpsf::mpi::RowExchangeOptions ().bytes_cap;
   o.mu_pinned = 1;
+  o.frame_floor = 0.0;          /* no lower bound on the fitted frame */
+  o.frame_ceiling = 0.0;        /* no clamp at the inadmissible fallback */
   o.tau_assemble = 6.0;
   o.wsym = LGH_WSYM_WEIGHTED;
   o.verbose = 1;
@@ -479,6 +481,8 @@ make_config (const lgh_fit_opts_t &o, int num_threads)
   {
     config.row.mu = lgpsf::MuPolicy::Pinned;
   }
+  config.row.frame_floor = o.frame_floor;
+  config.row.frame_ceiling = o.frame_ceiling;
   config.num_threads = num_threads;
   return config;
 }
@@ -1049,18 +1053,28 @@ finish_fit (lgh_fit_t *b, const lgpsf::mpi::DistFitResult &fit,
     rep->spike_max = mx;
   }
   {
-    long                counts[3] = { (long) bsym.size (), 0, 0 };
-    for (const auto st : fit.fit.diagnostics.status)
+    long                counts[5] = { (long) bsym.size (), 0, 0, 0, 0 };
+    const auto         &dg = fit.fit.diagnostics;
+    for (size_t r = 0; r < dg.status.size (); r++)
     {
+      const auto          st = dg.status[r];
       if (st == lgpsf::RowStatus::Fit) counts[1]++;
       else if (st == lgpsf::RowStatus::FallbackBaseline) counts[2]++;
+      if (r < dg.stop_reason.size ()
+          && dg.stop_reason[r] == lgpsf::RowStop::Clamped)
+      {
+        counts[3]++;
+        if (st == lgpsf::RowStatus::Fit) counts[4]++;
+      }
     }
-    long                glob[3];
-    MPI_Allreduce (counts, glob, 3, MPI_LONG, MPI_SUM, b->comm);
+    long                glob[5];
+    MPI_Allreduce (counts, glob, 5, MPI_LONG, MPI_SUM, b->comm);
     rep->nnz_local = (long) bsym.size ();
     rep->nnz_global = glob[0];
     rep->rows_fit = (int) glob[1];
     rep->rows_fallback = (int) glob[2];
+    rep->rows_clamped = (int) glob[3];
+    rep->rows_clamped_fit = (int) glob[4];
   }
 
   b->b_rowptr.assign ((size_t) nloc + 1, 0);

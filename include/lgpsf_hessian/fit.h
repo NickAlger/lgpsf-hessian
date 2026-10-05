@@ -106,6 +106,17 @@ typedef struct lgh_fit_opts
   int        wedge_order;       /* LG mode ladder: wedge order             */
   int        wedge_step;        /*                 wedge step              */
   int        mu_pinned;         /* 1: pin the PSF center to the node       */
+  double     frame_floor;       /* lower admissibility bound on a fitted
+                                   frame's smallest semi-axis, in local point
+                                   spacings (lgpsf ProbeFitConfig); 0 = none,
+                                   the default; tentative value 0.1         */
+  double     frame_ceiling;     /* > 0: when no candidate of a row's search
+                                   is admissible, the best one's semi-axes are
+                                   clamped into [frame_floor * spacing,
+                                   frame_ceiling * window radius] and its
+                                   linear coefficients re-solved; <= 0 = off,
+                                   the default (it goes on as it is);
+                                   tentative value 1.0                      */
   double     balance_tolerance; /* > 0: move the LM SEARCH of some rows to
                                    another rank and bring the answers back,
                                    to the given per-rank imbalance tolerance
@@ -137,6 +148,10 @@ typedef struct lgh_fit_report
   /* fit */
   int    rows_fit;        /* rows with a searched fit                      */
   int    rows_fallback;   /* rows on the a-priori baseline                 */
+  int    rows_clamped;    /* rows whose search ended in the clamped
+                             fallback (opts.frame_ceiling > 0)             */
+  int    rows_clamped_fit;/* of those, the rows where it shipped (it beat
+                             the baseline); the rest are in rows_fallback  */
   double qc_energy;       /* held-out energy-ratio QC (decides the ladder):
                              sqrt(sum|Bz - Hz|^2 / sum|Hz|^2) over QC
                              probes ~ |B - H|_F / |H|_F, whitened          */
