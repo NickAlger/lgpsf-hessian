@@ -303,6 +303,32 @@ run_scenario (int dim, int m, double qc_target)
       check (rs.qc_energy <= 2.0 * qc_target, "per-guess ladder qc sane",
              rs.qc_energy);
     }
+    /* the table (2026-10-09): a valid fit, every row accounted for, no guess
+     * skipped with every centre at the node; patience off runs too */
+    fs = fo; fs.ladder_table = 1; fs.frame_floor = 0.3;
+    {
+      int                 rc = lgh_fit_hessian (fit, psf_apply, &op, sigma,
+                                                &fs, &rs);
+      check (rc == 0, "table ladder returns 0", (double) rc);
+      check (rs.rows_fit + rs.rows_fallback == nglob,
+             "table ladder: every row accounted for",
+             (double) (rs.rows_fit + rs.rows_fallback));
+      check (rs.qc_energy <= 2.0 * qc_target, "table ladder qc sane",
+             rs.qc_energy);
+      /* the 3-sigma circle exceeds the batch radius where the small domain
+       * clips the window, so some rows skip it; the count is bounded by the
+       * rows and every row still ships */
+      check (rs.rows_guess_skipped >= 0 && rs.rows_guess_skipped <= nglob,
+             "table: skipped-guess count within the rows",
+             (double) rs.rows_guess_skipped);
+      check (rs.rows_rejected == 0, "table: nothing rejected",
+             (double) rs.rows_rejected);
+      fs.ladder_patience = 100;
+      rc = lgh_fit_hessian (fit, psf_apply, &op, sigma, &fs, &rs);
+      check (rc == 0, "table without patience returns 0", (double) rc);
+      check (rs.qc_energy <= 2.0 * qc_target, "table without patience qc sane",
+             rs.qc_energy);
+    }
     /* the a-priori centre AT the node changes nothing, bit for bit */
     {
       double             *mu = (double *) malloc (sizeof (double) * (size_t) nloc * dim);

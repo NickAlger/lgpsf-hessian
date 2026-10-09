@@ -316,6 +316,8 @@ lgh_fit_opts_default (void)
   o.frame_floor = 0.0;          /* no lower bound on the fitted frame */
   o.frame_ceiling = 0.0;        /* no clamp at the inadmissible fallback */
   o.reject_inadmissible = 0;    /* the best inadmissible one ships, as through tag G */
+  o.ladder_table = 0;           /* the ladders, not the table */
+  o.ladder_patience = 0;        /* the library's patience (2) */
   o.tau_assemble = 6.0;
   o.wsym = LGH_WSYM_WEIGHTED;
   o.verbose = 1;
@@ -503,8 +505,13 @@ make_config (const lgh_fit_opts_t &o, int num_threads)
   {
     config.row.mu = lgpsf::MuPolicy::Pinned;
   }
-  config.row.ladder = o.ladder_per_guess ? lgpsf::LadderScope::PerGuess
-                                         : lgpsf::LadderScope::Shared;
+  config.row.ladder = o.ladder_table      ? lgpsf::LadderScope::Table
+                      : o.ladder_per_guess ? lgpsf::LadderScope::PerGuess
+                                           : lgpsf::LadderScope::Shared;
+  if (o.ladder_patience > 0)
+  {
+    config.row.mode_patience = o.ladder_patience;
+  }
   config.row.frame_floor = o.frame_floor;
   config.row.frame_ceiling = o.frame_ceiling;
   config.row.reject_inadmissible = (o.reject_inadmissible != 0);
@@ -554,7 +561,10 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
   {
     long                outside = 0, outside_g = 0;
     in.mu_prior = b->mu_prior;
-    for (int r = 0; r < nloc; ++r)
+    /* under the table the guard is the table's own: a guess whose frame is
+     * inadmissible at its centre is not climbed (rows_guess_skipped), and the
+     * centre travels as the caller set it */
+    for (int r = 0; r < nloc && !o.ladder_table; ++r)
     {
       const ellipsoid_tree::Ellipsoid &w = windows[(size_t) r];
       const Eigen::VectorXd d = in.mu_prior.row (r).transpose () - w.mu;
@@ -1100,7 +1110,7 @@ finish_fit (lgh_fit_t *b, const lgpsf::mpi::DistFitResult &fit,
     rep->spike_max = mx;
   }
   {
-    long                counts[6] = { (long) bsym.size (), 0, 0, 0, 0, 0 };
+    long                counts[7] = { (long) bsym.size (), 0, 0, 0, 0, 0, 0 };
     const auto         &dg = fit.fit.diagnostics;
     for (size_t r = 0; r < dg.status.size (); r++)
     {
@@ -1118,9 +1128,14 @@ finish_fit (lgh_fit_t *b, const lgpsf::mpi::DistFitResult &fit,
       {
         counts[5]++;   /* reject_inadmissible: the baseline shipped */
       }
+      if ((Eigen::Index) r < dg.guesses_skipped.size ()
+          && dg.guesses_skipped ((Eigen::Index) r) > 0)
+      {
+        counts[6]++;   /* ladder_table: a guess not climbed */
+      }
     }
-    long                glob[6];
-    MPI_Allreduce (counts, glob, 6, MPI_LONG, MPI_SUM, b->comm);
+    long                glob[7];
+    MPI_Allreduce (counts, glob, 7, MPI_LONG, MPI_SUM, b->comm);
     rep->nnz_local = (long) bsym.size ();
     rep->nnz_global = glob[0];
     rep->rows_fit = (int) glob[1];
@@ -1128,6 +1143,7 @@ finish_fit (lgh_fit_t *b, const lgpsf::mpi::DistFitResult &fit,
     rep->rows_clamped = (int) glob[3];
     rep->rows_clamped_fit = (int) glob[4];
     rep->rows_rejected = (int) glob[5];
+    rep->rows_guess_skipped = (int) glob[6];
   }
 
   b->b_rowptr.assign ((size_t) nloc + 1, 0);
@@ -1247,7 +1263,8 @@ lgh_fit_hessian (lgh_fit_t *b, lgh_hessian_fn hessian_apply, void *ctx,
     std::fprintf (stderr, "[LGH-LADDER] the a-priori guess is centred at the "
                   "caller's centres (lgh_fit_set_prior_center); k0 %d, step %d, "
                   "k_max %d, %s ladder\n", o.k0, step, o.k_max,
-                  o.ladder_per_guess ? "per-guess" : "shared");
+                  o.ladder_table ? "table"
+                  : o.ladder_per_guess ? "per-guess" : "shared");
   }
   for (;;)
   {

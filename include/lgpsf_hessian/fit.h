@@ -148,6 +148,36 @@ typedef struct lgh_fit_opts
                                    clamp, or the best inadmissible one as it
                                    is (every run through tag G).  Counted in
                                    report->rows_rejected.                  */
+  int        ladder_table;      /* 1: THE TABLE (lgpsf LadderScope::Table;
+                                   Nick, 2026-10-09).  Every admissible initial
+                                   guess -- the a-priori ellipsoid at its centre
+                                   and circles of radius h (the local spacing),
+                                   sigma and 3 sigma at the node, sigma the
+                                   a-priori ellipsoid's largest semi-axis --
+                                   climbs its own cold LG ladder AND contributes
+                                   a FIXED-frame entry (the linear stage at its
+                                   own frame) at every level; the best
+                                   cross-validation score over the whole table
+                                   ships, ties to fewer fitted parameters.  No
+                                   separate baseline, no certificate, no
+                                   full-window re-score (the coarsened window
+                                   is all the fit sees), the frame floor taken
+                                   at each guess's own centre in the spacing of
+                                   the quadrature there; a guess whose own frame
+                                   is inadmissible is not climbed (counted in
+                                   report->rows_guess_skipped).  Overrides
+                                   ladder_per_guess; makes reject_inadmissible
+                                   and frame_ceiling moot.  0 (default): the
+                                   ladders above.  rows_fit then counts rows
+                                   where a fitted-frame entry won, rows_fallback
+                                   those where a fixed-frame entry did.      */
+  int        ladder_patience;   /* > 0: the mode ladder's patience -- stop a
+                                   fitted ladder after this many consecutive
+                                   levels without improving its best score
+                                   (lgpsf mode_patience; 2 is the library's
+                                   default).  0 (default): the library's.  A
+                                   large value climbs every level the counting
+                                   rule allows (patience off).              */
   double     balance_tolerance; /* > 0: move the LM SEARCH of some rows to
                                    another rank and bring the answers back,
                                    to the given per-rank imbalance tolerance
@@ -189,6 +219,12 @@ typedef struct lgh_fit_report
   int    rows_rejected;   /* rows whose search had no admissible candidate
                              and shipped the baseline (reject_inadmissible);
                              a subset of rows_fallback                     */
+  int    rows_guess_skipped; /* ladder_table: rows where at least one initial
+                             guess was NOT climbed because its own frame
+                             failed the admissibility rules at its centre
+                             (the a-priori guess too far from the node for
+                             its size, or too narrow for the cells it sits
+                             on); 0 under the other ladders                */
   double qc_energy;       /* held-out energy-ratio QC (decides the ladder):
                              sqrt(sum|Bz - Hz|^2 / sum|Hz|^2) over QC
                              probes ~ |B - H|_F / |H|_F, whitened          */
