@@ -137,6 +137,17 @@ typedef struct lgh_fit_opts
                                    linear coefficients re-solved; <= 0 = off,
                                    the default (it goes on as it is);
                                    tentative value 1.0                      */
+  int        reject_inadmissible; /* 1: a row whose search has NO admissible
+                                   candidate (containment: the fitted
+                                   ellipsoid inside the window's ball, its
+                                   centre's displacement included; and the
+                                   floor) ships its a-priori baseline instead
+                                   -- no clamp, nothing inadmissible ever
+                                   ships (lgpsf reject_inadmissible;
+                                   2026-10-09).  0 (default): frame_ceiling's
+                                   clamp, or the best inadmissible one as it
+                                   is (every run through tag G).  Counted in
+                                   report->rows_rejected.                  */
   double     balance_tolerance; /* > 0: move the LM SEARCH of some rows to
                                    another rank and bring the answers back,
                                    to the given per-rank imbalance tolerance
@@ -175,6 +186,9 @@ typedef struct lgh_fit_report
   int    rows_prior_outside; /* rows whose a-priori centre (lgh_fit_set_
                              prior_center) fell outside their window and
                              took the node instead; 0 without a centre     */
+  int    rows_rejected;   /* rows whose search had no admissible candidate
+                             and shipped the baseline (reject_inadmissible);
+                             a subset of rows_fallback                     */
   double qc_energy;       /* held-out energy-ratio QC (decides the ladder):
                              sqrt(sum|Bz - Hz|^2 / sum|Hz|^2) over QC
                              probes ~ |B - H|_F / |H|_F, whitened          */

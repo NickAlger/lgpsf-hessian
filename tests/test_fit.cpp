@@ -343,6 +343,21 @@ run_scenario (int dim, int m, double qc_target)
              rs.qc_energy - rep.qc_energy);
       free (mu);
     }
+    /* reject_inadmissible (2026-10-09): nothing inadmissible ships; a floor no
+     * frame can meet turns every searched row into a rejected one */
+    {
+      fs = fo; fs.reject_inadmissible = 1; fs.frame_floor = 0.1;
+      int                 rc = lgh_fit_hessian (fit, psf_apply, &op, sigma,
+                                                &fs, &rs);
+      check (rc == 0, "reject_inadmissible returns 0", (double) rc);
+      check (rs.rows_fit + rs.rows_fallback == nglob && rs.rows_rejected <= rs.rows_fallback,
+             "rejected rows are counted among the fallbacks", (double) rs.rows_rejected);
+      check (rs.qc_energy <= 2.0 * qc_target, "reject_inadmissible qc sane", rs.qc_energy);
+      fs.frame_floor = 1e9;
+      rc = lgh_fit_hessian (fit, psf_apply, &op, sigma, &fs, &rs);
+      check (rc == 0 && rs.rows_fit == 0 && rs.rows_rejected > 0 && rs.rows_rejected == rs.rows_fallback - (nglob - rs.rows_rejected - rs.rows_fit),
+             "an impossible floor rejects every searched row", (double) rs.rows_rejected);
+    }
   }
 
   /* precomputed probe pairs */
