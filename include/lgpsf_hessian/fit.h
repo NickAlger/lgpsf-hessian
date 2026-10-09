@@ -89,6 +89,15 @@ typedef struct lgh_fit_opts
                                    scaled white noise, matching the QC
                                    metric family.  0 is experimental and
                                    valid only for single-rung ladders.     */
+  int  k_step;                  /* probes added per ladder rung.  0 (the
+                                   default) = n_qc: the schedule of every run
+                                   through tag G (k0, k0 + 5, k0 + 10, ...).
+                                   15 gives 10, 25, 40, ..., 100 (2026-10-09:
+                                   the refit work to 100 probes falls from
+                                   1,045 to 385 row fits per row, no apply is
+                                   wasted on either schedule).  The held-out
+                                   columns are the pool's last n_qc either way
+                                   and join the fit pool at the next rung.  */
   /* -- per-row fit configuration (defaults = the validated production
    *    configuration; change only with cause) -------------------------- */
   double     tau_window;        /* row window radius, in sigma units       */
@@ -106,6 +115,17 @@ typedef struct lgh_fit_opts
   int        wedge_order;       /* LG mode ladder: wedge order             */
   int        wedge_step;        /*                 wedge step              */
   int        mu_pinned;         /* 1: pin the PSF center to the node       */
+  int        ladder_per_guess;  /* 0 (default): one LG mode ladder per row --
+                                   every initial guess refit cold at every
+                                   rung plus a warm candidate from the
+                                   previous rung's winner, one patience on the
+                                   best score across guesses (every run through
+                                   tag G).  1: every initial guess climbs its
+                                   own ladder, cold, with its own patience, no
+                                   warm candidate; the best score over all wins
+                                   (lgpsf LadderScope::PerGuess; 2026-10-09:
+                                   the same or a better held-out score for
+                                   14-20% fewer evaluations on the ice rows). */
   double     frame_floor;       /* lower admissibility bound on a fitted
                                    frame's smallest semi-axis, in local point
                                    spacings (lgpsf ProbeFitConfig); 0 = none,
@@ -152,6 +172,9 @@ typedef struct lgh_fit_report
                              fallback (opts.frame_ceiling > 0)             */
   int    rows_clamped_fit;/* of those, the rows where it shipped (it beat
                              the baseline); the rest are in rows_fallback  */
+  int    rows_prior_outside; /* rows whose a-priori centre (lgh_fit_set_
+                             prior_center) fell outside their window and
+                             took the node instead; 0 without a centre     */
   double qc_energy;       /* held-out energy-ratio QC (decides the ladder):
                              sqrt(sum|Bz - Hz|^2 / sum|Hz|^2) over QC
                              probes ~ |B - H|_F / |H|_F, whitened          */
@@ -243,6 +266,18 @@ lgh_fit_t *lgh_fit_create (MPI_Comm comm, int dim, int nloc, long gid0,
                            const double *coords, const double *mass_lumps,
                            int num_threads);
 void       lgh_fit_destroy (lgh_fit_t *fit);
+
+/* Where each row's A-PRIORI INITIAL GUESS is centred (2026-10-09): mu[i*dim + a]
+ * is coordinate a of local row i, interleaved like coords.  The row fit's first
+ * candidate is the a-priori ellipsoid `sigma[i]` centred HERE instead of at the
+ * node -- the surrogate mean of an a-priori model, say -- while the window, the
+ * spike and the circle-rung guesses stay at the node.  A centre outside the
+ * row's window is replaced by the node at fit time and counted in
+ * report->rows_prior_outside.  NULL clears it (the node: the default and every
+ * run through tag G).  The array is copied and persists across fits of this
+ * object; set it again when it changes.  Local, not collective.  Returns 0, or
+ * -1 if fit is NULL. */
+int        lgh_fit_set_prior_center (lgh_fit_t *fit, const double *mu);
 
 /* THE main entry point: probe the Hessian through the callback and run the
  * accuracy ladder until qc_target or k_max.  sigma: per-node kernel

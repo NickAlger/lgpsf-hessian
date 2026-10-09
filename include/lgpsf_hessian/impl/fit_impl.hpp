@@ -279,6 +279,9 @@ struct lgh_fit
    * object does and the row set does not change -- so only the very first
    * rung of the very first build has nothing better than the window size. */
   Eigen::VectorXd     prev_weight;
+  /* where the a-priori initial guess is centred, (nloc, dim), or EMPTY for the
+   * node (lgh_fit_set_prior_center) */
+  Eigen::MatrixXd     mu_prior;
   void               *Bmat = NULL;  /* cached PETSc Mat (lgh_fit_get_mat) */
 };
 
@@ -295,6 +298,7 @@ lgh_fit_opts_default (void)
   o.seed = 20260817UL;
   o.probe_mode = LGH_PROBES_HASHED;
   o.whitened_fit_probes = 1;
+  o.k_step = 0;                 /* = n_qc: the schedule through tag G */
   /* per-row fit: the validated production configuration */
   o.tau_window = 5.0;
   o.window_aspect_cap = 1.0;    /* ball windows */
@@ -308,6 +312,7 @@ lgh_fit_opts_default (void)
   o.balance_tolerance = 0.0;   /* off: every rank fits the rows it owns */
   o.balance_bytes_cap = lgpsf::mpi::RowExchangeOptions ().bytes_cap;
   o.mu_pinned = 1;
+  o.ladder_per_guess = 0;       /* the shared ladder with the warm candidate */
   o.frame_floor = 0.0;          /* no lower bound on the fitted frame */
   o.frame_ceiling = 0.0;        /* no clamp at the inadmissible fallback */
   o.tau_assemble = 6.0;
@@ -360,6 +365,22 @@ lgh_fit_destroy (lgh_fit_t *b)
   if (b == NULL) return;
   lgh_fit_drop_mat (b);
   delete b;
+}
+
+int
+lgh_fit_set_prior_center (lgh_fit_t *b, const double *mu)
+{
+  if (b == NULL) return -1;
+  if (mu == NULL)
+  {
+    b->mu_prior.resize (0, 0);
+    return 0;
+  }
+  b->mu_prior.resize (b->nloc, b->dim);
+  for (int i = 0; i < b->nloc; i++)
+    for (int a = 0; a < b->dim; a++)
+      b->mu_prior (i, a) = mu[(size_t) i * (size_t) b->dim + (size_t) a];
+  return 0;
 }
 
 void
@@ -481,6 +502,8 @@ make_config (const lgh_fit_opts_t &o, int num_threads)
   {
     config.row.mu = lgpsf::MuPolicy::Pinned;
   }
+  config.row.ladder = o.ladder_per_guess ? lgpsf::LadderScope::PerGuess
+                                         : lgpsf::LadderScope::Shared;
   config.row.frame_floor = o.frame_floor;
   config.row.frame_ceiling = o.frame_ceiling;
   config.num_threads = num_threads;
@@ -520,6 +543,28 @@ fit_once (lgh_fit_t *b, const lgh_fit_opts_t &o,
   if (o.balance_tolerance > 0. && b->prev_weight.size () == nloc)
   {
     in.prev_evaluations = b->prev_weight;
+  }
+  /* the a-priori guess's centre (lgh_fit_set_prior_center): the guard --
+   * a centre outside the row's window (Mahalanobis > 1 against the window
+   * ellipsoid, which is scaled to membership <= 1) takes the node -- and
+   * its count, which the geometry fixes, so every rung reports the same */
+  if (b->mu_prior.rows () == nloc && b->mu_prior.cols () == b->dim)
+  {
+    long                outside = 0, outside_g = 0;
+    in.mu_prior = b->mu_prior;
+    for (int r = 0; r < nloc; ++r)
+    {
+      const ellipsoid_tree::Ellipsoid &w = windows[(size_t) r];
+      const Eigen::VectorXd d = in.mu_prior.row (r).transpose () - w.mu;
+      const double        m2 = d.dot (w.Sigma.ldlt ().solve (d));
+      if (!(m2 <= 1.0))
+      {
+        in.mu_prior.row (r) = b->x.row (r);
+        ++outside;
+      }
+    }
+    MPI_Allreduce (&outside, &outside_g, 1, MPI_LONG, MPI_SUM, b->comm);
+    rep->rows_prior_outside = (int) outside_g;
   }
   fit = lgpsf::mpi::dist_fit (plan, in, windows, config, o.tau_assemble);
   if (o.balance_tolerance > 0.)
@@ -1184,8 +1229,18 @@ lgh_fit_hessian (lgh_fit_t *b, lgh_hessian_fn hessian_apply, void *ctx,
 
   draw (o.k0 + o.n_qc);
   int                 kfit = o.k0;
+  /* probes added per rung: k_step, or n_qc when unset (the schedule of every
+   * run through tag G) */
+  const int           step = (o.k_step > 0) ? o.k_step : o.n_qc;
   lgpsf::mpi::DistFitResult fit;
   std::vector<lgpsf::mpi::GlobalTriplet> bsym;
+  if (b->rank == 0 && o.verbose && b->mu_prior.rows () == nloc)
+  {
+    std::fprintf (stderr, "[LGH-LADDER] the a-priori guess is centred at the "
+                  "caller's centres (lgh_fit_set_prior_center); k0 %d, step %d, "
+                  "k_max %d, %s ladder\n", o.k0, step, o.k_max,
+                  o.ladder_per_guess ? "per-guess" : "shared");
+  }
   for (;;)
   {
     const int           rc = lgh::fit_once (b, o, config, windows, plan,
@@ -1198,18 +1253,22 @@ lgh_fit_hessian (lgh_fit_t *b, lgh_hessian_fn hessian_apply, void *ctx,
     if (b->rank == 0 && o.verbose)
     {
       std::fprintf (stderr,
-                    "[LGH-LADDER] rung %d: k=%d qcE=%.4f qcM=%.4f%s\n",
+                    "[LGH-LADDER] rung %d: k=%d qcE=%.4f qcM=%.4f%s%s\n",
                     rep->ladder_rungs, kfit, rep->qc_energy,
                     rep->qc_rowmean,
-                    (rep->qc_energy <= o.qc_target) ? " (target met)" : "");
+                    (rep->qc_energy <= o.qc_target) ? " (target met)" : "",
+                    (rep->rows_prior_outside > 0 && rep->ladder_rungs == 1)
+                        ? " (a-priori centres outside their window took the node: see the report)" : "");
     }
-    if (rep->qc_energy <= o.qc_target || kfit + o.n_qc > o.k_max)
+    if (rep->qc_energy <= o.qc_target || kfit + step > o.k_max || step <= 0)
     {
       break;
     }
-    /* fold the QC probes into the fit pool, draw fresh QC probes */
-    draw (o.n_qc);
-    kfit += o.n_qc;
+    /* the next rung: `step` fresh columns.  The pool's leading kfit + step
+     * columns are then the fit set -- the old held-out columns join it -- and
+     * its last n_qc are the new held-out set, drawn fresh. */
+    draw (step);
+    kfit += step;
   }
   rep->ladder_k = kfit;
   lgh::finish_fit (b, fit, bsym, rep);

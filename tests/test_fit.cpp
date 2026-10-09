@@ -269,6 +269,82 @@ run_scenario (int dim, int m, double qc_target)
            (double) (rep2.nnz_global - rep.nnz_global));
   }
 
+  /* the 2026-10-09 row-fit options: the ladder's step, the per-guess ladder,
+   * the a-priori centre (lgh_fit_set_prior_center) */
+  {
+    lgh_fit_opts_t      fs = fo;
+    lgh_fit_report_t    rs;
+    /* k_step 10: the rungs are k0, k0 + 10, ... while the next one would not
+     * exceed k_max (k0 15: 15, 25; the 3-D case's k0 20: 20, 30).  A loose
+     * target so the ladder runs out. */
+    fs.k_step = 10; fs.qc_target = 1e-9;
+    {
+      int                 want_k = fo.k0, want_rungs = 1;
+      while (want_k + 10 <= fo.k_max) { want_k += 10; want_rungs++; }
+      int                 rc = lgh_fit_hessian (fit, psf_apply, &op, sigma,
+                                                &fs, &rs);
+      check (rc == 0, "k_step ladder returns 0", (double) rc);
+      check (rs.ladder_k == want_k && rs.ladder_rungs == want_rungs,
+             "k_step 10 climbs k0, k0 + 10, ... under k_max",
+             (double) rs.ladder_k);
+      check (rs.hessian_applies == fo.k0 + fo.n_qc + 10 * (want_rungs - 1),
+             "k_step draws step columns per rung",
+             (double) rs.hessian_applies);
+    }
+    /* the per-guess ladder: a valid fit, every row accounted for */
+    fs = fo; fs.ladder_per_guess = 1;
+    {
+      int                 rc = lgh_fit_hessian (fit, psf_apply, &op, sigma,
+                                                &fs, &rs);
+      check (rc == 0, "per-guess ladder returns 0", (double) rc);
+      check (rs.rows_fit + rs.rows_fallback == nglob,
+             "per-guess ladder: every row accounted for",
+             (double) (rs.rows_fit + rs.rows_fallback));
+      check (rs.qc_energy <= 2.0 * qc_target, "per-guess ladder qc sane",
+             rs.qc_energy);
+    }
+    /* the a-priori centre AT the node changes nothing, bit for bit */
+    {
+      double             *mu = (double *) malloc (sizeof (double) * (size_t) nloc * dim);
+      for (int i = 0; i < nloc; i++)
+        for (int a = 0; a < dim; a++) mu[(size_t) i * dim + a] = op.coords[(size_t) i * dim + a];
+      lgh_fit_set_prior_center (fit, mu);
+      int                 rc = lgh_fit_hessian (fit, psf_apply, &op, sigma,
+                                                &fo, &rs);
+      check (rc == 0, "prior centre at the node returns 0", (double) rc);
+      check (rs.qc_energy == rep.qc_energy && rs.nnz_global == rep.nnz_global,
+             "prior centre at the node is bitwise the default",
+             rs.qc_energy - rep.qc_energy);
+      check (rs.rows_prior_outside == 0, "no centre outside its window",
+             (double) rs.rows_prior_outside);
+      /* far away: every row's centre falls outside its window and takes the
+       * node -- the same fit again, counted */
+      for (int i = 0; i < nloc; i++) mu[(size_t) i * dim] += 1000.0 * h;
+      lgh_fit_set_prior_center (fit, mu);
+      rc = lgh_fit_hessian (fit, psf_apply, &op, sigma, &fo, &rs);
+      check (rc == 0, "far prior centre returns 0", (double) rc);
+      check (rs.rows_prior_outside == nglob, "every far centre took the node",
+             (double) rs.rows_prior_outside);
+      check (rs.qc_energy == rep.qc_energy, "far centres fall back bitwise",
+             rs.qc_energy - rep.qc_energy);
+      /* a quarter spacing off: a different search, still a valid operator */
+      for (int i = 0; i < nloc; i++) mu[(size_t) i * dim] = op.coords[(size_t) i * dim] + 0.25 * h;
+      lgh_fit_set_prior_center (fit, mu);
+      rc = lgh_fit_hessian (fit, psf_apply, &op, sigma, &fo, &rs);
+      check (rc == 0, "shifted prior centre returns 0", (double) rc);
+      check (rs.rows_prior_outside == 0, "shifted centres inside their windows",
+             (double) rs.rows_prior_outside);
+      check (rs.qc_energy <= 2.0 * qc_target, "shifted prior centre qc sane",
+             rs.qc_energy);
+      lgh_fit_set_prior_center (fit, NULL);
+      rc = lgh_fit_hessian (fit, psf_apply, &op, sigma, &fo, &rs);
+      check (rc == 0 && rs.qc_energy == rep.qc_energy,
+             "clearing the centre restores the default bitwise",
+             rs.qc_energy - rep.qc_energy);
+      free (mu);
+    }
+  }
+
   /* precomputed probe pairs */
   if (dim == 2)
   {
