@@ -165,6 +165,13 @@ typedef struct lgh_prior_cholmod_opts
   int    verbose;      /* 1 (default): print the [LGH-PRIOR-CHOL] setup
                           lines (n, nnz(L), factor bytes, peak memory,
                           analyse/factor times); 0: silent              */
+  int    shared_copies;/* 0: every rank factors and holds its own copy of
+                          the factor.  1: ONE factor per NODE, 2 (default):
+                          one per SOCKET -- the copy's leader factors, the
+                          two large arrays live in an MPI shared-memory
+                          window, every rank reads them through an alias
+                          (GLR-MEMORY-REDESIGN A4, 2026-10-12).  Solves are
+                          bitwise the same in every mode.                  */
 }
 lgh_prior_cholmod_opts_t;
 
@@ -174,12 +181,19 @@ lgh_prior_cholmod_opts_t lgh_prior_cholmod_opts_default (void);
  * supports, e.g. MPIAIJ), with the same row layout as mass_lumps; mode
  * LGH_CHOL_A_IS_R or LGH_CHOL_A_IS_Z (see the top of this file).
  *
- * Every rank gathers the whole of A (one triangle), factors it redundantly
- * with CHOLMOD (AMD ordering, supernodal LL^T; the factor is checked to be
- * LL^T, not LDL^T) and frees the gathered copy; the factors are identical
- * on every rank (CHOLMOD and its BLAS run single-threaded).  Memory per
- * rank: the factor, plus the gathered A and CHOLMOD's workspace during
- * setup.  A is used once more: a two-probe symmetry check (an error above
+ * Every rank gathers the whole of A (one triangle).  With shared_copies = 0
+ * every rank factors it redundantly with CHOLMOD (AMD ordering, supernodal
+ * LL^T; the factor is checked to be LL^T, not LDL^T) and frees the gathered
+ * copy; the factors are identical on every rank (CHOLMOD and its BLAS run
+ * single-threaded).  Memory per rank: the factor, plus the gathered A and
+ * CHOLMOD's workspace during setup.  With shared_copies = 1 or 2 only the
+ * leader of each node (socket) factors; the factor's values and row indices
+ * (x and s, all but ~4% of its bytes) sit once per copy in an MPI shared-
+ * memory window, the small arrays (super, pi, px, Perm) are broadcast and
+ * kept per rank, and every rank reads the factor through a cholmod_factor
+ * alias of its own.  lgh_prior_destroy is then COLLECTIVE over the ranks
+ * of a copy (the window is freed).  The solves read the same bytes either
+ * way, so every result is bitwise identical across the three modes.  A is used once more: a two-probe symmetry check (an error above
  * 1e-10 relative).  A_IS_Z keeps a reference to A for its applies (MatMult);
  * A_IS_R keeps nothing of A.
  *
@@ -202,8 +216,13 @@ typedef struct lgh_prior_cholmod_stats
   long   n;              /* rows of A                                    */
   double nnz_A;          /* entries of the gathered triangle of A        */
   double nnz_L;          /* nnz(L) (CHOLMOD's count, without padding)    */
-  double factor_bytes;   /* supernodal factor incl. indices and Perm      */
-  double peak_bytes;     /* CHOLMOD's peak (incl. the gathered A)        */
+  double factor_bytes;   /* ONE supernodal factor incl. indices and Perm  */
+  double peak_bytes;     /* CHOLMOD's peak (incl. the gathered A); 0 on a
+                            rank that did not factor (shared modes)       */
+  int    shared_copies;  /* the mode (0 / 1 / 2)                          */
+  int    copies_per_node;/* factor copies resident per node (1 when 0)    */
+  int    copy_ranks;     /* ranks sharing this rank's copy (1 when 0)     */
+  double private_bytes;  /* per-rank bytes besides the shared arrays      */
   double t_gather, t_analyse, t_factor;          /* setup, seconds        */
   double t_single;  long n_single;               /* Vec-wise ops          */
   double t_blocked; double t_blocked_comm;       /* blocked solves        */

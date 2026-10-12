@@ -378,8 +378,10 @@ run_scenario (int spd, lgh_glr_backend_t backend)
 
   /* adaptive sketch (exact rank 10): from ell0 = 4 the sketch is saturated
    * at 4 and 8, doubles to 16, and stops there by the oversampling rule
-   * (10 <= 0.7 * 16); == one-shot at 16.  From ell0 = 12 (not saturated)
-   * one jump to ceil(1.1 * 10 / 0.7) = 16.  ell_max = 8 stops CAPPED.
+   * (10 <= 0.7 * 16); == one-shot at 16.  From ell0 = 12 the FIXED ladder
+   * doubles to 24 (fixed_ladder = 1, the default); the older rule
+   * (fixed_ladder = 0) jumps to ceil(1.1 * 10 / 0.7) = 16.  ell_max = 12
+   * clamps the last step (8 -> 12) and stops CAPPED; ell_max = 8 likewise.
    * (These small widths also exercise the pdsyevd workspace padding: the
    * reference ScaLAPACK's query under-reported here, 2026-09-28.)       */
   {
@@ -410,8 +412,21 @@ run_scenario (int spd, lgh_glr_backend_t backend)
 
     ad.ell0 = 12;
     PetscCall (lgh_glr_compute_adaptive (B, prior, &go, &ad, &ga, &ra, &ar));
+    check (ar.ell_final == 24 && ar.steps == 2 && !ar.capped && ra.kept == RANK_B,
+           "adaptive (fixed ladder): 12 -> 24, stop by rho", (double) ar.ell_final);
+    lgh_glr_destroy (ga);
+
+    ad.ell0 = 12; ad.fixed_ladder = 0;
+    PetscCall (lgh_glr_compute_adaptive (B, prior, &go, &ad, &ga, &ra, &ar));
     check (ar.ell_final == 16 && ar.steps == 2 && !ar.capped && ra.kept == RANK_B,
-           "adaptive: 12 -> 16 in one jump", (double) ar.ell_final);
+           "adaptive (kept-based rule): 12 -> 16 in one jump", (double) ar.ell_final);
+    lgh_glr_destroy (ga);
+    ad.fixed_ladder = 1;
+
+    ad.ell0 = 4; ad.ell_max = 12;
+    PetscCall (lgh_glr_compute_adaptive (B, prior, &go, &ad, &ga, &ra, &ar));
+    check (ar.ell_final == 12 && ar.steps == 3 && ar.capped == 1 && ra.kept == RANK_B,
+           "adaptive: 4 -> 8 -> 12 (last step clamped to the ceiling), capped", (double) ar.ell_final);
     lgh_glr_destroy (ga);
 
     ad.ell0 = 4; ad.ell_max = 8;

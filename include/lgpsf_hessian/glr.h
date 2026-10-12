@@ -196,20 +196,28 @@ int lgh_glr_extend (lgh_glr_t *glr, int k_new, lgh_glr_report_t *report);
  * condition kept <= rho * ell holds (the sketch is at least 1/rho wider
  * than the rank at the cut: with q = 1 the last Ritz values of a randomized
  * sketch are biased low, so "next_abs < trunc_abs" alone can stop early),
- * or ell reaches ell_max (the build is then RANK-CAPPED).  While saturated
- * (kept == ell) ell grows by `growth`; otherwise it jumps to
- * ceil(1.1 * kept / rho).  Each step is lgh_glr_extend, so the result is the
- * one-shot build at the final ell (span-equivalent).  opts->ell is ignored.
- * on_step (optional) is called after every build/extension on every rank. */
+ * or ell reaches ell_max (the build is then RANK-CAPPED).  The next width is
+ * min(growth * ell, ell_max) -- a FIXED LADDER, data-independent apart from
+ * the rung it stops at (fixed_ladder = 1, the default since 2026-10-12: the
+ * memory of every rung is then known in advance).  With fixed_ladder = 0 the
+ * older rule applies: ell grows by `growth` only while saturated (kept == ell)
+ * and otherwise jumps to ceil(1.1 * kept / rho).  Each step is lgh_glr_extend,
+ * so the result is the one-shot build at the final ell (span-equivalent).
+ * opts->ell is ignored.  on_step (optional) is called after every
+ * build/extension on every rank. */
 typedef void (*lgh_glr_adapt_step_fn) (int step, int ell,
                                        const lgh_glr_report_t *rep, void *ctx);
 typedef struct lgh_glr_adapt
 {
   double                rho;      /* stop once kept <= rho * ell (0.7)      */
   int                   ell_max;  /* ceiling; capped beyond it (30000)      */
-  int                   ell0;     /* first width (4000); callers warm-start *
-                                   * later builds with ceil(prev_kept/rho)  */
-  double                growth;   /* width factor while saturated (2.0)     */
+  int                   ell0;     /* first width (4000) of EVERY build;     *
+                                   * warm-starting later builds from the    *
+                                   * previous kept rank made them one-shot  *
+                                   * builds at the ceiling -- not advised   */
+  double                growth;   /* width factor per rung (2.0)            */
+  int                   fixed_ladder; /* 1 (default): next = growth * ell;  *
+                                   * 0: the pre-2026-10-12 kept-based jump  */
   lgh_glr_adapt_step_fn on_step;  /* optional per-step report               */
   void                 *ctx;
 }

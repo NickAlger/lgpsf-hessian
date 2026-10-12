@@ -504,6 +504,18 @@ lgh_glrd_pdsyevd (lgh_glr_t *g, double *Tloc)
   double             *work;
   int                *iwork;
 
+  /* a non-finite entry in T can HANG pdsyevd rather than fail it: check
+   * first, collectively (2026-10-12, GLR-MEMORY-REDESIGN A3)              */
+  {
+    int                 bad = 0, badg = 0;
+    const long          ntl = (long) s->tl_rows * (long) s->tl_cols;
+    for (long ii = 0; ii < ntl; ii++)
+      if (!isfinite (Tloc[ii])) { bad = 1; break; }
+    PetscCallMPI (MPI_Allreduce (&bad, &badg, 1, MPI_INT, MPI_MAX, g->comm));
+    PetscCheck (!badg, g->comm, PETSC_ERR_FP,
+                "lgh_glrd: the projected matrix T has a non-finite entry "
+                "at ell %d", nell);
+  }
   PetscCall (lgh_gt_begin (g, LGH_GT_EIG_WORK));
   LGH_SCALAPACK_PDSYEVD ("V", "L", &nell, Tloc, &ione, &ione, s->desc,
                          s->lam_raw, s->Vloc, &ione, &ione, s->desc, &wkopt,
@@ -545,7 +557,11 @@ lgh_glrd_pdsyevd (lgh_glr_t *g, double *Tloc)
   PetscCall (PetscFree (iwork));
   PetscCall (lgh_gt_end (g, LGH_GT_EIG_WORK));
   PetscCheck (info == 0, PETSC_COMM_SELF, PETSC_ERR_LIB,
-              "lgh_glrd: pdsyevd failed");
+              "lgh_glrd: pdsyevd failed (info %d)", info);
+  for (int ii = 0; ii < nell; ii++)      /* lam_raw is replicated: rank-consistent */
+    PetscCheck (isfinite (s->lam_raw[ii]), PETSC_COMM_SELF, PETSC_ERR_FP,
+                "lgh_glrd: pdsyevd returned a non-finite eigenvalue "
+                "(index %d of %d)", ii, nell);
   return PETSC_SUCCESS;
 }
 
@@ -712,6 +728,14 @@ lgh_glrd_build (lgh_glr_t *g, lgh_glr_report_t *rep)
   /* T = sym(Q^T Y), streamed into block-cyclic; then pdsyevd (V in place) */
   t0 = MPI_Wtime ();
   PetscCall (lgh_glrd_form_T (g, Q, Y, panel_b, Tloc, Arep));
+  /* Y and W are not read again (the eigensolve reads Tloc, the check Arep
+   * and lam_raw, the selection lam_raw, U = Q V reads Q): free them BEFORE
+   * the eigensolver's workspace -- two n x ell slabs less at the peak of a
+   * one-shot build (2026-10-12, GLR-MEMORY-REDESIGN A2)                  */
+  PetscCall (lgh_gt_begin (g, LGH_GT_SETUP));
+  PetscCall (MatDestroy (&Y));
+  PetscCall (MatDestroy (&W));
+  PetscCall (lgh_gt_end (g, LGH_GT_SETUP));
   g->gmem[1] = lgh_rss_mb ();
   PetscCall (lgh_glrd_pdsyevd (g, Tloc));
   g->gmem[2] = lgh_rss_mb ();
@@ -762,8 +786,6 @@ lgh_glrd_build (lgh_glr_t *g, lgh_glr_report_t *rep)
 
   PetscCall (lgh_gt_begin (g, LGH_GT_SETUP));
   PetscCall (PetscFree (Tloc));
-  PetscCall (MatDestroy (&Y));
-  PetscCall (MatDestroy (&W));
   PetscCall (lgh_gt_end (g, LGH_GT_SETUP));
   s->Q = Q;
   return PETSC_SUCCESS;
@@ -789,10 +811,34 @@ lgh_glrd_extend_incr (lgh_glr_t *g, int k_new, lgh_glr_report_t *rep)
 
   PetscCall (PetscMemzero (rep, sizeof (*rep)));
 
-  /* Q grows: new N x ell2 slab, old columns copied, new ones hashed */
+  /* Q grows: a new N x ell2 slab takes the old columns, and the OLD Q is
+   * destroyed right there -- before the three k_new-wide slabs of the new
+   * block exist.  The step's transient is then (ell2 + 3 k_new) columns,
+   * not (ell1 + ell2 + 3 k_new) (2026-10-12, GLR-MEMORY-REDESIGN A6).    */
   PetscCall (lgh_gt_begin (g, LGH_GT_SETUP));
   PetscCall (MatCreateDense (g->comm, g->nloc, PETSC_DECIDE, g->Nglob, ell2,
                              NULL, &Qb));
+  PetscCall (lgh_gt_end (g, LGH_GT_SETUP));
+  {
+    const PetscScalar  *qa;
+    PetscScalar        *qb;
+    PetscInt            rlo, rhi, ldq, ldb;
+
+    PetscCall (lgh_gt_begin (g, LGH_GT_COPY));
+    PetscCall (MatGetOwnershipRange (Qb, &rlo, &rhi));
+    PetscCall (MatDenseGetLDA (s->Q, &ldq));
+    PetscCall (MatDenseGetLDA (Qb, &ldb));
+    PetscCall (MatDenseGetArrayRead (s->Q, &qa));
+    PetscCall (MatDenseGetArrayWrite (Qb, &qb));
+    for (j = 0; j < ell1; j++)
+      for (i = 0; i < (int) (rhi - rlo); i++)
+        qb[i + (size_t) j * ldb] = qa[i + (size_t) j * ldq];
+    PetscCall (MatDenseRestoreArrayWrite (Qb, &qb));
+    PetscCall (MatDenseRestoreArrayRead (s->Q, &qa));
+    PetscCall (lgh_gt_end (g, LGH_GT_COPY));
+  }
+  PetscCall (lgh_gt_begin (g, LGH_GT_SETUP));
+  PetscCall (MatDestroy (&s->Q));          /* consumed: its columns live in Qb */
   PetscCall (MatCreateDense (g->comm, g->nloc, PETSC_DECIDE, g->Nglob,
                              k_new, NULL, &Qn));
   PetscCall (MatCreateDense (g->comm, g->nloc, PETSC_DECIDE, g->Nglob,
@@ -801,32 +847,20 @@ lgh_glrd_extend_incr (lgh_glr_t *g, int k_new, lgh_glr_report_t *rep)
                              k_new, NULL, &Wn));
   PetscCall (lgh_gt_end (g, LGH_GT_SETUP));
   {
-    const PetscScalar  *qa;
-    PetscScalar        *qb, *qn;
-    PetscInt            rlo, rhi, ldq, ldb, ldn;
+    PetscScalar        *qn;
+    PetscInt            rlo, rhi, ldn;
 
-    PetscCall (lgh_gt_begin (g, LGH_GT_COPY));
-    PetscCall (MatGetOwnershipRange (Qb, &rlo, &rhi));
-    PetscCall (MatDenseGetLDA (s->Q, &ldq));
-    PetscCall (MatDenseGetLDA (Qb, &ldb));
-    PetscCall (MatDenseGetLDA (Qn, &ldn));
-    PetscCall (MatDenseGetArrayRead (s->Q, &qa));
-    PetscCall (MatDenseGetArrayWrite (Qb, &qb));
-    PetscCall (MatDenseGetArrayWrite (Qn, &qn));
-    for (j = 0; j < ell1; j++)
-      for (i = 0; i < (int) (rhi - rlo); i++)
-        qb[i + (size_t) j * ldb] = qa[i + (size_t) j * ldq];
-    PetscCall (lgh_gt_end (g, LGH_GT_COPY));
     PetscCall (lgh_gt_begin (g, LGH_GT_OMEGA));
+    PetscCall (MatGetOwnershipRange (Qn, &rlo, &rhi));
+    PetscCall (MatDenseGetLDA (Qn, &ldn));
+    PetscCall (MatDenseGetArrayWrite (Qn, &qn));
     for (j = 0; j < k_new; j++)
       for (i = 0; i < (int) (rhi - rlo); i++)
         qn[i + (size_t) j * ldn] =
             lgh_randn_at (g->opts.seed, rlo + i, ell1 + j);
+    PetscCall (MatDenseRestoreArrayWrite (Qn, &qn));
     PetscCall (lgh_gt_end (g, LGH_GT_OMEGA));
     lgh_gt_count (g, LGH_GT_OMEGA, 0., (double) k_new);
-    PetscCall (MatDenseRestoreArrayWrite (Qn, &qn));
-    PetscCall (MatDenseRestoreArrayWrite (Qb, &qb));
-    PetscCall (MatDenseRestoreArrayRead (s->Q, &qa));
   }
 
   /* power passes on the new block (internal orth only) */
@@ -976,8 +1010,7 @@ lgh_glrd_extend_incr (lgh_glr_t *g, int k_new, lgh_glr_report_t *rep)
   PetscCall (MatDestroy (&Qn));
   PetscCall (MatDestroy (&Yn));
   PetscCall (MatDestroy (&Wn));
-  PetscCall (MatDestroy (&s->Q));
-  s->Q = Qb;
+  s->Q = Qb;                               /* the old Q went right after its copy */
   s->ell = ell2;
   g->opts.ell = ell2;
 

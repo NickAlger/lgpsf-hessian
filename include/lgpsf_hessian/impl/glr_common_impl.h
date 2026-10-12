@@ -981,6 +981,7 @@ lgh_glr_adapt_default (void)
   a.ell_max = 30000;
   a.ell0 = 4000;
   a.growth = 2.0;
+  a.fixed_ladder = 1;
   a.on_step = NULL;
   a.ctx = NULL;
   return a;
@@ -1037,7 +1038,7 @@ lgh_glr_compute_adaptive (Mat B, lgh_prior_t *prior, const lgh_glr_opts_t *opts,
     int                 enew;
     if ((double) rep.kept <= ad.rho * (double) ell) break;      /* tolerance */
     if (ell >= emax) { ar.capped = 1; break; }                  /* ceiling   */
-    if (rep.kept >= ell) enew = (int) ceil (ad.growth * (double) ell);
+    if (ad.fixed_ladder || rep.kept >= ell) enew = (int) ceil (ad.growth * (double) ell);
     else enew = (int) ceil (1.1 * (double) rep.kept / ad.rho);
     if (enew <= ell) enew = ell + 1;
     enew = PetscMin (enew, emax);

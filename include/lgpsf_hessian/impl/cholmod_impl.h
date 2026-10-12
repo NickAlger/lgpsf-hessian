@@ -26,6 +26,7 @@
 
 #include <cholmod.h>
 #include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
@@ -95,6 +96,15 @@ struct lgh_chol_ctx
   int                 cc_started;
   cholmod_factor     *L;
   const int64_t      *perm;                /* L->Perm                     */
+  /* the node-shared factor (A4, 2026-10-12; shared_copies > 0): one copy
+   * per copycomm, its leader (copy_rank 0) factors; x and s live in `win`,
+   * the small arrays in `small`; L then points at the alias `Lalias`      */
+  int                 shared_copies, copies_per_node, socket_colour;
+  MPI_Comm            copycomm;
+  int                 copy_rank, copy_size;
+  MPI_Win             win;
+  cholmod_factor     *Lalias;
+  int64_t            *small;
   /* single-vector work: two full-length arrays + the solve workspace  */
   double             *xg, *t1;
   double             *ework;
@@ -509,11 +519,189 @@ lgh_chol_cb_solveZt_blocked (Mat X, Mat Y, void *vctx)
 
 /* ---- setup ------------------------------------------------------------ */
 
+/* ---- the node-shared factor (GLR-MEMORY-REDESIGN A4, 2026-10-12) ------
+ * With opts->shared_copies > 0 the ranks of one node (1) or one socket (2)
+ * share ONE factor.  The copy's leader factors; the two large arrays of the
+ * supernodal factor, x (xsize doubles) and s (ssize int64), are copied once
+ * into an MPI shared-memory window; the small arrays (super, pi, px: nsuper
+ * + 1 each; Perm: n) are broadcast and kept per rank; every rank then reads
+ * the factor through a cholmod_factor struct of its own that aliases the
+ * window.  CHOLMOD's supernodal solves and lgh_chol_lmul only READ the
+ * factor (SuiteSparse 7.9: t_cholmod_super_solve_worker reads n, nsuper,
+ * super, pi, px, s, x, maxesize, dtype; the wrapper xtype, is_super, is_ll),
+ * so every solve stays bitwise the same.  The alias is calloc'ed and freed
+ * by hand, never through cholmod_l_free_factor.  Saves (ranks per copy - 1)
+ * x (x + s bytes) per copy -- 27 GB per node at albmap_40 with 48 ranks --
+ * and CHOLMOD's factorization workspace on every rank but the leaders. */
+
+/* the socket this process runs on: /proc/self/stat field 39 (the cpu) and
+ * that cpu's topology/physical_package_id; -1 when either is unreadable  */
+static int
+lgh_chol_cpu_package (void)
+{
+  FILE               *f = fopen ("/proc/self/stat", "r");
+  char                buf[1024];
+  int                 cpu = -1, pkg = -1;
+
+  if (f == NULL) return -1;
+  if (fgets (buf, sizeof (buf), f) != NULL) {
+    const char         *q = strrchr (buf, ')');   /* the comm field may hold spaces */
+    int                 field = 2;
+    if (q != NULL) {
+      q++;
+      while (*q != '\0' && field < 39) { if (*q == ' ') field++; q++; }
+      if (field == 39) cpu = atoi (q);
+    }
+  }
+  fclose (f);
+  if (cpu < 0) return -1;
+  snprintf (buf, sizeof (buf), "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", cpu);
+  f = fopen (buf, "r");
+  if (f == NULL) return -1;
+  if (fscanf (f, "%d", &pkg) != 1) pkg = -1;
+  fclose (f);
+  return pkg;
+}
+
+/* the communicator of this rank's copy; copies_per_node for the record.
+ * LGH_CHOL_FORCE_SLICES=k (tests) slices every node into k rank ranges
+ * instead of reading the sockets.                                        */
+static PetscErrorCode
+lgh_chol_copycomm (struct lgh_chol_ctx *c)
+{
+  MPI_Comm            nodecomm;
+  int                 nrank, nsize, colour = 0, cmin, cmax;
+  const char         *env = getenv ("LGH_CHOL_FORCE_SLICES");
+  const int           slices = (env != NULL && atoi (env) > 0) ? atoi (env) : 0;
+
+  PetscCallMPI (MPI_Comm_split_type (c->comm, MPI_COMM_TYPE_SHARED, c->rank,
+                                     MPI_INFO_NULL, &nodecomm));
+  PetscCallMPI (MPI_Comm_rank (nodecomm, &nrank));
+  PetscCallMPI (MPI_Comm_size (nodecomm, &nsize));
+  c->socket_colour = 0;
+  if (slices > 0) {
+    colour = (int) (((long) nrank * slices) / nsize);
+  }
+  else if (c->shared_copies >= 2) {
+    int                 pkg = lgh_chol_cpu_package (), pmin;
+    PetscCallMPI (MPI_Allreduce (&pkg, &pmin, 1, MPI_INT, MPI_MIN, nodecomm));
+    if (pmin >= 0) { colour = pkg; c->socket_colour = 1; }
+    else colour = (int) (((long) nrank * c->shared_copies) / nsize);   /* fallback: rank ranges */
+  }
+  PetscCallMPI (MPI_Allreduce (&colour, &cmin, 1, MPI_INT, MPI_MIN, nodecomm));
+  PetscCallMPI (MPI_Allreduce (&colour, &cmax, 1, MPI_INT, MPI_MAX, nodecomm));
+  c->copies_per_node = cmax - cmin + 1;
+  if (c->copies_per_node == 1) {
+    c->copycomm = nodecomm;
+  }
+  else {
+    PetscCallMPI (MPI_Comm_split (nodecomm, colour, c->rank, &c->copycomm));
+    PetscCallMPI (MPI_Comm_free (&nodecomm));
+  }
+  PetscCallMPI (MPI_Comm_rank (c->copycomm, &c->copy_rank));
+  PetscCallMPI (MPI_Comm_size (c->copycomm, &c->copy_size));
+  return PETSC_SUCCESS;
+}
+
+/* after the leader factored (c->L on the leader, NULL elsewhere; `ok` the
+ * leader's factorize return): validate collectively, publish x and s in
+ * the window, broadcast the small arrays and the struct, build the alias */
+static PetscErrorCode
+lgh_chol_share_factor (struct lgh_chol_ctx *c, int ok)
+{
+  cholmod_factor      hdr;
+  int                 flags[2] = { 0, 0 };     /* [0] valid, [1] cc.status */
+  double              st3[2] = { 0., 0. };     /* lnz, peak                */
+  size_t              xbytes, sbytes, off_s, nsup1, nsmall;
+  MPI_Aint            total, qsz;
+  int                 disp;
+  char               *base = NULL;
+  int64_t            *small;
+
+  memset (&hdr, 0, sizeof (hdr));
+  if (c->copy_rank == 0) {
+    flags[1] = (int) c->cc.status;
+    flags[0] = (ok && c->L != NULL && c->cc.status == CHOLMOD_OK
+                && c->L->minor == (size_t) c->n && c->L->is_ll && c->L->is_super
+                && c->L->itype == CHOLMOD_LONG && c->L->xtype == CHOLMOD_REAL
+                && c->L->dtype == CHOLMOD_DOUBLE
+                && c->L->p == NULL && c->L->i == NULL && c->L->z == NULL) ? 1 : 0;
+    if (c->L != NULL) hdr = *c->L;
+    st3[0] = c->cc.lnz;
+    st3[1] = (double) c->cc.memory_usage;
+  }
+  PetscCallMPI (MPI_Bcast (flags, 2, MPI_INT, 0, c->copycomm));
+  PetscCallMPI (MPI_Bcast (&hdr, (int) sizeof (hdr), MPI_BYTE, 0, c->copycomm));
+  PetscCallMPI (MPI_Bcast (st3, 2, MPI_DOUBLE, 0, c->copycomm));
+  PetscCheck (flags[0], c->copycomm, PETSC_ERR_LIB,
+              "lgh_prior_create_cholmod: the copy leader's factorization failed or is not a "
+              "supernodal real double LL^T (CHOLMOD status %d, minor %ld of %" PetscInt_FMT
+              "): A not positive definite?", flags[1], (long) hdr.minor, c->n);
+  c->st.nnz_L = st3[0];
+  c->st.peak_bytes = (c->copy_rank == 0) ? st3[1] : 0.;
+
+  /* the window: x, then s at a 64-byte boundary */
+  xbytes = hdr.xsize * sizeof (double);
+  sbytes = hdr.ssize * sizeof (int64_t);
+  off_s = (xbytes + 63) & ~((size_t) 63);
+  total = (MPI_Aint) (off_s + sbytes);
+  PetscCallMPI (MPI_Win_allocate_shared (c->copy_rank == 0 ? total : 0, 1, MPI_INFO_NULL,
+                                         c->copycomm, &base, &c->win));
+  PetscCallMPI (MPI_Win_shared_query (c->win, 0, &qsz, &disp, &base));
+  PetscCheck ((size_t) qsz >= off_s + sbytes, c->copycomm, PETSC_ERR_LIB,
+              "lgh_prior_create_cholmod: shared window smaller than the factor");
+  PetscCallMPI (MPI_Win_lock_all (MPI_MODE_NOCHECK, c->win));
+  if (c->copy_rank == 0) {
+    memcpy (base, c->L->x, xbytes);
+    memcpy (base + off_s, c->L->s, sbytes);
+  }
+  PetscCallMPI (MPI_Win_sync (c->win));
+  PetscCallMPI (MPI_Barrier (c->copycomm));
+  PetscCallMPI (MPI_Win_sync (c->win));
+
+  /* the small arrays, one per rank: super | pi | px | Perm */
+  nsup1 = hdr.nsuper + 1;
+  nsmall = 3 * nsup1 + (size_t) c->n;
+  PetscCheck (nsmall <= (size_t) INT_MAX, PETSC_COMM_SELF, PETSC_ERR_SUP,
+              "lgh_prior_create_cholmod: factor index arrays too large for one broadcast");
+  PetscCall (PetscMalloc1 (nsmall, &small));
+  if (c->copy_rank == 0) {
+    memcpy (small, c->L->super, nsup1 * sizeof (int64_t));
+    memcpy (small + nsup1, c->L->pi, nsup1 * sizeof (int64_t));
+    memcpy (small + 2 * nsup1, c->L->px, nsup1 * sizeof (int64_t));
+    memcpy (small + 3 * nsup1, c->L->Perm, (size_t) c->n * sizeof (int64_t));
+  }
+  PetscCallMPI (MPI_Bcast (small, (int) nsmall, MPI_INT64_T, 0, c->copycomm));
+
+  /* the alias: the leader's struct with the pointers re-aimed */
+  c->Lalias = (cholmod_factor *) calloc (1, sizeof (cholmod_factor));
+  PetscCheck (c->Lalias != NULL, PETSC_COMM_SELF, PETSC_ERR_MEM, "calloc failed");
+  *c->Lalias = hdr;
+  c->Lalias->x = base;
+  c->Lalias->s = base + off_s;
+  c->Lalias->super = small;
+  c->Lalias->pi = small + nsup1;
+  c->Lalias->px = small + 2 * nsup1;
+  c->Lalias->Perm = small + 3 * nsup1;
+  c->Lalias->ColCount = NULL;   /* read by no solve path */
+  c->Lalias->IPerm = NULL;
+  c->Lalias->p = NULL; c->Lalias->i = NULL; c->Lalias->z = NULL;
+  c->Lalias->nz = NULL; c->Lalias->next = NULL; c->Lalias->prev = NULL;
+  c->small = small;
+  if (c->copy_rank == 0) (void) cholmod_l_free_factor (&c->L, &c->cc);   /* CHOLMOD's own copy */
+  c->L = c->Lalias;
+  c->perm = (const int64_t *) c->Lalias->Perm;
+  c->st.factor_bytes = (double) (xbytes + sbytes) + 8.0 * (double) nsmall;
+  c->st.private_bytes = 8.0 * (double) nsmall;
+  return PETSC_SUCCESS;
+}
+
 lgh_prior_cholmod_opts_t
 lgh_prior_cholmod_opts_default (void)
 {
   lgh_prior_cholmod_opts_t o;
   o.verbose = 1;
+  o.shared_copies = 2;        /* one factor per socket (Nick, 2026-10-12); 0 = the replicated factor */
   return o;
 }
 
@@ -704,6 +892,16 @@ lgh_prior_create_cholmod (Mat A, Vec mass_lumps, int mode,
   PetscCall (PetscMalloc4 (c->size, &c->scnt, c->size, &c->sdsp,
                            c->size, &c->rcnt, c->size, &c->rdsp));
   PetscCall (PetscMalloc1 (c->size + 1, &c->cstart));
+  PetscCheck (o.shared_copies >= 0 && o.shared_copies <= 2, PETSC_COMM_SELF, PETSC_ERR_ARG_OUTOFRANGE,
+              "lgh_prior_create_cholmod: shared_copies must be 0, 1 or 2 (got %d)", o.shared_copies);
+  c->shared_copies = o.shared_copies;
+  c->copycomm = MPI_COMM_NULL; c->win = MPI_WIN_NULL; c->Lalias = NULL; c->small = NULL;
+  c->copy_rank = 0; c->copy_size = 1; c->copies_per_node = 1; c->socket_colour = 0;
+  c->st.shared_copies = o.shared_copies;
+  if (o.shared_copies > 0) PetscCall (lgh_chol_copycomm (c));
+  c->st.copies_per_node = (o.shared_copies > 0) ? c->copies_per_node : 1;
+  c->st.copy_ranks = (o.shared_copies > 0) ? c->copy_size : 1;
+  c->st.private_bytes = 0.;
 
   PetscCall (lgh_chol_check_symmetric (A, &asym));
   PetscCheck (asym <= 1e-10, c->comm, PETSC_ERR_ARG_WRONG,
@@ -729,18 +927,25 @@ lgh_prior_create_cholmod (Mat A, Vec mass_lumps, int mode,
   PetscCall (lgh_chol_gather (c, A, &As));
   c->st.t_gather = MPI_Wtime () - t0;
 
-  th = lgh_chol_threads_enter ();
-  t0 = MPI_Wtime ();
-  c->L = cholmod_l_analyze (As, &c->cc);
-  c->st.t_analyse = MPI_Wtime () - t0;
-  if (c->L != NULL && c->cc.status == CHOLMOD_OK) {
+  if (c->shared_copies == 0 || c->copy_rank == 0) {    /* every rank, or the copy's leader */
+    th = lgh_chol_threads_enter ();
     t0 = MPI_Wtime ();
-    ok = cholmod_l_factorize (As, c->L, &c->cc);
-    c->st.t_factor = MPI_Wtime () - t0;
+    c->L = cholmod_l_analyze (As, &c->cc);
+    c->st.t_analyse = MPI_Wtime () - t0;
+    if (c->L != NULL && c->cc.status == CHOLMOD_OK) {
+      t0 = MPI_Wtime ();
+      ok = cholmod_l_factorize (As, c->L, &c->cc);
+      c->st.t_factor = MPI_Wtime () - t0;
+    }
+    else ok = 0;
+    lgh_chol_threads_leave (th);
   }
-  else ok = 0;
-  lgh_chol_threads_leave (th);
+  else { c->L = NULL; ok = 1; }
   (void) cholmod_l_free_sparse (&As, &c->cc);   /* the gathered A, now */
+  if (c->shared_copies > 0) {
+    PetscCall (lgh_chol_share_factor (c, ok));    /* validates collectively; sets L, perm, stats */
+  }
+  else {
   PetscCheck (c->L != NULL, PETSC_COMM_SELF, PETSC_ERR_LIB,
               "lgh_prior_create_cholmod: cholmod_l_analyze failed (status %d)",
               c->cc.status);
@@ -763,6 +968,7 @@ lgh_prior_create_cholmod (Mat A, Vec mass_lumps, int mode,
                               + 3.0 * ((double) c->L->nsuper + 1.0)
                               + 2.0 * (double) c->n);
   c->st.peak_bytes = (double) c->cc.memory_usage;
+  }
 
   PetscCall (PetscMalloc2 (PetscMax (c->n, 1), &c->xg, PetscMax (c->n, 1),
                            &c->t1));
@@ -780,12 +986,26 @@ lgh_prior_create_cholmod (Mat A, Vec mass_lumps, int mode,
       c->n, c->st.nnz_A, c->st.nnz_L,
       c->n > 0 ? c->st.nnz_L / (double) c->n : 0., (long) c->L->nsuper,
       c->L->is_ll ? "yes" : "NO"));
-    PetscCall (PetscPrintf (c->comm,
-      "[LGH-PRIOR-CHOL] factor %.1f MB per rank (x %d ranks)  CHOLMOD peak "
-      "%.1f MB (incl. the gathered A)  gather %.3f s  analyse %.3f s  "
-      "factor %.3f s  (max over ranks)  symmetry probe %.1e\n",
-      c->st.factor_bytes / 1e6, (int) c->size, mx[3] / 1e6, mx[0], mx[1],
-      mx[2], asym));
+    if (c->shared_copies == 0) {
+      PetscCall (PetscPrintf (c->comm,
+        "[LGH-PRIOR-CHOL] factor %.1f MB per rank (x %d ranks)  CHOLMOD peak "
+        "%.1f MB (incl. the gathered A)  gather %.3f s  analyse %.3f s  "
+        "factor %.3f s  (max over ranks)  symmetry probe %.1e\n",
+        c->st.factor_bytes / 1e6, (int) c->size, mx[3] / 1e6, mx[0], mx[1],
+        mx[2], asym));
+    }
+    else {
+      int                 loc2[2] = { c->copies_per_node, c->socket_colour }, mx2[2];
+      PetscCallMPI (MPI_Allreduce (loc2, mx2, 2, MPI_INT, MPI_MAX, c->comm));
+      PetscCall (PetscPrintf (c->comm,
+        "[LGH-PRIOR-CHOL] factor %.1f MB x %d copies per node (shared over %d ranks each, %s; "
+        "%.1f MB per rank besides)  CHOLMOD peak %.1f MB on the leaders (incl. the gathered A)  "
+        "gather %.3f s  analyse %.3f s  factor %.3f s  (max over ranks)  symmetry probe %.1e\n",
+        c->st.factor_bytes / 1e6, mx2[0], (int) c->copy_size,
+        mx2[1] ? "sockets from the cpu topology"
+               : (getenv ("LGH_CHOL_FORCE_SLICES") ? "rank slices (forced)" : "rank slices"),
+        c->st.private_bytes / 1e6, mx[3] / 1e6, mx[0], mx[1], mx[2], asym));
+    }
   }
 
   /* the prior */
@@ -827,7 +1047,18 @@ lgh_chol_prior_teardown (lgh_prior_t *p)
   struct lgh_chol_ctx *c = p->chol;
 
   if (c == NULL) return;
+  if (c->Lalias != NULL) {             /* the shared factor: by hand, never cholmod_l_free_factor */
+    free (c->Lalias);
+    c->Lalias = NULL;
+    c->L = NULL;
+    (void) PetscFree (c->small);
+    if (c->win != MPI_WIN_NULL) {
+      (void) MPI_Win_unlock_all (c->win);
+      (void) MPI_Win_free (&c->win);
+    }
+  }
   if (c->L != NULL) (void) cholmod_l_free_factor (&c->L, &c->cc);
+  if (c->copycomm != MPI_COMM_NULL) (void) MPI_Comm_free (&c->copycomm);
   if (c->cc_started) (void) cholmod_l_finish (&c->cc);
   (void) PetscFree2 (c->xg, c->t1);
   (void) PetscFree (c->ework);

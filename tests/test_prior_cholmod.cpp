@@ -381,6 +381,38 @@ blocked_vs_columns (lgh_prior_t *p, lgh_prior_t *q,
   return PETSC_SUCCESS;
 }
 
+/* worst column-relative difference between the blocked solves of p and q on
+ * the same block (the same multi-column kernel on both sides: bitwise when
+ * the two priors hold the same factor bytes)                             */
+static PetscErrorCode
+blocked_vs_blocked (lgh_prior_t *p, lgh_prior_t *q,
+                    lgh_prior_block_which_t which, Vec like, PetscInt ncols,
+                    double *worst)
+{
+  Mat                 X, Y1, Y2;
+
+  PetscCall (make_block (like, ncols, 0xB10CUL + (unsigned long) ncols, &X));
+  PetscCall (MatDuplicate (X, MAT_DO_NOT_COPY_VALUES, &Y1));
+  PetscCall (MatDuplicate (X, MAT_DO_NOT_COPY_VALUES, &Y2));
+  PetscCall (lgh_prior_solve_block (p, which, X, Y1));
+  PetscCall (lgh_prior_solve_block (q, which, X, Y2));
+  *worst = 0.;
+  for (PetscInt j = 0; j < ncols; j++) {
+    Vec                 a, b;
+    double              rd;
+    PetscCall (MatDenseGetColumnVecRead (Y1, j, &a));
+    PetscCall (MatDenseGetColumnVecRead (Y2, j, &b));
+    PetscCall (rel_diff (a, b, &rd));
+    PetscCall (MatDenseRestoreColumnVecRead (Y2, j, &b));
+    PetscCall (MatDenseRestoreColumnVecRead (Y1, j, &a));
+    *worst = fmax (*worst, rd);
+  }
+  PetscCall (MatDestroy (&X));
+  PetscCall (MatDestroy (&Y1));
+  PetscCall (MatDestroy (&Y2));
+  return PETSC_SUCCESS;
+}
+
 /* ======================================================================= */
 /* part 1: A_IS_R and A_IS_Z at the prior level                             */
 
@@ -410,6 +442,7 @@ run_prior_level (int layout)
   PetscCall (VecSet (minv_gamma, 1.0 / GAMMA));
 
   co.verbose = (layout == 0);
+  co.shared_copies = 0;               /* the replicated factor is this test's baseline */
   PetscCall ((PetscErrorCode) lgh_prior_create_cholmod (A, minv_gamma,
                                                         LGH_CHOL_A_IS_R, &co,
                                                         &pr));
@@ -497,6 +530,73 @@ run_prior_level (int layout)
   PetscCall (lgh_prior_applyZt_vec (pr, v, x));
   PetscCall (rel_diff (x, w, &rd));
   check (rd > 1e-3, "A_IS_R: Z v and Z^T v differ", rd);
+
+  /* ---- the node-shared factor (GLR-MEMORY-REDESIGN A4, 2026-10-12): the same
+   * bytes read through an alias, so every solve is BITWISE the replicated one.
+   * shared_copies 1 (one per node) and 2 (sockets; LGH_CHOL_FORCE_SLICES=2 cuts
+   * a node in two).  NOTE: an MPI without shared memory (the laptop's MPICH is
+   * ch3:sock) puts every rank in a node of its own, so there every copy has one
+   * rank and the alias is built from a one-rank window; the leader + follower
+   * path (a follower's shared_query, the broadcasts) is first exercised on a
+   * machine with a real shared-memory MPI -- environment/65 runs this test at
+   * 48 ranks on TACC for that reason. */
+  lgh_prior_t        *pr0;            /* an independent REPLICATED factor: the baseline, so that
+                                       * pr's own blocked-solve counters (checked below) stay put */
+  {
+    lgh_prior_cholmod_opts_t c0 = co;
+    c0.shared_copies = 0; c0.verbose = 0;
+    PetscCall ((PetscErrorCode) lgh_prior_create_cholmod (A, minv_gamma, LGH_CHOL_A_IS_R, &c0, &pr0));
+  }
+  for (int sc = 1; sc <= 2; sc++) {
+    lgh_prior_cholmod_opts_t cs = co;
+    lgh_prior_t        *ps;
+    lgh_prior_cholmod_stats_t sst;
+
+    cs.shared_copies = sc;
+    cs.verbose = (layout == 0);
+    if (sc == 2) setenv ("LGH_CHOL_FORCE_SLICES", "2", 1);
+    PetscCall ((PetscErrorCode) lgh_prior_create_cholmod (A, minv_gamma, LGH_CHOL_A_IS_R, &cs, &ps));
+    if (sc == 2) unsetenv ("LGH_CHOL_FORCE_SLICES");
+    PetscCall (fill_randn (v, 0x5A4EDUL, sc));
+    PetscCall (lgh_prior_solveZ_vec (pr0, v, w));
+    PetscCall (lgh_prior_solveZ_vec (ps, v, x));
+    PetscCall (rel_diff (x, w, &rd));
+    snprintf (what, sizeof (what), "shared factor (%d per node): Z^{-1} v bitwise", sc);
+    check (rd == 0.0, what, rd);
+    PetscCall (lgh_prior_solveZt_vec (pr0, v, w));
+    PetscCall (lgh_prior_solveZt_vec (ps, v, x));
+    PetscCall (rel_diff (x, w, &rd));
+    snprintf (what, sizeof (what), "shared factor (%d per node): Z^{-T} v bitwise", sc);
+    check (rd == 0.0, what, rd);
+    PetscCall (lgh_prior_applyZ_vec (pr0, v, w));
+    PetscCall (lgh_prior_applyZ_vec (ps, v, x));
+    PetscCall (rel_diff (x, w, &rd));
+    snprintf (what, sizeof (what), "shared factor (%d per node): Z v bitwise", sc);
+    check (rd == 0.0, what, rd);
+    PetscCall (lgh_prior_applyZt_vec (pr0, v, w));
+    PetscCall (lgh_prior_applyZt_vec (ps, v, x));
+    PetscCall (rel_diff (x, w, &rd));
+    snprintf (what, sizeof (what), "shared factor (%d per node): Z^T v bitwise", sc);
+    check (rd == 0.0, what, rd);
+    PetscCall (blocked_vs_blocked (ps, pr0, LGH_PRIOR_SOLVEZ, v, 5, &rd));
+    snprintf (what, sizeof (what), "shared factor (%d per node): blocked Z^{-1} bitwise the replicated blocked", sc);
+    check (rd == 0.0, what, rd);
+    PetscCall (blocked_vs_blocked (ps, pr0, LGH_PRIOR_SOLVEZT, v, 3, &rd));
+    snprintf (what, sizeof (what), "shared factor (%d per node): blocked Z^{-T} bitwise the replicated blocked", sc);
+    check (rd == 0.0, what, rd);
+    PetscCall (blocked_vs_columns (ps, pr0, LGH_PRIOR_SOLVEZ, v, 5, &rd));
+    snprintf (what, sizeof (what), "shared factor (%d per node): blocked Z^{-1} == replicated columns (rounding)", sc);
+    check (rd < 1e-12, what, rd);
+    PetscCall ((PetscErrorCode) lgh_prior_cholmod_get_stats (ps, &sst));
+    snprintf (what, sizeof (what), "shared factor (%d per node): stats (copies/node %d, ranks/copy %d, "
+              "%.0f B factor, %.0f B private)", sc, sst.copies_per_node, sst.copy_ranks,
+              sst.factor_bytes, sst.private_bytes);
+    check (sst.shared_copies == sc && sst.copies_per_node >= 1 && sst.copy_ranks >= 1
+           && sst.factor_bytes > sst.private_bytes && sst.private_bytes > 0 && sst.nnz_L > 0,
+           what, (double) sst.copies_per_node);
+    lgh_prior_destroy (ps);
+  }
+  lgh_prior_destroy (pr0);
 
   /* ---- blocked == column-by-column */
   for (int k = 0; k < 5; k++) {
