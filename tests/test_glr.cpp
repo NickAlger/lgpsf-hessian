@@ -232,6 +232,25 @@ run_scenario (int spd, lgh_glr_backend_t backend)
   }
   check (rep.next_abs < 1e-6 * rep.lam_abs_max, "next_abs ~ 0 at exact rank",
          rep.next_abs);
+  {
+    /* the applied operator is what the formulas say (lgh_glr_check_basis, 2026-10-14):
+     * every kept column orthonormal, the quadratic forms along the kept directions
+     * 1/(lam + c) through the whitened filter and through the full apply, random
+     * vectors consistent between the two and positive, the apply symmetric */
+    lgh_glr_basis_report_t brep;
+
+    PetscCall (lgh_glr_check_basis (glr, c, -1, 4, 2, 4, &brep));
+    check (brep.orth_cols == rep.kept, "basis check: every kept column", (double) brep.orth_cols);
+    check (brep.orth_diag_max < 1e-10 && brep.orth_off_max < 1e-10,
+           "basis check: U^T U = I", PetscMax (brep.orth_diag_max, brep.orth_off_max));
+    check (brep.n_dir == 6 && brep.dir_dev_white_max < 1e-9,
+           "basis check: whitened form = 1/(lam+c)", brep.dir_dev_white_max);
+    check (brep.n_dir_full == brep.n_dir && brep.dir_dev_full_max < 1e-9 && brep.dir_q_full_min > 0.,
+           "basis check: full apply = 1/(lam+c), positive", brep.dir_dev_full_max);
+    check (brep.n_rand == 4 && brep.rand_rel_max < 1e-9 && brep.rand_q1_min > 0.,
+           "basis check: r'H^-1 r = whitened form, positive", brep.rand_rel_max);
+    check (brep.n_sym == 2 && brep.sym_max < 1e-9, "basis check: symmetric", brep.sym_max);
+  }
   if (backend == LGH_GLR_REPLICATED)   /* eigen-residual check */
     check (rep.resid_max < 1e-7 * rep.lam_abs_max, "residual gate",
            rep.resid_max);

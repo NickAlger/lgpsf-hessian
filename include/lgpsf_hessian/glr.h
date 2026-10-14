@@ -294,6 +294,55 @@ int lgh_glr_filter (lgh_glr_t *glr, const double *f_lam, double f_c,
  * pointer, valid until extend/destroy.  Not collective. */
 int lgh_glr_eigs (const lgh_glr_t *glr, int *nkept, const double **lam);
 
+/* ---- diagnostics: is the applied operator what the formulas say? -------
+ * (2026-10-14: the albmap_40 gamma 1e-3 run's DIVERGED_INDEFINITE_PC exits at
+ * the 48,000-column ceiling -- lgpsf-antarctica/H1EXP-HANDOFF.md.)  Three
+ * measurements at a shift c, all collective:
+ *  (1) orthonormality of the kept basis U: the first ncols columns in
+ *      |lam|-descending order (ncols < 0: all) against ALL kept columns, in
+ *      panels through the block primitives.  The applied filter f_c I +
+ *      U diag(f - f_c) U^T is positive in a kept direction only while
+ *      |U^T U - I| stays below c / lam there;
+ *  (2) the applied preconditioner H(c)^{-1} = Z^{-T} M^{1/2} (F + cI)^{-1}
+ *      M^{1/2} Z^{-1} along the n_top stiffest and the n_low lowest kept
+ *      directions: with r_j = Z M^{-1/2} u_j the form r_j^T H(c)^{-1} r_j is
+ *      exactly 1/(lam_j + c); dev_full = q (lam_j + c) - 1 through the full
+ *      apply (lgh_glr_solve: both Z solves) and dev_white through the
+ *      whitened filter alone.  The full probes need the prior's applyZ
+ *      callback (n_dir_full = 0 without it);
+ *  (3) n_rand hashed-Gaussian vectors r: q1 = r^T H(c)^{-1} r (CG's beta)
+ *      against q2 = w^T (F + cI)^{-1} w, w = M^{1/2} Z^{-1} r (the Z-transpose
+ *      consistency), the sign of q1, and the symmetry |r_a^T H^{-1} r_b -
+ *      r_b^T H^{-1} r_a| over consecutive pairs.
+ * Cost: (1) two passes over the basis per 64 columns (every column: ~4 N
+ * kept^2 flops, minutes on 24 nodes at kept 44,000); (2) + (3) a few solves. */
+typedef struct lgh_glr_basis_report
+{
+  int    kept;
+  double c;
+  int    orth_cols;             /* columns checked (the stiffest first)    */
+  double orth_diag_max;         /* max_j |u_j^T u_j - 1|                   */
+  int    orth_diag_arg;
+  double orth_off_max;          /* max_{i != j} |u_i^T u_j|                */
+  int    orth_off_arg_i, orth_off_arg_j;
+  double orth_top_max;          /* both maxima over the n_top stiffest     */
+  int    n_dir, n_dir_full;     /* directions probed; through the full apply */
+  double dir_dev_white_max;     /* max |q (lam + c) - 1|, whitened filter  */
+  double dir_dev_full_max;      /* the same through the full apply         */
+  double dir_q_full_min;        /* min q (lam + c), full apply (< 0: not positive there) */
+  int    dir_arg_full;          /* the direction of dir_dev_full_max       */
+  int    n_rand;
+  double rand_rel_max;          /* max |q1 - q2| / |q2|                    */
+  double rand_q1_min;           /* min q1 / (r^T r)  (< 0: not positive)   */
+  int    n_sym;
+  double sym_max;               /* max relative asymmetry                  */
+  double t_orth, t_probe;       /* seconds                                 */
+}
+lgh_glr_basis_report_t;
+
+int lgh_glr_check_basis (lgh_glr_t *glr, double c, int ncols, int n_top,
+                         int n_low, int n_rand, lgh_glr_basis_report_t *rep);
+
 /* ---- stage 2.5: deflation correction against the TRUE Hessian --------- */
 
 /* The GLR object approximates the misfit Hessian twice over (lgpsf row-fit

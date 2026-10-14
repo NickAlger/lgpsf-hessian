@@ -1342,6 +1342,183 @@ lgh_glr_eigs (const lgh_glr_t *glr, int *nkept, const double **lam)
   return 0;
 }
 
+/* ---- diagnostics (glr.h, 2026-10-14) ---------------------------------- */
+
+/* r <- hashed Gaussian, column k of a (seed, row, col) stream */
+static PetscErrorCode
+lgh_glr_basis_randvec (Vec r, unsigned long seed, PetscInt k)
+{
+  PetscInt            rs, re, i;
+  PetscScalar        *a;
+
+  PetscCall (VecGetOwnershipRange (r, &rs, &re));
+  PetscCall (VecGetArray (r, &a));
+  for (i = rs; i < re; i++) a[i - rs] = lgh_randn_at (seed, i, k);
+  PetscCall (VecRestoreArray (r, &a));
+  return PETSC_SUCCESS;
+}
+
+int
+lgh_glr_check_basis (lgh_glr_t *g, double c, int ncols, int n_top,
+                     int n_low, int n_rand, lgh_glr_basis_report_t *rep)
+{
+  const PetscInt      kept = g->kept;
+  const unsigned long seed = 0xBA515UL;
+  PetscInt            k, j, p0, ncheck;
+  int                 d, nd = 0, have_z;
+  double              t0, *e = NULL, *fl = NULL, *W = NULL, *G = NULL;
+  PetscInt           *dirs = NULL;
+  Vec                 u, v, r, x, y, w, *rr = NULL, *xx = NULL;
+  Mat                 Y = NULL;
+
+  PetscCall (PetscMemzero (rep, sizeof (*rep)));
+  rep->kept = (int) kept;
+  rep->c = c;
+  PetscCheck (c > g->floor, g->comm, PETSC_ERR_ARG_OUTOFRANGE,
+              "lgh_glr_check_basis: shift c must exceed the spectrum floor %g",
+              g->floor);
+  if (kept == 0) return 0;
+
+  /* (1) U^T u_j for the first ncheck columns, in panels: Y = U E_panel
+   *     (Umult_block of identity columns), G = U^T Y (UTmult_block). */
+  ncheck = (ncols < 0 || (PetscInt) ncols > kept) ? kept : (PetscInt) ncols;
+  rep->orth_cols = (int) ncheck;
+  t0 = MPI_Wtime ();
+  if (ncheck > 0) {
+    const PetscInt      bw = PetscMin ((PetscInt) 64, ncheck);
+
+    PetscCall (PetscMalloc2 ((size_t) kept * bw, &W, (size_t) kept * bw, &G));
+    for (p0 = 0; p0 < ncheck; p0 += bw) {
+      const PetscInt      cw = PetscMin (bw, ncheck - p0);
+
+      PetscCall (MatCreateDense (g->comm, g->nloc, PETSC_DECIDE, g->Nglob, cw,
+                                 NULL, &Y));
+      for (k = 0; k < kept * cw; k++) W[k] = 0.;
+      for (j = 0; j < cw; j++) W[(p0 + j) + (size_t) j * kept] = 1.;
+      PetscCall (lgh_glr_Umult_block (g, W, Y, PETSC_FALSE));
+      PetscCall (lgh_glr_UTmult_block (g, Y, G));
+      for (j = 0; j < cw; j++) {
+        const PetscInt      jj = p0 + j;
+
+        for (k = 0; k < kept; k++) {
+          const double        a = fabs (G[k + (size_t) j * kept]
+                                        - (k == jj ? 1. : 0.));
+
+          if (k == jj) {
+            if (a > rep->orth_diag_max) {
+              rep->orth_diag_max = a; rep->orth_diag_arg = (int) jj;
+            }
+          }
+          else if (a > rep->orth_off_max) {
+            rep->orth_off_max = a;
+            rep->orth_off_arg_i = (int) k; rep->orth_off_arg_j = (int) jj;
+          }
+          if (jj < (PetscInt) n_top && a > rep->orth_top_max)
+            rep->orth_top_max = a;
+        }
+      }
+      PetscCall (MatDestroy (&Y));
+    }
+    PetscCall (PetscFree2 (W, G));
+  }
+  rep->t_orth = MPI_Wtime () - t0;
+
+  /* (2) the kept directions: u = U e_j; the whitened form u^T filter(u);
+   *     r = Z M^{-1/2} u and the full apply r^T H(c)^{-1} r */
+  t0 = MPI_Wtime ();
+  have_z = (g->prior->cb.applyZ != NULL);
+  PetscCall (PetscMalloc3 (kept, &e, kept, &fl, (size_t) n_top + n_low, &dirs));
+  for (k = 0; k < kept; k++) fl[k] = 1. / (g->lam[k] + c);
+  for (d = 0; d < n_top && (PetscInt) d < kept; d++) dirs[nd++] = d;
+  for (d = 0; d < n_low && kept - 1 - d >= (PetscInt) n_top; d++)
+    dirs[nd++] = kept - 1 - d;
+  rep->n_dir = nd;
+  rep->dir_q_full_min = HUGE_VAL;
+  PetscCall (VecDuplicate (g->w1, &u));
+  PetscCall (VecDuplicate (g->w1, &v));
+  PetscCall (VecDuplicate (g->w1, &r));
+  PetscCall (VecDuplicate (g->w1, &x));
+  PetscCall (VecDuplicate (g->w1, &y));
+  PetscCall (VecDuplicate (g->w1, &w));
+  for (d = 0; d < nd; d++) {
+    const PetscInt      jd = dirs[d];
+    const double        lc = g->lam[jd] + c;
+    PetscScalar         q;
+    double              dev;
+
+    for (k = 0; k < kept; k++) e[k] = (k == jd) ? 1. : 0.;
+    PetscCall (lgh_glr_Umult (g, e, u, PETSC_FALSE));             /* u = u_j */
+    PetscCall (lgh_glr_filter_core (g, fl, 1. / c, u, y));
+    PetscCall (VecDot (u, y, &q));
+    dev = fabs ((double) q * lc - 1.);
+    if (dev > rep->dir_dev_white_max) rep->dir_dev_white_max = dev;
+    if (have_z) {
+      PetscCall (VecPointwiseMult (v, u, g->prior->minvsqrt));     /* M^-1/2 u */
+      PetscCall (lgh_prior_applyZ_vec (g->prior, v, r));           /* r = Z v  */
+      PetscCall (lgh_glr_solve (g, c, r, x));
+      PetscCall (VecDot (r, x, &q));
+      dev = fabs ((double) q * lc - 1.);
+      if (dev > rep->dir_dev_full_max) {
+        rep->dir_dev_full_max = dev; rep->dir_arg_full = (int) jd;
+      }
+      if ((double) q * lc < rep->dir_q_full_min) rep->dir_q_full_min = (double) q * lc;
+      rep->n_dir_full++;
+    }
+  }
+  if (!have_z) rep->dir_q_full_min = 0.;
+
+  /* (3) random vectors: q1 = r^T H^-1 r vs q2 = w^T filter(w); sign; symmetry */
+  rep->n_rand = n_rand;
+  rep->rand_q1_min = HUGE_VAL;
+  if (n_rand > 0) {
+    PetscCall (PetscMalloc2 (n_rand, &rr, n_rand, &xx));
+    for (d = 0; d < n_rand; d++) {
+      PetscScalar         q1, q2, nrm;
+
+      PetscCall (VecDuplicate (g->w1, &rr[d]));
+      PetscCall (VecDuplicate (g->w1, &xx[d]));
+      PetscCall (lgh_glr_basis_randvec (rr[d], seed, (PetscInt) d));
+      PetscCall (lgh_glr_solve (g, c, rr[d], xx[d]));
+      PetscCall (VecDot (rr[d], xx[d], &q1));
+      PetscCall (VecDot (rr[d], rr[d], &nrm));
+      PetscCall (lgh_prior_solveZ_vec (g->prior, rr[d], w));
+      PetscCall (VecPointwiseMult (w, w, g->prior->msqrt));        /* w = M^1/2 Z^-1 r */
+      PetscCall (lgh_glr_filter_core (g, fl, 1. / c, w, y));
+      PetscCall (VecDot (w, y, &q2));
+      if (fabs ((double) q2) > 0.) {
+        const double        rel = fabs ((double) (q1 - q2)) / fabs ((double) q2);
+
+        if (rel > rep->rand_rel_max) rep->rand_rel_max = rel;
+      }
+      if ((double) nrm > 0. && (double) (q1 / nrm) < rep->rand_q1_min)
+        rep->rand_q1_min = (double) (q1 / nrm);
+    }
+    for (d = 0; d + 1 < n_rand; d += 2) {
+      PetscScalar         ab, ba;
+      double              s;
+
+      PetscCall (VecDot (rr[d], xx[d + 1], &ab));
+      PetscCall (VecDot (rr[d + 1], xx[d], &ba));
+      s = fabs ((double) (ab - ba)) / PetscMax (fabs ((double) ab), 1e-300);
+      if (s > rep->sym_max) rep->sym_max = s;
+      rep->n_sym++;
+    }
+    for (d = 0; d < n_rand; d++) {
+      PetscCall (VecDestroy (&rr[d]));
+      PetscCall (VecDestroy (&xx[d]));
+    }
+    PetscCall (PetscFree2 (rr, xx));
+  }
+  else rep->rand_q1_min = 0.;
+  rep->t_probe = MPI_Wtime () - t0;
+
+  PetscCall (VecDestroy (&u)); PetscCall (VecDestroy (&v));
+  PetscCall (VecDestroy (&r)); PetscCall (VecDestroy (&x));
+  PetscCall (VecDestroy (&y)); PetscCall (VecDestroy (&w));
+  PetscCall (PetscFree3 (e, fl, dirs));
+  return 0;
+}
+
 int
 lgh_glr_solve (lgh_glr_t *glr, double c, Vec rhs, Vec x)
 {
