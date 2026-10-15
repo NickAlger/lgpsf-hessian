@@ -12,7 +12,8 @@
  *
  * Scenario A (SPD B): spectrum, next_abs, residual gate, logdet, solve
  * o apply identity, factor identities (G G^T = H(c), G^{-T} G^T = I),
- * sample == GINVT, pow/filter consistency, extend == one-shot.
+ * sample == GINVT, pow/filter consistency, extend == one-shot (both
+ * extension modes; the deflated one's old x new block of Q^T Q).
  * Scenario B (indefinite B): FLIP treatment — kept spectrum matches
  * |lambda| of the dense oracle, negative count, logdet over flipped
  * values.
@@ -347,26 +348,47 @@ run_scenario (int spd, lgh_glr_backend_t backend)
     }
   }
 
-  /* extend(10) from ell=30 == one-shot ell=40 (deterministic sketch) */
-  {
+  /* extend(10) from ell=30 == one-shot ell=40 (deterministic sketch).
+   * extend_deflate = 0: the one-shot build exactly (span-equivalent).
+   * extend_deflate = 1 (the default): a deflated block-Krylov extension,
+   * not span-equivalent in general -- but B has exact rank 10 < 30, so the
+   * old basis already holds range(F) and both must reproduce the one-shot
+   * spectrum; the deflated one must also leave the old x new block of
+   * Q^T Q at roundoff (check_extend).  2026-10-15.                        */
+  for (int defl = 0; defl < 2; defl++) {
     lgh_glr_opts_t      go2 = go;
     int                 nk1, nk2;
     const double       *l1, *l2;
     double              worst = 0.;
+    char                what[128];
 
     go2.ell = 30;
+    go2.extend_deflate = defl;
+    go2.check_extend = 1;
     PetscCall (lgh_glr_compute (B, prior, &go2, &glr2, &rep2));
     PetscCall (lgh_glr_extend (glr2, 10, &rep2));
-    if (backend == LGH_GLR_SCALAPACK)   /* replicated: full rebuild */
-      check (rep2.calls_max[LGH_GT_MATVEC] == 30.,
-             "extend: 3 k_new MatMults (the new columns only)",
-             rep2.calls_max[LGH_GT_MATVEC]);
+    if (backend == LGH_GLR_SCALAPACK) {  /* replicated: full rebuild */
+      snprintf (what, sizeof what, "extend (deflate %d): 3 k_new MatMults (the new columns only)", defl);
+      check (rep2.calls_max[LGH_GT_MATVEC] == 30., what, rep2.calls_max[LGH_GT_MATVEC]);
+      snprintf (what, sizeof what, "extend (deflate %d): old x new block of Q^T Q measured", defl);
+      check (rep2.ext_orth_max >= 0., what, rep2.ext_orth_max);
+      if (defl) {
+        snprintf (what, sizeof what, "extend (deflate %d): old x new block of Q^T Q at roundoff", defl);
+        check (rep2.ext_orth_max < 1e-12, what, rep2.ext_orth_max);
+      }
+    }
+    else {
+      snprintf (what, sizeof what, "extend (deflate %d, replicated): no extension check", defl);
+      check (rep2.ext_orth_max == -1., what, rep2.ext_orth_max);
+    }
     PetscCall ((PetscErrorCode) lgh_glr_eigs (glr, &nk1, &l1));
     PetscCall ((PetscErrorCode) lgh_glr_eigs (glr2, &nk2, &l2));
-    check (nk1 == nk2, "extend: kept matches one-shot", (double) nk2);
+    snprintf (what, sizeof what, "extend (deflate %d): kept matches one-shot", defl);
+    check (nk1 == nk2, what, (double) nk2);
     for (int i = 0; i < nk1 && i < nk2; i++)
       worst = fmax (worst, fabs (l1[i] - l2[i]) / fabs (l1[i]));
-    check (worst < 1e-10, "extend: spectrum matches one-shot", worst);
+    snprintf (what, sizeof what, "extend (deflate %d): spectrum matches one-shot", defl);
+    check (worst < 1e-10, what, worst);
     lgh_glr_destroy (glr2);
   }
 
@@ -380,6 +402,7 @@ run_scenario (int spd, lgh_glr_backend_t backend)
     double              worst = 0.;
 
     go3.ell = 20;
+    go3.extend_deflate = 0;   /* the span-equivalent extension (the default deflates) */
     PetscCall (lgh_glr_compute (B, prior, &go3, &glr2, &rep2));
     PetscCall (lgh_glr_extend (glr2, 20, &rep2));
     if (backend == LGH_GLR_SCALAPACK)

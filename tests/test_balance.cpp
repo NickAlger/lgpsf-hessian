@@ -258,11 +258,13 @@ test_modes (lgh_glr_backend_t backend)
     check (top <= 1.0001 * rep[3].t_total_mean + 1e-6 && top >= 0.5 * rep[3].t_total_mean,
            "breakdown: top-level rows still partition the build", top / rep[3].t_total_mean);
   }
-  /* extend reuses the balanced view: 30 + 10 == one-shot 40 */
+  /* extend reuses the balanced view: 30 + 10 == one-shot 40 (the span-equivalent
+   * extension, extend_deflate = 0: B here has full rank, so the default deflated
+   * extension is a different -- block-Krylov -- subspace and its spectrum differs) */
   {
     lgh_glr_opts_t      o = go;
     int n1, n2; const double *l1, *l2; double worst = 0.;
-    o.balance = 1; o.matvec_block = 1; o.ell = 30;
+    o.balance = 1; o.matvec_block = 1; o.ell = 30; o.extend_deflate = 0;
     PetscCall (lgh_glr_compute (B, prior, &o, &ge, &rx));
     PetscCall (lgh_glr_extend (ge, 10, &rx));
     if (backend == LGH_GLR_SCALAPACK)

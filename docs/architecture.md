@@ -126,10 +126,14 @@ implicit `U` (the object dispatches by representation from then on).
   serves every shift; rescaling the regularization rescales the spectrum exactly
   (see the design record).
 - **Determinism.** Hashed probes and hashed sketch columns are pure functions of
-  `(seed, global index, column)`: fits and builds are partition-independent, and
-  `lgh_glr_extend` is *exactly* the build you would have done with the wider
-  sketch. Floating-point bit-identity holds within a build, not across
-  compilers/flags (see `platform-notes.md`).
+  `(seed, global index, column)`: fits and builds are partition-independent.
+  `lgh_glr_extend` with `extend_deflate = 0` is *exactly* the build you would
+  have done with the wider sketch; the default (`extend_deflate = 1`, since
+  2026-10-15) deflates the new block's power passes against the existing basis
+  -- a block-Krylov extension, because the span-equivalent one puts its new
+  columns numerically inside the old span once the old basis holds the
+  dominant modes (`glr.h`, `lgh_glr_extend`). Floating-point bit-identity holds
+  within a build, not across compilers/flags (see `platform-notes.md`).
 
 ## Layering and dependencies
 

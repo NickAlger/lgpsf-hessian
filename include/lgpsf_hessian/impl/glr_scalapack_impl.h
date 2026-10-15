@@ -156,6 +156,57 @@ lgh_glrd_panel_cholqr (lgh_glr_t *g, double *pa, PetscInt nloc, PetscInt lda,
   return PETSC_SUCCESS;
 }
 
+/* Y[:, 0:m] against the first k columns of Q, in column panels of width b
+ * (both N x . slabs on the same row layout, local arrays with their LDAs):
+ * subtract = 1: Y <- Y - Q_k (Q_k^T Y), one classical Gram-Schmidt sweep
+ * (timed as orthogonalization); subtract = 0: only *amax = max |Q_k^T Y|
+ * (timed as a check).  amax may be NULL.                                 */
+static PetscErrorCode
+lgh_glrd_against_old (lgh_glr_t *g, const double *qa, PetscInt ldq, int k,
+                      double *ya, PetscInt ldy, int m, int b, int subtract,
+                      double *amax)
+{
+  const PetscInt      nloc = g->nloc;
+  const int           tl = subtract ? LGH_GT_ORTH_LOCAL : LGH_GT_CHECK;
+  const int           tr = subtract ? LGH_GT_ORTH_RED : LGH_GT_CHECK;
+  double             *C, *Cl, mx = 0.;
+  int                 p0, i;
+
+  if (k <= 0 || m <= 0) { if (amax != NULL) *amax = 0.; return PETSC_SUCCESS; }
+  PetscCall (PetscMalloc2 ((size_t) k * b, &C, (size_t) k * b, &Cl));
+  for (p0 = 0; p0 < m; p0 += b) {
+    int                 bm = (int) nloc, bk = k, bw = PetscMin (b, m - p0);
+    int                 bldq = (int) ldq, bldy = (int) ldy;
+    double              one = 1.0, zero = 0.0, mone = -1.0;
+
+    PetscCall (lgh_gt_begin (g, tl));
+    if (nloc > 0) {
+      LGH_BLAS_DGEMM ("T", "N", &bk, &bw, &bm, &one, qa, &bldq,
+                      ya + (size_t) p0 * ldy, &bldy, &zero, Cl, &bk);
+    }
+    else { for (i = 0; i < k * bw; i++) Cl[i] = 0.; }
+    PetscCall (lgh_gt_end (g, tl));
+    PetscCall (lgh_gt_begin (g, tr));
+    PetscCallMPI (MPI_Allreduce (Cl, C, k * bw, MPI_DOUBLE, MPI_SUM, g->comm));
+    PetscCall (lgh_gt_end (g, tr));
+    if (subtract) {
+      lgh_gt_count (g, LGH_GT_ORTH_RED, 8. * k * bw, 1.);
+      PetscCall (lgh_gt_begin (g, tl));
+      if (nloc > 0) {
+        LGH_BLAS_DGEMM ("N", "N", &bm, &bw, &bk, &mone, qa, &bldq, C, &bk,
+                        &one, ya + (size_t) p0 * ldy, &bldy);
+      }
+      PetscCall (lgh_gt_end (g, tl));
+    }
+    else {
+      for (i = 0; i < k * bw; i++) mx = PetscMax (mx, fabs (C[i]));
+    }
+  }
+  PetscCall (PetscFree2 (C, Cl));
+  if (amax != NULL) *amax = mx;    /* replicated: C is the reduced block */
+  return PETSC_SUCCESS;
+}
+
 /* Orthonormalize columns [p_start, ell) of Y against columns [0, p_start)
  * (assumed already orthonormal) and each other; p_start = 0 is the full
  * factorization.  Used with p_start = ell1 for incremental extension.   */
@@ -602,6 +653,7 @@ lgh_glrd_build (lgh_glr_t *g, lgh_glr_report_t *rep)
   int                 i, j, p;
 
   PetscCall (PetscMemzero (rep, sizeof (*rep)));
+  rep->ext_orth_max = -1.;
   PetscCall (lgh_gt_begin (g, LGH_GT_SETUP));
   PetscCall (PetscNew (&s));
   g->dist = s;
@@ -794,7 +846,11 @@ lgh_glrd_build (lgh_glr_t *g, lgh_glr_report_t *rep)
 /* ------------------------------------------------------------------ */
 /* Incremental rank growth: fresh hashed columns continue the sketch
  * (deterministic, partition-independent), q power passes on the new block
- * (internal orth only — span-equivalent to one-shot), BCGS2 against the
+ * (opts.extend_deflate = 1, the default: each pass's F X projected twice
+ * against the existing Q before its orthonormalization -- the passes act on
+ * the complement of span(Q_old); 0: internal orth only, span-equivalent to
+ * one-shot in exact arithmetic but numerically inside span(Q_old) once Q_old
+ * holds the dominant modes, see glr.h), BCGS2 against the
  * existing Q, border the stored A with C = Q_all^T (F Q_new) (the
  * (new,old) block comes from (old,new)^T by symmetry of F), rebuild the
  * block-cyclic T from the column store, re-eigensolve, re-select.       */
@@ -810,6 +866,7 @@ lgh_glrd_extend_incr (lgh_glr_t *g, int k_new, lgh_glr_report_t *rep)
   int                 i, j, jj, p, p0, lc;
 
   PetscCall (PetscMemzero (rep, sizeof (*rep)));
+  rep->ext_orth_max = -1.;
 
   /* Q grows: a new N x ell2 slab takes the old columns, and the OLD Q is
    * destroyed right there -- before the three k_new-wide slabs of the new
@@ -863,12 +920,30 @@ lgh_glrd_extend_incr (lgh_glr_t *g, int k_new, lgh_glr_report_t *rep)
     lgh_gt_count (g, LGH_GT_OMEGA, 0., (double) k_new);
   }
 
-  /* power passes on the new block (internal orth only) */
+  /* power passes on the new block: deflated against the old basis
+   * (opts.extend_deflate, the default) or internal orth only            */
   t0 = MPI_Wtime ();
   PetscCall (lgh_glr_apply_F_block (g, Qn, Yn, Wn));
   rep->t_operator += MPI_Wtime () - t0;
   for (p = 0; p < g->opts.q_power; p++) {
     t0 = MPI_Wtime ();
+    if (g->opts.extend_deflate) {   /* Yn <- (I - Q_old Q_old^T)^2 Yn: twice is enough here, Yn's
+                                     * new columns are then orthonormalized among themselves */
+      const PetscScalar  *qb;
+      PetscScalar        *yn;
+      PetscInt            ldb, ldn;
+      int                 sw;
+
+      PetscCall (MatDenseGetLDA (Qb, &ldb));
+      PetscCall (MatDenseGetLDA (Yn, &ldn));
+      PetscCall (MatDenseGetArrayRead (Qb, &qb));
+      PetscCall (MatDenseGetArray (Yn, &yn));
+      for (sw = 0; sw < 2; sw++)
+        PetscCall (lgh_glrd_against_old (g, qb, ldb, ell1, yn, ldn, k_new,
+                                         panel_b, 1, NULL));
+      PetscCall (MatDenseRestoreArray (Yn, &yn));
+      PetscCall (MatDenseRestoreArrayRead (Qb, &qb));
+    }
     PetscCall (lgh_glrd_bcgs2 (g, Yn, k_new, panel_b, 0));
     rep->t_dense += MPI_Wtime () - t0;
     PetscCall (lgh_gt_begin (g, LGH_GT_COPY));
@@ -901,6 +976,16 @@ lgh_glrd_extend_incr (lgh_glr_t *g, int k_new, lgh_glr_report_t *rep)
   t0 = MPI_Wtime ();
   PetscCall (lgh_glrd_bcgs2 (g, Qb, ell2, panel_b, ell1));
   rep->t_dense += MPI_Wtime () - t0;
+  if (g->opts.check_extend) {      /* the old x new block of Q^T Q - I */
+    PetscScalar        *qb;
+    PetscInt            ldb;
+
+    PetscCall (MatDenseGetLDA (Qb, &ldb));
+    PetscCall (MatDenseGetArray (Qb, &qb));
+    PetscCall (lgh_glrd_against_old (g, qb, ldb, ell1, qb + (size_t) ell1 * ldb,
+                                     ldb, k_new, panel_b, 0, &rep->ext_orth_max));
+    PetscCall (MatDenseRestoreArray (Qb, &qb));
+  }
 
   /* one more F apply on the orthonormalized new block; then the border
    * columns Cnew = Q_all^T (F Q_new), reduced panel by panel (never a whole

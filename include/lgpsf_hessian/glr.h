@@ -96,6 +96,20 @@ typedef struct lgh_glr_opts
   int               matvec_tile;      /* columns per tile (256): bounds the  *
                                        * balanced layout's scratch and       *
                                        * PETSc's ghost buffer                */
+  /* Incremental extension (lgh_glr_extend; SCALAPACK backend -- the
+   * replicated backend rebuilds at the wider ell and ignores both).       */
+  int               extend_deflate;   /* 1 (default): the new block's power *
+                                       * passes run on the complement of    *
+                                       * the existing basis -- each pass's  *
+                                       * F X is projected against Q_old     *
+                                       * (twice) before its orthonormal-    *
+                                       * ization.  0: internal orth only    *
+                                       * (before 2026-10-15).  See          *
+                                       * lgh_glr_extend.                    */
+  int               check_extend;     /* 1: after an extension, measure     *
+                                       * max |Q_old^T Q_new| (report->      *
+                                       * ext_orth_max; one more projection  *
+                                       * sweep's GEMMs).  0 (default)       */
 }
 lgh_glr_opts_t;
 
@@ -173,6 +187,11 @@ typedef struct lgh_glr_report
   double rowsBal_max;           /* rows per rank there, max                */
   double bal_predicted;         /* the split's predicted weight max/mean   */
   int    bal_floor;             /* 1: the longest row set the split's cap  */
+  /* an extension's orthogonality (opts.check_extend; -1 when not measured):
+   * max |Q_old^T Q_new| over the old x new block after the new columns'
+   * orthogonalization -- O(eps) when the new columns are well separated
+   * from the old span; larger when they were numerically inside it      */
+  double ext_orth_max;
 }
 lgh_glr_report_t;
 
@@ -185,10 +204,30 @@ int lgh_glr_compute (Mat B, lgh_prior_t *prior, const lgh_glr_opts_t *opts,
                      lgh_glr_t **glr, lgh_glr_report_t *report);
 
 /* Incremental rank growth: extend the sketch by k_new deterministic hashed
- * columns (continuing the same sequence — extension is exactly the build
- * you would have done at ell + k_new), re-eigensolve, re-select.  Turns the
- * unknown-rank gamble into a stopping criterion: grow until
+ * columns (continuing the same sequence), re-eigensolve, re-select.  Turns
+ * the unknown-rank gamble into a stopping criterion: grow until
  * report->next_abs clears trunc_abs with margin.
+ *
+ * The new block's power passes (opts.q_power) and the old basis Q_old:
+ *   opts.extend_deflate = 1 (default): each pass orthonormalizes
+ *     (I - Q_old Q_old^T) F X, so the new columns are drawn from F's action
+ *     on the complement of span(Q_old) -- a block-Krylov extension, NOT
+ *     span-equivalent to the one-shot build at ell + k_new (it is at least as
+ *     good: the old span is kept and the new columns target what it misses).
+ *   opts.extend_deflate = 0: internal orthonormalization only; in exact
+ *     arithmetic exactly the one-shot build at ell + k_new.  In floating
+ *     point, once the old basis holds the dominant modes the new block
+ *     F^{q+1} Omega_new carries its new information at relative size
+ *     (lam_ell / lam_max)^{q+1}, and with an ill-conditioned prior F's
+ *     rounding lands in the stiff, already-captured directions: the new
+ *     columns are then numerically inside span(Q_old), BCGS2 cannot make
+ *     them orthogonal to it to O(eps), and the kept basis U loses the
+ *     orthonormality that the positivity of every (F + cI)^{-1} operation
+ *     depends on (a defect above ~c / sqrt(lam_i lam_j) between two kept
+ *     directions makes lgh_glr_solve indefinite; 2026-10-15, the albmap_40
+ *     gamma 1e-3 run's DIVERGED_INDEFINITE_PC).
+ * opts.check_extend = 1 measures the old x new block (report->ext_orth_max).
+ * The replicated backend rebuilds at ell + k_new (both options moot).
  * Not available after lgh_glr_correct (correct last; see below). */
 int lgh_glr_extend (lgh_glr_t *glr, int k_new, lgh_glr_report_t *report);
 
@@ -201,8 +240,10 @@ int lgh_glr_extend (lgh_glr_t *glr, int k_new, lgh_glr_report_t *report);
  * the rung it stops at (fixed_ladder = 1, the default since 2026-10-12: the
  * memory of every rung is then known in advance).  With fixed_ladder = 0 the
  * older rule applies: ell grows by `growth` only while saturated (kept == ell)
- * and otherwise jumps to ceil(1.1 * kept / rho).  Each step is lgh_glr_extend,
- * so the result is the one-shot build at the final ell (span-equivalent).
+ * and otherwise jumps to ceil(1.1 * kept / rho).  Each step is lgh_glr_extend
+ * (with opts.extend_deflate = 0 the result is the one-shot build at the final
+ * ell, span-equivalent; with the default 1 each rung is a deflated
+ * block-Krylov extension of the previous one).
  * opts->ell is ignored.  on_step (optional) is called after every
  * build/extension on every rank. */
 typedef void (*lgh_glr_adapt_step_fn) (int step, int ell,

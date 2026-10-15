@@ -529,6 +529,8 @@ lgh_glr_opts_default (void)
   o.balance_row_cost = 1;
   o.matvec_block = 0;
   o.matvec_tile = 256;
+  o.extend_deflate = 1;
+  o.check_extend = 0;
   return o;
 }
 
@@ -668,6 +670,7 @@ lgh_glr_build_replicated (lgh_glr_t *g, lgh_glr_report_t *rep)
   PetscReal           absmax, cut, t0;
 
   PetscCall (PetscMemzero (rep, sizeof (*rep)));
+  rep->ext_orth_max = -1.;
   PetscCall (MatCreateDense (comm, nloc, PETSC_DECIDE, Nglob, ell, NULL, &Y));
   PetscCall (MatCreateDense (comm, nloc, PETSC_DECIDE, Nglob, ell, NULL, &Q));
   PetscCall (MatCreateDense (comm, nloc, PETSC_DECIDE, Nglob, ell, NULL, &W));
@@ -936,12 +939,13 @@ lgh_glr_extend (lgh_glr_t *glr, int k_new, lgh_glr_report_t *report)
 {
   lgh_glr_report_t    local_rep;
 
-  /* The hashed sketch makes extension EXACTLY "the build you would have
-   * done at ell + k_new" (columns are a pure function of (seed, i, j), so
-   * the first ell columns of the wider sketch are the same draws).  The
-   * ScaLAPACK backend realizes it incrementally (reuses Q, borders T);
-   * the replicated backend recomputes at the wider ell — correct, not
-   * incremental-cost.                                                   */
+  /* The hashed sketch's columns are a pure function of (seed, i, j), so
+   * the new columns continue the same sequence.  The ScaLAPACK backend
+   * extends incrementally (reuses Q, borders T); with opts.extend_deflate
+   * = 0 that is EXACTLY "the build you would have done at ell + k_new",
+   * with the default 1 the new block's power passes are deflated against
+   * the old basis (glr.h).  The replicated backend recomputes at the wider
+   * ell — correct, not incremental-cost, and the one-shot build.        */
   PetscCheck (!glr->corrected, glr->comm, PETSC_ERR_ORDER,
               "lgh_glr_extend: not available after lgh_glr_correct (the "
               "sketch no longer represents the corrected operator) — "
