@@ -98,14 +98,13 @@ typedef struct lgh_glr_opts
                                        * PETSc's ghost buffer                */
   /* Incremental extension (lgh_glr_extend; SCALAPACK backend -- the
    * replicated backend rebuilds at the wider ell and ignores both).       */
-  int               extend_deflate;   /* 1 (default): the new block's power *
-                                       * passes run on the complement of    *
-                                       * the existing basis -- each pass's  *
-                                       * F X is projected against Q_old     *
-                                       * (twice) before its orthonormal-    *
-                                       * ization.  0: internal orth only    *
-                                       * (before 2026-10-15).  See          *
-                                       * lgh_glr_extend.                    */
+  int               extend_deflate;   /* 1: the new block's power passes    *
+                                       * run on the complement of the       *
+                                       * existing basis -- each pass's F X  *
+                                       * is projected against Q_old (twice) *
+                                       * before its orthonormalization.     *
+                                       * 0 (default): internal orth only.   *
+                                       * See lgh_glr_extend.                */
   int               check_extend;     /* 1: after an extension, measure     *
                                        * max |Q_old^T Q_new| (report->      *
                                        * ext_orth_max; one more projection  *
@@ -209,23 +208,19 @@ int lgh_glr_compute (Mat B, lgh_prior_t *prior, const lgh_glr_opts_t *opts,
  * report->next_abs clears trunc_abs with margin.
  *
  * The new block's power passes (opts.q_power) and the old basis Q_old:
- *   opts.extend_deflate = 1 (default): each pass orthonormalizes
- *     (I - Q_old Q_old^T) F X, so the new columns are drawn from F's action
- *     on the complement of span(Q_old) -- a block-Krylov extension, NOT
- *     span-equivalent to the one-shot build at ell + k_new (it is at least as
- *     good: the old span is kept and the new columns target what it misses).
- *   opts.extend_deflate = 0: internal orthonormalization only; in exact
- *     arithmetic exactly the one-shot build at ell + k_new.  In floating
- *     point, once the old basis holds the dominant modes the new block
- *     F^{q+1} Omega_new carries its new information at relative size
- *     (lam_ell / lam_max)^{q+1}, and with an ill-conditioned prior F's
- *     rounding lands in the stiff, already-captured directions: the new
- *     columns are then numerically inside span(Q_old), BCGS2 cannot make
- *     them orthogonal to it to O(eps), and the kept basis U loses the
- *     orthonormality that the positivity of every (F + cI)^{-1} operation
- *     depends on (a defect above ~c / sqrt(lam_i lam_j) between two kept
- *     directions makes lgh_glr_solve indefinite; 2026-10-15, the albmap_40
- *     gamma 1e-3 run's DIVERGED_INDEFINITE_PC).
+ *   opts.extend_deflate = 0 (default): internal orthonormalization only; in
+ *     exact arithmetic exactly the one-shot build at ell + k_new.
+ *   opts.extend_deflate = 1: each pass orthonormalizes (I - Q_old Q_old^T) F X,
+ *     so the new columns are drawn from F's action on the complement of
+ *     span(Q_old) -- a block-Krylov extension, NOT span-equivalent to the
+ *     one-shot build.  Motivated by a laptop model in which the
+ *     span-equivalent extension left late-rung columns numerically inside
+ *     span(Q_old) (|Q_old^T Q_new| 2.3e-9 vs 3.6e-15 one-shot, CHOLMOD prior
+ *     with delta 1e-8, lam_max 1.78e8).  At production scale (albmap_40,
+ *     gamma 1e-3, 48k columns, 2026-10-16) the old x new block measured
+ *     1e-16 with either setting, and the kept basis's 2e-2 defect seen there
+ *     is present with either setting: this option is not its cure, hence
+ *     OFF by default (on 2026-10-15 / 6182183 it was briefly the default).
  * opts.check_extend = 1 measures the old x new block (report->ext_orth_max).
  * The replicated backend rebuilds at ell + k_new (both options moot).
  * Not available after lgh_glr_correct (correct last; see below). */
@@ -241,8 +236,8 @@ int lgh_glr_extend (lgh_glr_t *glr, int k_new, lgh_glr_report_t *report);
  * memory of every rung is then known in advance).  With fixed_ladder = 0 the
  * older rule applies: ell grows by `growth` only while saturated (kept == ell)
  * and otherwise jumps to ceil(1.1 * kept / rho).  Each step is lgh_glr_extend
- * (with opts.extend_deflate = 0 the result is the one-shot build at the final
- * ell, span-equivalent; with the default 1 each rung is a deflated
+ * (with opts.extend_deflate = 0, the default, the result is the one-shot build
+ * at the final ell, span-equivalent; with 1 each rung is a deflated
  * block-Krylov extension of the previous one).
  * opts->ell is ignored.  on_step (optional) is called after every
  * build/extension on every rank. */

@@ -846,11 +846,10 @@ lgh_glrd_build (lgh_glr_t *g, lgh_glr_report_t *rep)
 /* ------------------------------------------------------------------ */
 /* Incremental rank growth: fresh hashed columns continue the sketch
  * (deterministic, partition-independent), q power passes on the new block
- * (opts.extend_deflate = 1, the default: each pass's F X projected twice
- * against the existing Q before its orthonormalization -- the passes act on
- * the complement of span(Q_old); 0: internal orth only, span-equivalent to
- * one-shot in exact arithmetic but numerically inside span(Q_old) once Q_old
- * holds the dominant modes, see glr.h), BCGS2 against the
+ * (opts.extend_deflate = 0, the default: internal orth only, span-equivalent
+ * to one-shot; 1: each pass's F X projected twice against the existing Q
+ * before its orthonormalization -- the passes act on the complement of
+ * span(Q_old), see glr.h), BCGS2 against the
  * existing Q, border the stored A with C = Q_all^T (F Q_new) (the
  * (new,old) block comes from (old,new)^T by symmetry of F), rebuild the
  * block-cyclic T from the column store, re-eigensolve, re-select.       */
@@ -920,8 +919,8 @@ lgh_glrd_extend_incr (lgh_glr_t *g, int k_new, lgh_glr_report_t *rep)
     lgh_gt_count (g, LGH_GT_OMEGA, 0., (double) k_new);
   }
 
-  /* power passes on the new block: deflated against the old basis
-   * (opts.extend_deflate, the default) or internal orth only            */
+  /* power passes on the new block: internal orth only (the default) or
+   * deflated against the old basis (opts.extend_deflate)                */
   t0 = MPI_Wtime ();
   PetscCall (lgh_glr_apply_F_block (g, Qn, Yn, Wn));
   rep->t_operator += MPI_Wtime () - t0;

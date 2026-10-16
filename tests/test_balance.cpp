@@ -259,8 +259,8 @@ test_modes (lgh_glr_backend_t backend)
            "breakdown: top-level rows still partition the build", top / rep[3].t_total_mean);
   }
   /* extend reuses the balanced view: 30 + 10 == one-shot 40 (the span-equivalent
-   * extension, extend_deflate = 0: B here has full rank, so the default deflated
-   * extension is a different -- block-Krylov -- subspace and its spectrum differs) */
+   * extension, extend_deflate = 0, the default: B here has full rank, so the
+   * deflated extension would be a different -- block-Krylov -- subspace) */
   {
     lgh_glr_opts_t      o = go;
     int n1, n2; const double *l1, *l2; double worst = 0.;

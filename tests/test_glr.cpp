@@ -350,7 +350,7 @@ run_scenario (int spd, lgh_glr_backend_t backend)
 
   /* extend(10) from ell=30 == one-shot ell=40 (deterministic sketch).
    * extend_deflate = 0: the one-shot build exactly (span-equivalent).
-   * extend_deflate = 1 (the default): a deflated block-Krylov extension,
+   * extend_deflate = 1 (opt-in): a deflated block-Krylov extension,
    * not span-equivalent in general -- but B has exact rank 10 < 30, so the
    * old basis already holds range(F) and both must reproduce the one-shot
    * spectrum; the deflated one must also leave the old x new block of
@@ -402,7 +402,7 @@ run_scenario (int spd, lgh_glr_backend_t backend)
     double              worst = 0.;
 
     go3.ell = 20;
-    go3.extend_deflate = 0;   /* the span-equivalent extension (the default deflates) */
+    go3.extend_deflate = 0;   /* the span-equivalent extension (the default) */
     PetscCall (lgh_glr_compute (B, prior, &go3, &glr2, &rep2));
     PetscCall (lgh_glr_extend (glr2, 20, &rep2));
     if (backend == LGH_GLR_SCALAPACK)

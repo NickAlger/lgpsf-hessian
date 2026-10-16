@@ -529,7 +529,7 @@ lgh_glr_opts_default (void)
   o.balance_row_cost = 1;
   o.matvec_block = 0;
   o.matvec_tile = 256;
-  o.extend_deflate = 1;
+  o.extend_deflate = 0;
   o.check_extend = 0;
   return o;
 }
@@ -942,8 +942,8 @@ lgh_glr_extend (lgh_glr_t *glr, int k_new, lgh_glr_report_t *report)
   /* The hashed sketch's columns are a pure function of (seed, i, j), so
    * the new columns continue the same sequence.  The ScaLAPACK backend
    * extends incrementally (reuses Q, borders T); with opts.extend_deflate
-   * = 0 that is EXACTLY "the build you would have done at ell + k_new",
-   * with the default 1 the new block's power passes are deflated against
+   * = 0 (the default) that is EXACTLY "the build you would have done at
+   * ell + k_new"; with 1 the new block's power passes are deflated against
    * the old basis (glr.h).  The replicated backend recomputes at the wider
    * ell — correct, not incremental-cost, and the one-shot build.        */
   PetscCheck (!glr->corrected, glr->comm, PETSC_ERR_ORDER,
