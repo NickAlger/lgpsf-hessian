@@ -132,6 +132,15 @@ implicit `U` (the object dispatches by representation from then on).
   deflates the new block's power passes against the existing basis -- a
   block-Krylov extension (`glr.h`, `lgh_glr_extend`). Floating-point bit-identity holds
   within a build, not across compilers/flags (see `platform-notes.md`).
+- **Two dense eigensolvers in the ScaLAPACK backend.** `opts.eigsolver = 0` (the
+  default) eigendecomposes `T = sym(QᵀFQ)` with `pdsyevd`; `1` uses `pdsyev`
+  (`pdsytrd` + QR iteration + `pdormtr`, the classic path, slower). The second is an
+  A/B control, not a production choice: a vendor `pdsyevd` may dispatch to its own
+  two-stage reduction (MKL 2024.0: `pdsyrdb`), and the kept basis `U = Q V_kept`
+  inherits whatever orthogonality `V` comes back with. The companion diagnostics
+  are `opts.diag_orth` (after each eigensolve: the eigenvector columns whose norm is
+  off, with their owner process column and a per-owner histogram) and the
+  Gershgorin positivity indicator `gersh_*` of `lgh_glr_check_basis` (`glr.h`).
 
 ## Layering and dependencies
 

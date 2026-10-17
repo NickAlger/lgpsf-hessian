@@ -532,6 +532,7 @@ lgh_glr_opts_default (void)
   o.extend_deflate = 0;
   o.check_extend = 0;
   o.diag_orth = 0;
+  o.eigsolver = 0;
   return o;
 }
 
@@ -900,6 +901,10 @@ lgh_glr_compute (Mat B, lgh_prior_t *prior, const lgh_glr_opts_t *opts,
               PETSC_ERR_ARG_OUTOFRANGE,
               "lgh_glr_compute: need 0 < ell (%d) <= N (%d)",
               (int) g->opts.ell, (int) Nglob);
+  PetscCheck (g->opts.eigsolver == 0 || g->opts.eigsolver == 1, g->comm,
+              PETSC_ERR_ARG_OUTOFRANGE,
+              "lgh_glr_compute: eigsolver must be 0 (pdsyevd) or 1 (pdsyev), "
+              "got %d", g->opts.eigsolver);
 
 #ifdef LGH_WITH_SCALAPACK
   if (g->opts.backend == LGH_GLR_DEFAULT)
@@ -1375,6 +1380,7 @@ lgh_glr_check_basis (lgh_glr_t *g, double c, int ncols, int n_top,
   PetscInt           *dirs = NULL;
   Vec                 u, v, r, x, y, w, *rr = NULL, *xx = NULL;
   Mat                 Y = NULL;
+  double             *sq = NULL;        /* sqrt(lam_k + c), clamped at 0 */
 
   PetscCall (PetscMemzero (rep, sizeof (*rep)));
   rep->kept = (int) kept;
@@ -1385,7 +1391,10 @@ lgh_glr_check_basis (lgh_glr_t *g, double c, int ncols, int n_top,
   if (kept == 0) return 0;
 
   /* (1) U^T u_j for the first ncheck columns, in panels: Y = U E_panel
-   *     (Umult_block of identity columns), G = U^T Y (UTmult_block). */
+   *     (Umult_block of identity columns), G = U^T Y (UTmult_block).  The
+   *     same panels give the Gershgorin positivity sums (glr.h, gersh_*):
+   *     per checked column j, S_j = sum_{k != j} |G_kj| sqrt((lam_k + c)
+   *     (lam_j + c)) / c and the diagonal term |G_jj - 1| (lam_j + c) / c. */
   ncheck = (ncols < 0 || (PetscInt) ncols > kept) ? kept : (PetscInt) ncols;
   rep->orth_cols = (int) ncheck;
   t0 = MPI_Wtime ();
@@ -1393,6 +1402,8 @@ lgh_glr_check_basis (lgh_glr_t *g, double c, int ncols, int n_top,
     const PetscInt      bw = PetscMin ((PetscInt) 64, ncheck);
 
     PetscCall (PetscMalloc2 ((size_t) kept * bw, &W, (size_t) kept * bw, &G));
+    PetscCall (PetscMalloc1 (kept, &sq));
+    for (k = 0; k < kept; k++) sq[k] = sqrt (PetscMax (g->lam[k] + c, 0.));
     for (p0 = 0; p0 < ncheck; p0 += bw) {
       const PetscInt      cw = PetscMin (bw, ncheck - p0);
 
@@ -1404,26 +1415,39 @@ lgh_glr_check_basis (lgh_glr_t *g, double c, int ncols, int n_top,
       PetscCall (lgh_glr_UTmult_block (g, Y, G));
       for (j = 0; j < cw; j++) {
         const PetscInt      jj = p0 + j;
+        const double        sjj = sq[jj];
+        double              S = 0., dterm = 0.;
 
         for (k = 0; k < kept; k++) {
           const double        a = fabs (G[k + (size_t) j * kept]
                                         - (k == jj ? 1. : 0.));
 
           if (k == jj) {
+            dterm = a * sjj * sjj / c;
             if (a > rep->orth_diag_max) {
               rep->orth_diag_max = a; rep->orth_diag_arg = (int) jj;
             }
           }
-          else if (a > rep->orth_off_max) {
-            rep->orth_off_max = a;
-            rep->orth_off_arg_i = (int) k; rep->orth_off_arg_j = (int) jj;
+          else {
+            S += a * sq[k] * sjj / c;
+            if (a > rep->orth_off_max) {
+              rep->orth_off_max = a;
+              rep->orth_off_arg_i = (int) k; rep->orth_off_arg_j = (int) jj;
+            }
           }
           if (jj < (PetscInt) n_top && a > rep->orth_top_max)
             rep->orth_top_max = a;
         }
+        if (S > rep->gersh_max) {
+          rep->gersh_max = S; rep->gersh_arg = (int) jj;
+        }
+        if (dterm > rep->gersh_diag_max) {
+          rep->gersh_diag_max = dterm; rep->gersh_diag_arg = (int) jj;
+        }
       }
       PetscCall (MatDestroy (&Y));
     }
+    PetscCall (PetscFree (sq));
     PetscCall (PetscFree2 (W, G));
   }
   rep->t_orth = MPI_Wtime () - t0;

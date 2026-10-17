@@ -17,6 +17,9 @@
  * Scenario B (indefinite B): FLIP treatment — kept spectrum matches
  * |lambda| of the dense oracle, negative count, logdet over flipped
  * values.
+ * Both scenarios, ScaLAPACK backend: opts.eigsolver = 1 (pdsyev) against the
+ * pdsyevd build (kept, treated spectrum, a solve), once through an
+ * extension; lgh_glr_check_basis's Gershgorin positivity fields (2026-10-16).
  */
 
 #include <lgpsf_hessian/lgpsf_hessian.h>
@@ -251,6 +254,77 @@ run_scenario (int spd, lgh_glr_backend_t backend)
     check (brep.n_rand == 4 && brep.rand_rel_max < 1e-9 && brep.rand_q1_min > 0.,
            "basis check: r'H^-1 r = whitened form, positive", brep.rand_rel_max);
     check (brep.n_sym == 2 && brep.sym_max < 1e-9, "basis check: symmetric", brep.sym_max);
+    /* the Gershgorin positivity sums (glr.h, gersh_*): finite, their columns
+     * in range, and ~0 for an orthonormal basis (O(eps lam_max / c)) */
+    check (isfinite (brep.gersh_max) && isfinite (brep.gersh_diag_max)
+           && brep.gersh_arg >= 0 && brep.gersh_arg < rep.kept
+           && brep.gersh_diag_arg >= 0 && brep.gersh_diag_arg < rep.kept,
+           "basis check: Gershgorin fields filled", brep.gersh_max);
+    check (brep.gersh_max < 1e-8 && brep.gersh_diag_max < 1e-8,
+           "basis check: Gershgorin sums ~ 0 for an orthonormal basis",
+           PetscMax (brep.gersh_max, brep.gersh_diag_max));
+  }
+
+  /* opts.eigsolver = 1 (pdsyev) against the pdsyevd build above: the same
+   * kept count, the same treated spectrum to 1e-10, the same solve on a
+   * hashed random vector to 1e-8, and the pdsyev-vs-dsyevd cross-check
+   * (rep.resid_max, opts.check); then an extension 30 -> 40 under pdsyev ==
+   * the one-shot build.  The replicated backend ignores the option: it must
+   * still accept it and give the same build.  diag_orth = 1 exercises the
+   * [GLR-DIAG] eigensolver lines for pdsyev (prints only).  2026-10-16.  */
+  {
+    lgh_glr_opts_t      go_ev = go;
+    lgh_glr_t          *gev;
+    lgh_glr_report_t    rev;
+    int                 nk1, nk2;
+    const double       *l1, *l2;
+    double              worst = 0., rd;
+    const int           sca = (backend == LGH_GLR_SCALAPACK);
+    Vec                 rnd;
+
+    go_ev.eigsolver = 1;
+    go_ev.diag_orth = sca;
+    PetscCall (lgh_glr_compute (B, prior, &go_ev, &gev, &rev));
+    check (rev.kept == rep.kept, sca ? "pdsyev: kept == pdsyevd's" : "eigsolver 1, replicated: kept unchanged",
+           (double) rev.kept);
+    PetscCall ((PetscErrorCode) lgh_glr_eigs (glr, &nk1, &l1));
+    PetscCall ((PetscErrorCode) lgh_glr_eigs (gev, &nk2, &l2));
+    for (int i = 0; i < nk1 && i < nk2; i++)
+      worst = fmax (worst, fabs (l1[i] - l2[i]) / fabs (l1[i]));
+    check (worst < 1e-10, sca ? "pdsyev: treated spectrum == pdsyevd's" : "eigsolver 1, replicated: spectrum unchanged",
+           worst);
+    if (sca)
+      check (rev.resid_max < 1e-12, "pdsyev cross-check gate (vs dsyevd)", rev.resid_max);
+    PetscCall (VecDuplicate (v, &rnd));
+    {
+      PetscInt            rs, re;
+      PetscScalar        *a;
+      PetscCall (VecGetOwnershipRange (rnd, &rs, &re));
+      PetscCall (VecGetArray (rnd, &a));
+      for (PetscInt i = rs; i < re; i++) a[i - rs] = lgh_randn_at (0x5EEDUL, i, 0);
+      PetscCall (VecRestoreArray (rnd, &a));
+    }
+    PetscCall ((PetscErrorCode) lgh_glr_solve (glr, c, rnd, x));
+    PetscCall ((PetscErrorCode) lgh_glr_solve (gev, c, rnd, y));
+    PetscCall (rel_diff (y, x, s1, &rd));
+    check (rd < 1e-8, sca ? "pdsyev: solve == pdsyevd's on a random vector" : "eigsolver 1, replicated: solve unchanged",
+           rd);
+    PetscCall (VecDestroy (&rnd));
+    lgh_glr_destroy (gev);
+
+    if (sca) {   /* an extension's re-eigensolve under pdsyev */
+      go_ev.ell = 30;
+      go_ev.diag_orth = 0;
+      PetscCall (lgh_glr_compute (B, prior, &go_ev, &gev, &rev));
+      PetscCall (lgh_glr_extend (gev, 10, &rev));
+      PetscCall ((PetscErrorCode) lgh_glr_eigs (gev, &nk2, &l2));
+      check (nk1 == nk2, "pdsyev: extend (30 -> 40) kept matches one-shot", (double) nk2);
+      worst = 0.;
+      for (int i = 0; i < nk1 && i < nk2; i++)
+        worst = fmax (worst, fabs (l1[i] - l2[i]) / fabs (l1[i]));
+      check (worst < 1e-10, "pdsyev: extend (30 -> 40) spectrum matches one-shot", worst);
+      lgh_glr_destroy (gev);
+    }
   }
   if (backend == LGH_GLR_REPLICATED)   /* eigen-residual check */
     check (rep.resid_max < 1e-7 * rep.lam_abs_max, "residual gate",

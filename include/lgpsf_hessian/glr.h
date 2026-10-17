@@ -116,12 +116,37 @@ typedef struct lgh_glr_opts
                                        * against itself and against the     *
                                        * columns before it (streamed in     *
                                        * panels) and the CholQR jitter      *
-                                       * events; after every pdsyevd the    *
-                                       * eigenvector columns' norms and     *
-                                       * |V^T V x - x| on random x.  Costs  *
-                                       * about one more BCGS2 sweep per     *
-                                       * call.  0 (default).  2026-10-16:   *
-                                       * the gamma 1e-3 kept-basis defect.  */
+                                       * events; after every eigensolve the *
+                                       * eigenvector columns' norms (how    *
+                                       * many have |v^T v - 1| > 1e-10, the *
+                                       * 16 worst with their owner process  *
+                                       * column and lam_raw, and the count  *
+                                       * per owner: clustered on one or a   *
+                                       * few owners points at the layout or *
+                                       * the memory, spread over many at    *
+                                       * the algorithm) and |V^T V x - x|   *
+                                       * on random x.  Costs about one more *
+                                       * BCGS2 sweep per call.  0 (default).*
+                                       * 2026-10-16: the gamma 1e-3         *
+                                       * kept-basis defect.                 */
+  int               eigsolver;        /* the dense eigensolver of T = sym(  *
+                                       * Q^T F Q), SCALAPACK backend only   *
+                                       * (the replicated backend's dsyevd   *
+                                       * is unaffected): 0 (default) =      *
+                                       * pdsyevd (divide and conquer); 1 =  *
+                                       * pdsyev (pdsytrd + the QR iteration *
+                                       * dsteqr2 + pdormtr -- the classic   *
+                                       * path, slower).  1 is an A/B        *
+                                       * control against a vendor pdsyevd   *
+                                       * that dispatches to its own two-    *
+                                       * stage reduction (MKL 2024.0:       *
+                                       * pdsyrdb; the kept basis U = Q V    *
+                                       * inherits V's orthogonality).  Both *
+                                       * return the eigenvalues ascending   *
+                                       * with matching eigenvector columns, *
+                                       * so selection and everything        *
+                                       * downstream are the same.  Must be  *
+                                       * 0 or 1.  2026-10-16.               */
 }
 lgh_glr_opts_t;
 
@@ -151,8 +176,8 @@ typedef enum
   LGH_GT_T_GEMM,     /* Q^T Y panels; extension border Q_all^T F Q_new     */
   LGH_GT_T_RED,      /* their allreduces; extension T rebuild allreduces   */
   LGH_GT_T_SCATTER,  /* block-cyclic scatter + symmetrize; column store    */
-  LGH_GT_EIG_WORK,   /* pdsyevd workspace query + allocation               */
-  LGH_GT_EIG,        /* pdsyevd                                            */
+  LGH_GT_EIG_WORK,   /* eigensolver workspace query + allocation           */
+  LGH_GT_EIG,        /* the eigensolver: pdsyevd, or pdsyev (eigsolver 1)  */
   LGH_GT_SELECT,     /* sort, truncation, treatment                        */
   LGH_GT_BAL_SETUP,  /* balanced / blocked matvec setup: row weights,      *
                       * gather, split, the balanced view of B, scratch     */
@@ -351,7 +376,8 @@ int lgh_glr_eigs (const lgh_glr_t *glr, int *nkept, const double **lam);
  *      |lam|-descending order (ncols < 0: all) against ALL kept columns, in
  *      panels through the block primitives.  The applied filter f_c I +
  *      U diag(f - f_c) U^T is positive in a kept direction only while
- *      |U^T U - I| stays below c / lam there;
+ *      |U^T U - I| stays below c / lam there; the same panels give the
+ *      Gershgorin positivity sums gersh_* (below) at no extra cost;
  *  (2) the applied preconditioner H(c)^{-1} = Z^{-T} M^{1/2} (F + cI)^{-1}
  *      M^{1/2} Z^{-1} along the n_top stiffest and the n_low lowest kept
  *      directions: with r_j = Z M^{-1/2} u_j the form r_j^T H(c)^{-1} r_j is
@@ -386,6 +412,23 @@ typedef struct lgh_glr_basis_report
   int    n_sym;
   double sym_max;               /* max relative asymmetry                  */
   double t_orth, t_probe;       /* seconds                                 */
+  /* A positivity indicator from the same Gram panels (2026-10-16, the review
+   * of the gamma 1e-3 flag).  With E = U^T U - I, F = diag(f_i), f_i = 1 /
+   * (lam_i + c), f_c = 1 / c, the whitened filter f_c I + U diag(f - f_c) U^T
+   * is positive on span(U) iff M = (I + E)[F + (F - f_c I) E] is; to first
+   * order F^{-1/2} M F^{-1/2} = I + (F^{1/2} E F^{-1/2} + F^{-1/2} E F^{1/2})
+   * - f_c F^{-1/2} E F^{-1/2}, and the last term dominates, with entries
+   * -e_ij sqrt((lam_i + c)(lam_j + c)) / c.  Its Gershgorin row sums over the
+   * checked columns j, G = U^T U over ALL kept i, lam treated:
+   *   gersh_max      = max_j sum_{i != j} |G_ij| sqrt((lam_i + c)(lam_j + c)) / c
+   *   gersh_diag_max = max_j |G_jj - 1| (lam_j + c) / c
+   * A sum of order 1 or more flags likely indefiniteness; an orthonormal
+   * basis gives O(eps lam_max / c).  Column indices as the orth_* fields
+   * (|lam|-descending); the shift c is the one passed in.               */
+  double gersh_max;
+  int    gersh_arg;
+  double gersh_diag_max;
+  int    gersh_diag_arg;
 }
 lgh_glr_basis_report_t;
 

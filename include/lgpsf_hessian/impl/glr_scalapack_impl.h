@@ -9,8 +9,10 @@
  *   - T = sym(Q^T F Q) is formed in column panels and reduced directly into
  *     a 2D block-cyclic layout on a BLACS process grid (feature space owns
  *     its own partition — by feature index, never by mesh geometry);
- *   - eigendecomposition by ScaLAPACK pdsyevd; the eigenvector matrix V
- *     STAYS IN PLACE (block-cyclic); eigenvalues are replicated (small);
+ *   - eigendecomposition by ScaLAPACK pdsyevd (or pdsyev, opts.eigsolver =
+ *     1: the classic tridiagonalization + QR path, an A/B control against a
+ *     vendor pdsyevd's own reduction); the eigenvector matrix V STAYS IN
+ *     PLACE (block-cyclic); eigenvalues are replicated (small);
  *   - U = Q V_kept is IMPLICIT: U w = Q(V w), U^T x = V^T(Q^T x), with
  *     O(ell) coefficient traffic per apply;
  *   - incremental extension: fresh hashed columns continue the sketch, are
@@ -54,6 +56,7 @@ extern void         Cblacs_gridexit (int ictxt);
 
 #include <limits.h>
 #define LGH_SCALAPACK_PDSYEVD LGH_F77_FUNC (pdsyevd, PDSYEVD)
+#define LGH_SCALAPACK_PDSYEV LGH_F77_FUNC (pdsyev, PDSYEV)
 #define LGH_SCALAPACK_DESCINIT LGH_F77_FUNC (descinit, DESCINIT)
 extern void LGH_SCALAPACK_PDSYEVD (const char *jobz, const char *uplo,
                                    int *n, double *a, int *ia, int *ja,
@@ -61,6 +64,12 @@ extern void LGH_SCALAPACK_PDSYEVD (const char *jobz, const char *uplo,
                                    int *jz, int *descz, double *work,
                                    int *lwork, int *iwork, int *liwork,
                                    int *info);
+/* pdsyev: pdsytrd + dsteqr2 + pdormtr (no IWORK); opts.eigsolver = 1 */
+extern void LGH_SCALAPACK_PDSYEV (const char *jobz, const char *uplo,
+                                  int *n, double *a, int *ia, int *ja,
+                                  int *desca, double *w, double *z, int *iz,
+                                  int *jz, int *descz, double *work,
+                                  int *lwork, int *info);
 extern void LGH_SCALAPACK_DESCINIT (int *desc, int *m, int *n, int *mb,
                                     int *nb, int *irsrc, int *icsrc,
                                     int *ictxt, int *lld, int *info);
@@ -79,7 +88,7 @@ struct lgh_glrd_state
   int                 desc[9];     /* descriptor for T / V               */
   int                 tl_rows, tl_cols;  /* local block sizes            */
   double             *Vloc;        /* eigenvectors, block-cyclic, in place */
-  double             *lam_raw;     /* ell, pdsyevd-ascending (replicated) */
+  double             *lam_raw;     /* ell, ascending (pdsyevd / pdsyev), replicated */
   int                *keep;        /* kept -> raw index                  */
   int                *kpos;        /* raw index -> kept position or -1   */
   Mat                 Q;           /* N x ell MATDENSE row slab (owned)  */
@@ -598,10 +607,14 @@ lgh_glrd_set_desc (struct lgh_glrd_state *s)
   return PETSC_SUCCESS;
 }
 
+/* The eigensolver entry (its name predates opts.eigsolver): T -> (lam_raw
+ * ascending, V in place).  opts.eigsolver = 0: pdsyevd, the path below
+ * unchanged since 2026-09-28; = 1: pdsyev.                               */
 static PetscErrorCode
 lgh_glrd_pdsyevd (lgh_glr_t *g, double *Tloc)
 {
   struct lgh_glrd_state *s = g->dist;
+  const char         *solver = (g->opts.eigsolver == 1) ? "pdsyev" : "pdsyevd";
   int                 nell = s->ell, ione = 1, info = 0;
   int                 lwork = -1, liwork = -1, iwkopt = 0;
   double              wkopt;
@@ -620,6 +633,53 @@ lgh_glrd_pdsyevd (lgh_glr_t *g, double *Tloc)
                 "lgh_glrd: the projected matrix T has a non-finite entry "
                 "at ell %d", nell);
   }
+  if (g->opts.eigsolver == 1) {
+    /* pdsyev("V", "L"): pdsytrd -> dsteqr2 (the QR iteration on the
+     * tridiagonal, its Q on an internal P x 1 grid) -> pdgemr2d -> pdormtr.
+     * Workspace: the query, plus the documented minimum recomputed here
+     * (reference pdsyev.f: LWMIN = 5N + N LDC + max(SIZEMQRLEFT, 2N - 2) + 1
+     * for JOBZ = 'V', with LDC the rows of the internal N x N Q on this rank
+     * -- bounded above by ceil(N / (nb P)) nb -- and SIZESYTRD = max(nb (np +
+     * 1), 3 nb), which only the JOBZ = 'N' formula states but pdsytrd needs
+     * either way), plus the pdormtr and pdlasrt-sized margins the pdsyevd
+     * path adds: the same under-reporting guard (above / below).          */
+    PetscCall (lgh_gt_begin (g, LGH_GT_EIG_WORK));
+    LGH_SCALAPACK_PDSYEV ("V", "L", &nell, Tloc, &ione, &ione, s->desc,
+                          s->lam_raw, s->Vloc, &ione, &ione, s->desc, &wkopt,
+                          &lwork, &info);
+    PetscCheck (info == 0, PETSC_COMM_SELF, PETSC_ERR_LIB,
+                "lgh_glrd: pdsyev workspace query failed (info %d)", info);
+    lwork = (int) wkopt;
+    {
+      const long long     N = nell, np = s->tl_rows, nq = s->tl_cols;
+      const long long     nb = s->nb, P = s->P;
+      const long long     ldc = ((N + nb * P - 1) / (nb * P)) * nb;
+      const long long     sytrd = PetscMax (nb * (np + 1), 3 * nb);
+      const long long     mqr = PetscMax (nb * (nb - 1) / 2, (np + nq) * nb) + nb * nb;
+      const long long     doc = 5 * N + N * ldc + PetscMax (mqr, 2 * N - 2) + 1 + sytrd;
+      const long long     lasrt = PetscMax (N, np * (nb + nq));
+      const long long     lw = (long long) lwork + doc + mqr + lasrt;
+      PetscCheck (lw <= INT_MAX, PETSC_COMM_SELF, PETSC_ERR_SUP,
+                  "lgh_glrd: pdsyev workspace exceeds int");
+      lwork = (int) lw;
+    }
+    PetscCall (PetscMalloc1 (lwork, &work));
+    PetscCall (lgh_gt_end (g, LGH_GT_EIG_WORK));
+    PetscCall (lgh_gt_begin (g, LGH_GT_EIG));
+    LGH_SCALAPACK_PDSYEV ("V", "L", &nell, Tloc, &ione, &ione, s->desc,
+                          s->lam_raw, s->Vloc, &ione, &ione, s->desc, work,
+                          &lwork, &info);
+    PetscCall (lgh_gt_end (g, LGH_GT_EIG));
+    PetscCall (lgh_gt_begin (g, LGH_GT_EIG_WORK));
+    PetscCall (PetscFree (work));
+    PetscCall (lgh_gt_end (g, LGH_GT_EIG_WORK));
+    PetscCheck (info == 0, PETSC_COMM_SELF, PETSC_ERR_LIB,
+                "lgh_glrd: pdsyev failed (info %d%s)", info,
+                info == nell + 1 ? ": the eigenvalues differ across the "
+                "process grid (pdsyev's heterogeneity check)" : "");
+  }
+  else {
+  /* the pdsyevd path, verbatim (not re-indented so the diff shows it unchanged) */
   PetscCall (lgh_gt_begin (g, LGH_GT_EIG_WORK));
   LGH_SCALAPACK_PDSYEVD ("V", "L", &nell, Tloc, &ione, &ione, s->desc,
                          s->lam_raw, s->Vloc, &ione, &ione, s->desc, &wkopt,
@@ -662,12 +722,13 @@ lgh_glrd_pdsyevd (lgh_glr_t *g, double *Tloc)
   PetscCall (lgh_gt_end (g, LGH_GT_EIG_WORK));
   PetscCheck (info == 0, PETSC_COMM_SELF, PETSC_ERR_LIB,
               "lgh_glrd: pdsyevd failed (info %d)", info);
+  }
   for (int ii = 0; ii < nell; ii++)      /* lam_raw is replicated: rank-consistent */
     PetscCheck (isfinite (s->lam_raw[ii]), PETSC_COMM_SELF, PETSC_ERR_FP,
-                "lgh_glrd: pdsyevd returned a non-finite eigenvalue "
-                "(index %d of %d)", ii, nell);
+                "lgh_glrd: %s returned a non-finite eigenvalue "
+                "(index %d of %d)", solver, ii, nell);
   if (g->opts.diag_orth) {
-    /* [GLR-DIAG]: the eigenvectors as pdsyevd left them, in place (no
+    /* [GLR-DIAG]: the eigenvectors as the solver left them, in place (no
      * redistribution): every column's norm, and |V^T V x - x| / |x| on three
      * hashed random x -- O(ell^2 / P) work and a few ell-sized allreduces    */
     double             *cl, *cf, *x, *yl, *y, *zl, *z, nmax = 0., rmax = 0., t0d = MPI_Wtime ();
@@ -713,10 +774,60 @@ lgh_glrd_pdsyevd (lgh_glr_t *g, double *Tloc)
       rmax = PetscMax (rmax, em / PetscMax (xm, 1e-300));
     }
     PetscCall (lgh_gt_end (g, LGH_GT_CHECK));
-    PetscCall (PetscPrintf (g->comm, "[GLR-DIAG] pdsyevd n %d (grid %d x %d, nb %d): eigenvector columns max |v^T v - 1| %.2e "
+    PetscCall (PetscPrintf (g->comm, "[GLR-DIAG] %s n %d (grid %d x %d, nb %d): eigenvector columns max |v^T v - 1| %.2e "
                             "(raw col %d, lam %.4e), |V^T V x - x|_inf / |x|_inf max %.2e over 3 random x | %.1f s\n",
-                            nell, s->prow, s->pcol, s->nb, nmax, nargs, nargs >= 0 ? s->lam_raw[nargs] : 0.,
+                            solver, nell, s->prow, s->pcol, s->nb, nmax, nargs, nargs >= 0 ? s->lam_raw[nargs] : 0.,
                             rmax, MPI_Wtime () - t0d));
+    {
+      /* the columns with |v^T v - 1| > 1e-10: how many, the 16 worst with their
+       * block-cyclic owner (process column (col / nb) % pcol) and lam_raw, and
+       * the count per owner -- clustered on one or a few owners points at the
+       * layout or the memory, spread over many at the algorithm.  cf is
+       * replicated, so every rank has the whole picture: no communication. */
+      const double        tol = 1e-10;
+      int                *bad, *per, nbad = 0, nown = 0, t;
+      char                line[2048];
+      size_t              off;
+
+      PetscCall (PetscMalloc2 (nell, &bad, s->pcol, &per));
+      for (i = 0; i < s->pcol; i++) per[i] = 0;
+      for (i = 0; i < nell; i++)
+        if (fabs (cf[i] - 1.) > tol) {
+          bad[nbad++] = i;
+          per[lgh_glrd_owner (i, s->nb, s->pcol)]++;
+        }
+      off = (size_t) snprintf (line, sizeof line, "[GLR-DIAG] %s columns with |v^T v - 1| > %.0e: %d of %d",
+                               solver, tol, nbad, nell);
+      if (nbad > 0 && off < sizeof line)
+        off += (size_t) snprintf (line + off, sizeof line - off,
+                                  "; the worst (raw col/owner pcol: lam_raw, |v^T v - 1|):");
+      for (t = 0; t < nbad && t < 16; t++) {     /* selection: the t-th worst into slot t */
+        int                 best = t, tmp;
+        for (i = t + 1; i < nbad; i++)
+          if (fabs (cf[bad[i]] - 1.) > fabs (cf[bad[best]] - 1.)) best = i;
+        tmp = bad[t]; bad[t] = bad[best]; bad[best] = tmp;
+        if (off < sizeof line)
+          off += (size_t) snprintf (line + off, sizeof line - off, " %d/%d: %.3e, %.1e", bad[t],
+                                    lgh_glrd_owner (bad[t], s->nb, s->pcol), s->lam_raw[bad[t]],
+                                    fabs (cf[bad[t]] - 1.));
+      }
+      PetscCall (PetscPrintf (g->comm, "%s\n", line));
+      if (nbad > 0) {
+        for (i = 0; i < s->pcol; i++) if (per[i] > 0) nown++;
+        off = (size_t) snprintf (line, sizeof line, "[GLR-DIAG] %s bad columns per owner process column "
+                                 "(%d of %d owners have any; owner:count):", solver, nown, s->pcol);
+        for (i = 0, t = 0; i < s->pcol && t < 32; i++)
+          if (per[i] > 0) {
+            if (off < sizeof line)
+              off += (size_t) snprintf (line + off, sizeof line - off, " %d:%d", i, per[i]);
+            t++;
+          }
+        if (nown > 32 && off < sizeof line)
+          (void) snprintf (line + off, sizeof line - off, " ... (%d more owners)", nown - 32);
+        PetscCall (PetscPrintf (g->comm, "%s\n", line));
+      }
+      PetscCall (PetscFree2 (bad, per));
+    }
     PetscCall (PetscFree4 (cl, cf, x, yl));
     PetscCall (PetscFree3 (y, zl, z));
   }
