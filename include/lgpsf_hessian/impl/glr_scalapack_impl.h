@@ -90,6 +90,11 @@ struct lgh_glrd_state
    * by symmetry of F.                                                   */
   double             *Acols;
   int                 acn;
+  /* opts.diag_orth: CholQR jitter events of the current BCGS2 call, by
+   * [sweep][CholQR pass], and the smallest G_ii / max G_ii among them    */
+  long                jit[2][2];
+  double              jit_minrel;
+  int                 cur_sweep;
 };
 
 /* block-cyclic ownership helpers (row-src / col-src fixed at process 0) */
@@ -139,6 +144,13 @@ lgh_glrd_panel_cholqr (lgh_glr_t *g, double *pa, PetscInt nloc, PetscInt lda,
       PetscCallMPI (MPI_Allreduce (Gl, G, bw * bw, MPI_DOUBLE, MPI_SUM,
                                    comm));   /* rare: charged to local */
       for (i = 0; i < bw; i++) dmax = PetscMax (dmax, G[i + i * bw]);
+      if (g->dist != NULL) {         /* opts.diag_orth's count (always kept) */
+        double              dmin = HUGE_VAL;
+        for (i = 0; i < bw; i++) dmin = PetscMin (dmin, G[i + i * bw]);
+        g->dist->jit[g->dist->cur_sweep & 1][pass]++;
+        g->dist->jit_minrel = PetscMin (g->dist->jit_minrel,
+                                        dmin / PetscMax (dmax, 1e-300));
+      }
       for (i = 0; i < bw; i++) G[i + i * bw] += 1.e-12 * PetscMax (dmax, 1.);
       info = 0;
       LGH_LAPACK_DPOTRF ("U", &bn, G, &bn, &info);
@@ -211,7 +223,8 @@ lgh_glrd_against_old (lgh_glr_t *g, const double *qa, PetscInt ldq, int k,
  * (assumed already orthonormal) and each other; p_start = 0 is the full
  * factorization.  Used with p_start = ell1 for incremental extension.   */
 static PetscErrorCode
-lgh_glrd_bcgs2 (lgh_glr_t *g, Mat Y, int ell, int b, int p_start)
+lgh_glrd_bcgs2 (lgh_glr_t *g, Mat Y, int ell, int b, int p_start,
+                const char *ctx)
 {
   MPI_Comm            comm = g->comm;
   PetscScalar        *ya;
@@ -229,6 +242,7 @@ lgh_glrd_bcgs2 (lgh_glr_t *g, Mat Y, int ell, int b, int p_start)
     int                 sweep;
 
     for (sweep = 0; sweep < 2; sweep++) {   /* BCGS2: two full sweeps */
+      if (g->dist != NULL) g->dist->cur_sweep = sweep;
       if (p0 > 0) {
         int                 bm = (int) nloc, bj = p0, bb = bw;
         int                 blda = (int) lda;
@@ -256,6 +270,45 @@ lgh_glrd_bcgs2 (lgh_glr_t *g, Mat Y, int ell, int b, int p_start)
       }
       PetscCall (lgh_glrd_panel_cholqr (g, pa, nloc, lda, bw));
     }
+  }
+  if (g->opts.diag_orth && g->dist != NULL) {
+    /* [GLR-DIAG]: the columns [p_start, ell) just made, against themselves and
+     * against [0, p_start), streamed: per panel P of width b, C = Y[:, 0:p0+bw]^T
+     * Y[:, P] (the lower part of the Gram up to this panel, by symmetry enough) */
+    struct lgh_glrd_state *sd = g->dist;
+    double              self_d = 0., self_o = 0., cross = 0., t0d = MPI_Wtime ();
+    int                 q0;
+
+    PetscCall (lgh_gt_begin (g, LGH_GT_CHECK));
+    for (q0 = p_start; q0 < ell; q0 += b) {
+      const int           bw = PetscMin (b, ell - q0), rows = q0 + bw;
+      int                 bm = (int) nloc, br = rows, bb = bw, blda = (int) lda, i, jj;
+      double              one = 1.0, zero = 0.0;
+
+      if (nloc > 0) {
+        LGH_BLAS_DGEMM ("T", "N", &br, &bb, &bm, &one, ya, &blda,
+                        ya + (size_t) q0 * lda, &blda, &zero, Cl, &br);
+      }
+      else { for (i = 0; i < rows * bw; i++) Cl[i] = 0.; }
+      PetscCallMPI (MPI_Allreduce (Cl, C, rows * bw, MPI_DOUBLE, MPI_SUM, comm));
+      for (jj = 0; jj < bw; jj++)
+        for (i = 0; i < rows; i++) {
+          const double        e = C[i + (size_t) jj * rows];
+          if (i < p_start) cross = PetscMax (cross, fabs (e));
+          else if (i == q0 + jj) self_d = PetscMax (self_d, fabs (e - 1.));
+          else self_o = PetscMax (self_o, fabs (e));
+        }
+    }
+    PetscCall (lgh_gt_end (g, LGH_GT_CHECK));
+    PetscCall (PetscPrintf (comm, "[GLR-DIAG] bcgs2 %-11s cols [%d,%d): |Q^T Q - I| own block diag %.2e off %.2e, "
+                            "vs the columns before %.2e | CholQR jitter (sweep 1: pass 1/2, sweep 2: pass 1/2) "
+                            "%ld/%ld %ld/%ld, min G_ii/max G_ii %.1e | %.1f s\n", ctx ? ctx : "?", p_start, ell,
+                            self_d, self_o, cross, sd->jit[0][0], sd->jit[0][1], sd->jit[1][0], sd->jit[1][1],
+                            sd->jit_minrel, MPI_Wtime () - t0d));
+  }
+  if (g->dist != NULL) {
+    memset (g->dist->jit, 0, sizeof (g->dist->jit));
+    g->dist->jit_minrel = 1.;
   }
   PetscCall (PetscFree2 (C, Cl));
   PetscCall (MatDenseRestoreArray (Y, &ya));
@@ -613,6 +666,60 @@ lgh_glrd_pdsyevd (lgh_glr_t *g, double *Tloc)
     PetscCheck (isfinite (s->lam_raw[ii]), PETSC_COMM_SELF, PETSC_ERR_FP,
                 "lgh_glrd: pdsyevd returned a non-finite eigenvalue "
                 "(index %d of %d)", ii, nell);
+  if (g->opts.diag_orth) {
+    /* [GLR-DIAG]: the eigenvectors as pdsyevd left them, in place (no
+     * redistribution): every column's norm, and |V^T V x - x| / |x| on three
+     * hashed random x -- O(ell^2 / P) work and a few ell-sized allreduces    */
+    double             *cl, *cf, *x, *yl, *y, *zl, *z, nmax = 0., rmax = 0., t0d = MPI_Wtime ();
+    int                 nargs = -1, lj, i, t;
+
+    PetscCall (lgh_gt_begin (g, LGH_GT_CHECK));
+    PetscCall (PetscMalloc4 (nell, &cl, nell, &cf, nell, &x, nell, &yl));
+    PetscCall (PetscMalloc3 (nell, &y, nell, &zl, nell, &z));
+    for (i = 0; i < nell; i++) cl[i] = 0.;
+    for (lj = 0; lj < s->tl_cols; lj++) {
+      const int           gj = (lj / s->nb) * s->nb * s->pcol + s->mycol * s->nb + lj % s->nb;
+      if (gj >= nell) continue;
+      for (i = 0; i < s->tl_rows; i++) {
+        const int           gi = (i / s->nb) * s->nb * s->prow + s->myrow * s->nb + i % s->nb;
+        const double        v = s->Vloc[i + (size_t) lj * s->tl_rows];
+        if (gi < nell) cl[gj] += v * v;
+      }
+    }
+    PetscCallMPI (MPI_Allreduce (cl, cf, nell, MPI_DOUBLE, MPI_SUM, g->comm));
+    for (i = 0; i < nell; i++) if (fabs (cf[i] - 1.) > nmax) { nmax = fabs (cf[i] - 1.); nargs = i; }
+    for (t = 0; t < 3; t++) {
+      double              xm = 0., em = 0.;
+      for (i = 0; i < nell; i++) { x[i] = lgh_randn_at (0xD1A6UL, i, t); yl[i] = 0.; zl[i] = 0.; xm = PetscMax (xm, fabs (x[i])); }
+      for (lj = 0; lj < s->tl_cols; lj++) {        /* y = V x */
+        const int           gj = (lj / s->nb) * s->nb * s->pcol + s->mycol * s->nb + lj % s->nb;
+        if (gj >= nell) continue;
+        for (i = 0; i < s->tl_rows; i++) {
+          const int           gi = (i / s->nb) * s->nb * s->prow + s->myrow * s->nb + i % s->nb;
+          if (gi < nell) yl[gi] += s->Vloc[i + (size_t) lj * s->tl_rows] * x[gj];
+        }
+      }
+      PetscCallMPI (MPI_Allreduce (yl, y, nell, MPI_DOUBLE, MPI_SUM, g->comm));
+      for (lj = 0; lj < s->tl_cols; lj++) {        /* z = V^T y */
+        const int           gj = (lj / s->nb) * s->nb * s->pcol + s->mycol * s->nb + lj % s->nb;
+        if (gj >= nell) continue;
+        for (i = 0; i < s->tl_rows; i++) {
+          const int           gi = (i / s->nb) * s->nb * s->prow + s->myrow * s->nb + i % s->nb;
+          if (gi < nell) zl[gj] += s->Vloc[i + (size_t) lj * s->tl_rows] * y[gi];
+        }
+      }
+      PetscCallMPI (MPI_Allreduce (zl, z, nell, MPI_DOUBLE, MPI_SUM, g->comm));
+      for (i = 0; i < nell; i++) em = PetscMax (em, fabs (z[i] - x[i]));
+      rmax = PetscMax (rmax, em / PetscMax (xm, 1e-300));
+    }
+    PetscCall (lgh_gt_end (g, LGH_GT_CHECK));
+    PetscCall (PetscPrintf (g->comm, "[GLR-DIAG] pdsyevd n %d (grid %d x %d, nb %d): eigenvector columns max |v^T v - 1| %.2e "
+                            "(raw col %d, lam %.4e), |V^T V x - x|_inf / |x|_inf max %.2e over 3 random x | %.1f s\n",
+                            nell, s->prow, s->pcol, s->nb, nmax, nargs, nargs >= 0 ? s->lam_raw[nargs] : 0.,
+                            rmax, MPI_Wtime () - t0d));
+    PetscCall (PetscFree4 (cl, cf, x, yl));
+    PetscCall (PetscFree3 (y, zl, z));
+  }
   return PETSC_SUCCESS;
 }
 
@@ -656,6 +763,7 @@ lgh_glrd_build (lgh_glr_t *g, lgh_glr_report_t *rep)
   rep->ext_orth_max = -1.;
   PetscCall (lgh_gt_begin (g, LGH_GT_SETUP));
   PetscCall (PetscNew (&s));
+  s->jit_minrel = 1.;
   g->dist = s;
   PetscCallMPI (MPI_Comm_size (g->comm, &s->P));
   PetscCallMPI (MPI_Comm_rank (g->comm, &s->rank));
@@ -718,7 +826,7 @@ lgh_glrd_build (lgh_glr_t *g, lgh_glr_report_t *rep)
   rep->t_operator += MPI_Wtime () - t0;
   for (p = 0; p < g->opts.q_power; p++) {
     t0 = MPI_Wtime ();
-    PetscCall (lgh_glrd_bcgs2 (g, Y, ell, panel_b, 0));
+    PetscCall (lgh_glrd_bcgs2 (g, Y, ell, panel_b, 0, "build-power"));
     rep->t_dense += MPI_Wtime () - t0;
     PetscCall (lgh_gt_begin (g, LGH_GT_COPY));
     PetscCall (MatCopy (Y, Q, SAME_NONZERO_PATTERN));
@@ -728,7 +836,7 @@ lgh_glrd_build (lgh_glr_t *g, lgh_glr_report_t *rep)
     rep->t_operator += MPI_Wtime () - t0;
   }
   t0 = MPI_Wtime ();
-  PetscCall (lgh_glrd_bcgs2 (g, Y, ell, panel_b, 0));
+  PetscCall (lgh_glrd_bcgs2 (g, Y, ell, panel_b, 0, "build-final"));
   rep->t_dense += MPI_Wtime () - t0;
   PetscCall (lgh_gt_begin (g, LGH_GT_COPY));
   PetscCall (MatCopy (Y, Q, SAME_NONZERO_PATTERN));
@@ -943,7 +1051,7 @@ lgh_glrd_extend_incr (lgh_glr_t *g, int k_new, lgh_glr_report_t *rep)
       PetscCall (MatDenseRestoreArray (Yn, &yn));
       PetscCall (MatDenseRestoreArrayRead (Qb, &qb));
     }
-    PetscCall (lgh_glrd_bcgs2 (g, Yn, k_new, panel_b, 0));
+    PetscCall (lgh_glrd_bcgs2 (g, Yn, k_new, panel_b, 0, "ext-power"));
     rep->t_dense += MPI_Wtime () - t0;
     PetscCall (lgh_gt_begin (g, LGH_GT_COPY));
     PetscCall (MatCopy (Yn, Qn, SAME_NONZERO_PATTERN));
@@ -973,7 +1081,7 @@ lgh_glrd_extend_incr (lgh_glr_t *g, int k_new, lgh_glr_report_t *rep)
     PetscCall (lgh_gt_end (g, LGH_GT_COPY));
   }
   t0 = MPI_Wtime ();
-  PetscCall (lgh_glrd_bcgs2 (g, Qb, ell2, panel_b, ell1));
+  PetscCall (lgh_glrd_bcgs2 (g, Qb, ell2, panel_b, ell1, "ext-border"));
   rep->t_dense += MPI_Wtime () - t0;
   if (g->opts.check_extend) {      /* the old x new block of Q^T Q - I */
     PetscScalar        *qb;

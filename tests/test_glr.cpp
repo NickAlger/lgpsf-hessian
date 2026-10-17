@@ -365,6 +365,7 @@ run_scenario (int spd, lgh_glr_backend_t backend)
     go2.ell = 30;
     go2.extend_deflate = defl;
     go2.check_extend = 1;
+    go2.diag_orth = (backend == LGH_GLR_SCALAPACK);   /* exercise the [GLR-DIAG] path (prints only) */
     PetscCall (lgh_glr_compute (B, prior, &go2, &glr2, &rep2));
     PetscCall (lgh_glr_extend (glr2, 10, &rep2));
     if (backend == LGH_GLR_SCALAPACK) {  /* replicated: full rebuild */

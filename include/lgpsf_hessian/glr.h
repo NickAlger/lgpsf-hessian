@@ -109,6 +109,19 @@ typedef struct lgh_glr_opts
                                        * max |Q_old^T Q_new| (report->      *
                                        * ext_orth_max; one more projection  *
                                        * sweep's GEMMs).  0 (default)       */
+  int               diag_orth;        /* 1: orthogonality diagnostics, SCA- *
+                                       * LAPACK backend, printed ([GLR-DIAG])*
+                                       * on the communicator: after every   *
+                                       * BCGS2 call the block it made       *
+                                       * against itself and against the     *
+                                       * columns before it (streamed in     *
+                                       * panels) and the CholQR jitter      *
+                                       * events; after every pdsyevd the    *
+                                       * eigenvector columns' norms and     *
+                                       * |V^T V x - x| on random x.  Costs  *
+                                       * about one more BCGS2 sweep per     *
+                                       * call.  0 (default).  2026-10-16:   *
+                                       * the gamma 1e-3 kept-basis defect.  */
 }
 lgh_glr_opts_t;
 

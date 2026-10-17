@@ -531,6 +531,7 @@ lgh_glr_opts_default (void)
   o.matvec_tile = 256;
   o.extend_deflate = 0;
   o.check_extend = 0;
+  o.diag_orth = 0;
   return o;
 }
 
