@@ -9,7 +9,7 @@
  *   - T = sym(Q^T F Q) is formed in column panels and reduced directly into
  *     a 2D block-cyclic layout on a BLACS process grid (feature space owns
  *     its own partition — by feature index, never by mesh geometry);
- *   - eigendecomposition by ScaLAPACK pdsyevd (or pdsyev, opts.eigsolver =
+ *   - eigendecomposition by ScaLAPACK pdsyevd (or pdsyev, or ELPA: opts.eigsolver =
  *     1: the classic tridiagonalization + QR path, an A/B control against a
  *     vendor pdsyevd's own reduction); the eigenvector matrix V STAYS IN
  *     PLACE (block-cyclic); eigenvalues are replicated (small);
@@ -37,6 +37,10 @@
 
 #ifndef LGPSF_HESSIAN_GLR_SCALAPACK_IMPL_H
 #define LGPSF_HESSIAN_GLR_SCALAPACK_IMPL_H
+
+#ifdef LGH_WITH_ELPA
+#include <elpa/elpa.h>      /* opts.eigsolver = 2: the ELPA eigensolver on the same block-cyclic T */
+#endif
 
 #ifndef LGPSF_HESSIAN_GLR_COMMON_IMPL_H
 #error "include impl/glr_common_impl.h first (impl.hpp does this)"
@@ -614,7 +618,8 @@ static PetscErrorCode
 lgh_glrd_pdsyevd (lgh_glr_t *g, double *Tloc)
 {
   struct lgh_glrd_state *s = g->dist;
-  const char         *solver = (g->opts.eigsolver == 1) ? "pdsyev" : "pdsyevd";
+  const char         *solver = (g->opts.eigsolver == 2) ? (g->opts.elpa_solver == 1 ? "elpa1" : "elpa2")
+                              : (g->opts.eigsolver == 1) ? "pdsyev" : "pdsyevd";
   int                 nell = s->ell, ione = 1, info = 0;
   int                 lwork = -1, liwork = -1, iwkopt = 0;
   double              wkopt;
@@ -678,6 +683,80 @@ lgh_glrd_pdsyevd (lgh_glr_t *g, double *Tloc)
                 info == nell + 1 ? ": the eigenvalues differ across the "
                 "process grid (pdsyev's heterogeneity check)" : "");
   }
+#ifdef LGH_WITH_ELPA
+  else if (g->opts.eigsolver == 2) {
+    /* ELPA (2026-10-18; the evaluation in nicks_research_experiments ice_hessian/indefinite_pc_review/
+     * elpa_eval/RESULTS.md): elpa_eigenvectors on the same block-cyclic layout -- na = ell, nblk = nb,
+     * local sizes = NUMROC's, the grid through mpi_comm_parent + process_row / process_col; V comes
+     * back in Vloc's own layout, the eigenvalues ascending and replicated.  ELPA reads the FULL
+     * matrix (T is stored full) and DESTROYS it: a copy.  ELPA refuses a process row or column that
+     * owns no block of T (solve_tridi: "Problem contains processor column with zero width"), so when
+     * the grid has such rows / columns -- 1 x P with P > ceil(ell / nb) -- it runs on the
+     * sub-communicator of the owning rows x columns (a rectangle of the grid, so process_row /
+     * process_col keep their values; verified identical to an exact-fit grid) and the idle ranks
+     * take the eigenvalues by a broadcast.  elpa_init once per process (its API version from the
+     * header); a handle per eigensolve (na changes along the ladder).                             */
+    static int          elpa_up = 0;
+    const int           nbr = (nell + s->nb - 1) / s->nb;                  /* block rows = block columns of T */
+    const int           urow = PetscMin (s->prow, nbr), ucol = PetscMin (s->pcol, nbr);
+    const int           active = (s->myrow < urow && s->mycol < ucol);
+    const int           partial = (urow < s->prow || ucol < s->pcol);
+    const long          ntl = (long) s->tl_rows * (long) s->tl_cols;
+    MPI_Comm            ecomm = MPI_COMM_NULL;
+    double             *A = NULL;
+    int                 err = ELPA_OK;
+
+    PetscCall (lgh_gt_begin (g, LGH_GT_EIG_WORK));
+    if (!elpa_up) {
+      PetscCheck (elpa_init (ELPA_API_VERSION) == ELPA_OK, PETSC_COMM_SELF, PETSC_ERR_LIB,
+                  "lgh_glrd: elpa_init rejected API version %d", (int) ELPA_API_VERSION);
+      elpa_up = 1;
+    }
+    PetscCall (PetscMalloc1 ((size_t) PetscMax (ntl, 1L), &A));
+    for (long ii = 0; ii < ntl; ii++) A[ii] = Tloc[ii];
+    PetscCallMPI (MPI_Comm_split (g->comm, active ? 0 : MPI_UNDEFINED,
+                                  s->myrow * s->pcol + s->mycol, &ecomm));
+    PetscCall (lgh_gt_end (g, LGH_GT_EIG_WORK));
+    if (active) {
+      elpa_t              h;
+
+      PetscCall (lgh_gt_begin (g, LGH_GT_EIG_WORK));
+      h = elpa_allocate (&err);
+      PetscCheck (err == ELPA_OK, PETSC_COMM_SELF, PETSC_ERR_LIB, "lgh_glrd: elpa_allocate: %s", elpa_strerr (err));
+#define LGH_ELPA_SET(name, val) do { int e_ = ELPA_OK; elpa_set_integer (h, name, (int) (val), &e_); \
+        PetscCheck (e_ == ELPA_OK, PETSC_COMM_SELF, PETSC_ERR_LIB, "lgh_glrd: elpa_set %s: %s", name, elpa_strerr (e_)); } while (0)
+      LGH_ELPA_SET ("na", nell);
+      LGH_ELPA_SET ("nev", nell);
+      LGH_ELPA_SET ("local_nrows", s->tl_rows);
+      LGH_ELPA_SET ("local_ncols", s->tl_cols);
+      LGH_ELPA_SET ("nblk", s->nb);
+      LGH_ELPA_SET ("mpi_comm_parent", MPI_Comm_c2f (ecomm));
+      LGH_ELPA_SET ("process_row", s->myrow);
+      LGH_ELPA_SET ("process_col", s->mycol);
+      err = elpa_setup (h);
+      PetscCheck (err == ELPA_OK, PETSC_COMM_SELF, PETSC_ERR_LIB, "lgh_glrd: elpa_setup: %s", elpa_strerr (err));
+      LGH_ELPA_SET ("solver", g->opts.elpa_solver == 1 ? ELPA_SOLVER_1STAGE : ELPA_SOLVER_2STAGE);
+      if (g->opts.diag_orth) { int e_ = ELPA_OK; elpa_set_integer (h, "debug", 1, &e_); }   /* ELPA's own messages on a failure */
+#undef LGH_ELPA_SET
+      PetscCall (lgh_gt_end (g, LGH_GT_EIG_WORK));
+      PetscCall (lgh_gt_begin (g, LGH_GT_EIG));
+      elpa_eigenvectors_a_h_a_d (h, A, s->lam_raw, s->Vloc, &err);
+      PetscCall (lgh_gt_end (g, LGH_GT_EIG));
+      PetscCall (lgh_gt_begin (g, LGH_GT_EIG_WORK));
+      PetscCheck (err == ELPA_OK, PETSC_COMM_SELF, PETSC_ERR_LIB,
+                  "lgh_glrd: elpa_eigenvectors (%s, na %d, grid %d x %d of %d x %d, nblk %d) failed: %s",
+                  solver, nell, urow, ucol, s->prow, s->pcol, s->nb, elpa_strerr (err));
+      elpa_deallocate (h, &err);
+      PetscCallMPI (MPI_Comm_free (&ecomm));
+    }
+    else PetscCall (lgh_gt_begin (g, LGH_GT_EIG_WORK));
+    if (partial)   /* rank 0 (row 0, column 0) is always active: the idle ranks take its eigenvalues */
+      PetscCallMPI (MPI_Bcast (s->lam_raw, nell, MPI_DOUBLE, 0, g->comm));
+    PetscCall (PetscFree (A));
+    PetscCall (lgh_gt_end (g, LGH_GT_EIG_WORK));
+    info = 0;
+  }
+#endif
   else {
   /* the pdsyevd path, verbatim (not re-indented so the diff shows it unchanged) */
   PetscCall (lgh_gt_begin (g, LGH_GT_EIG_WORK));
@@ -884,7 +963,8 @@ lgh_glrd_build (lgh_glr_t *g, lgh_glr_report_t *rep)
   /* BLACS grid: 1 x P default; near-square when opts.grid2d (see header) */
   {
     int                 pr = 1;
-    if (g->opts.grid2d) {
+    /* grid2d: 1 = near-square; 0 = 1 x P; -1 (default) = near-square for ELPA (eigsolver 2), else 1 x P */
+    if (g->opts.grid2d > 0 || (g->opts.grid2d < 0 && g->opts.eigsolver == 2)) {
       for (i = 1; (double) i * i <= (double) s->P; i++)
         if (s->P % i == 0) pr = i;
     }

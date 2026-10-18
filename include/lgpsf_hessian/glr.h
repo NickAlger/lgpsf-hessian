@@ -77,10 +77,16 @@ typedef struct lgh_glr_opts
   lgh_glr_backend_t backend;
   int               nb;        /* SCALAPACK block-cyclic block size        */
   int               panel;     /* orthogonalization panel width            */
-  int               grid2d;    /* 0 (default) = 1 x P process grid — safe  *
-                                * everywhere; 1 = 2D grid (faster, needs a *
-                                * ScaLAPACK free of the zero-byte-type     *
-                                * MPICH bug; see docs/platform-notes.md)   */
+  int               grid2d;    /* the BLACS process grid of T and V:       *
+                                * -1 (default) = automatic: 1 x P for      *
+                                * eigsolver 0 / 1 (safe everywhere), the   *
+                                * near-square grid for eigsolver 2 (ELPA,  *
+                                * which wants it and refuses a process     *
+                                * column that owns no block of T);         *
+                                * 0 = 1 x P; 1 = near-square (ScaLAPACK's  *
+                                * pdsyevd on it needs a BLACS free of the  *
+                                * zero-byte-type MPICH bug; see            *
+                                * docs/platform-notes.md)                  */
   int               check;     /* run internal self-check gates on build   */
   /* The sparse matvec with B inside F (GLR-BALANCE-DESIGN.md).  Both need an
    * AIJ B; a shell B keeps the column loop whatever is set here.          */
@@ -146,7 +152,26 @@ typedef struct lgh_glr_opts
                                        * with matching eigenvector columns, *
                                        * so selection and everything        *
                                        * downstream are the same.  Must be  *
-                                       * 0 or 1.  2026-10-16.               */
+                                       * 0 or 1.  2026-10-16.
+                                       * (2026-10-16); 2 = ELPA (the ELPA  *
+                                       * library's own two-stage or one-   *
+                                       * stage solver, elpa_solver below;  *
+                                       * needs a build with LGH_WITH_ELPA; *
+                                       * T is copied, since ELPA destroys  *
+                                       * its input; ELPA runs on the sub-  *
+                                       * communicator of the process rows  *
+                                       * and columns that own a block of   *
+                                       * T when some own none, e.g. 1 x P  *
+                                       * with P > ell / nb; nb must be a   *
+                                       * power of two).  2026-10-18: the   *
+                                       * adoption candidate if the 1e-3    *
+                                       * defect is the eigensolver's.      */
+  int               elpa_solver;      /* eigsolver 2 only: 2 (default) =    *
+                                       * ELPA_SOLVER_2STAGE (band reduction *
+                                       * + bulge chasing, ELPA's flagship), *
+                                       * 1 = ELPA_SOLVER_1STAGE (one-stage  *
+                                       * tridiagonalization).  The kernel   *
+                                       * is ELPA's default for the CPU.     */
 }
 lgh_glr_opts_t;
 

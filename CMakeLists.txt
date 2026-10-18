@@ -51,6 +51,35 @@ if(LGH_WITH_SCALAPACK)
   endif()
 endif()
 
+# ELPA (opts.eigsolver = 2): OPTIONAL, OFF by default.  -DLGH_WITH_ELPA=ON finds it through
+# pkg-config (elpa or elpa-<version>; CMAKE_PREFIX_PATH / ELPA_ROOT is searched) or, failing
+# that, through ELPA_ROOT's include/elpa-<version> and lib.  Defines LGH_WITH_ELPA for the glr
+# target and links libelpa.  ELPA itself needs BLAS/LAPACK + MPI (+ ScaLAPACK/BLACS at link
+# time, which the glr target carries anyway).  2026-10-18.
+option(LGH_WITH_ELPA "ELPA eigensolver backend for the GLR's T (opts.eigsolver = 2)" OFF)
+set(LGH_ELPA_LINK "")
+set(LGH_ELPA_INCLUDE_DIR "")
+if(LGH_WITH_ELPA)
+  if(ELPA_ROOT)
+    list(APPEND CMAKE_PREFIX_PATH "${ELPA_ROOT}")
+  endif()
+  pkg_search_module(ELPA IMPORTED_TARGET elpa elpa-2026.02.002 elpa-2025.06.002 elpa-2025.01.002)
+  if(ELPA_FOUND)
+    set(LGH_ELPA_LINK PkgConfig::ELPA)
+    message(STATUS "lgpsf-hessian: ELPA ${ELPA_VERSION} via pkg-config (${ELPA_LIBDIR})")
+  else()
+    file(GLOB _lgh_elpa_incs "${ELPA_ROOT}/include/elpa-*")
+    find_path(LGH_ELPA_INCLUDE_DIR elpa/elpa.h HINTS ${_lgh_elpa_incs} "${ELPA_ROOT}/include")
+    find_library(LGH_ELPA_LIBRARY NAMES elpa HINTS "${ELPA_ROOT}/lib" "${ELPA_ROOT}/lib64")
+    if(NOT LGH_ELPA_INCLUDE_DIR OR NOT LGH_ELPA_LIBRARY)
+      message(FATAL_ERROR "LGH_WITH_ELPA=ON but ELPA was not found: set ELPA_ROOT=<prefix> "
+                          "(include/elpa-<version>/elpa/elpa.h and lib/libelpa) or PKG_CONFIG_PATH")
+    endif()
+    set(LGH_ELPA_LINK ${LGH_ELPA_LIBRARY})
+    message(STATUS "lgpsf-hessian: ELPA at ${LGH_ELPA_LIBRARY} (headers ${LGH_ELPA_INCLUDE_DIR})")
+  endif()
+endif()
+
 # hypre: OPTIONAL hierarchy source for the blocked Z-solve (mode 3).  The code
 # compiles in when PETSc was configured with hypre (petscconf.h defines
 # PETSC_HAVE_HYPRE) AND hypre's internal headers are on the include path, and
@@ -194,6 +223,13 @@ endif()
 if(LGH_WITH_SCALAPACK)
   target_link_libraries(lgpsf_hessian_glr INTERFACE ${LGH_SCALAPACK_LIBRARY})
   target_compile_definitions(lgpsf_hessian_glr INTERFACE LGH_WITH_SCALAPACK)
+endif()
+if(LGH_WITH_ELPA)
+  target_link_libraries(lgpsf_hessian_glr INTERFACE ${LGH_ELPA_LINK})
+  if(LGH_ELPA_INCLUDE_DIR)
+    target_include_directories(lgpsf_hessian_glr INTERFACE ${LGH_ELPA_INCLUDE_DIR})
+  endif()
+  target_compile_definitions(lgpsf_hessian_glr INTERFACE LGH_WITH_ELPA)
 endif()
 
 # Stage 1: the fit.  MPI + lgpsf (Eigen transitively); PETSc only at the

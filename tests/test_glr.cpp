@@ -326,6 +326,80 @@ run_scenario (int spd, lgh_glr_backend_t backend)
       lgh_glr_destroy (gev);
     }
   }
+#ifdef LGH_WITH_ELPA
+  /* opts.eigsolver = 2 (ELPA, two-stage then one-stage) against the pdsyevd build: the same kept
+   * count, the same treated spectrum to 1e-10, the same solve to 1e-8; grid2d left at -1, so ELPA
+   * runs on the near-square grid; then an extension 30 -> 40 under ELPA == the one-shot build; then
+   * the 1 x P grid forced (grid2d 0) at a small ell so that some process columns own no block of T
+   * and the sub-communicator path runs.  2026-10-18 (the ELPA adoption candidate).               */
+  if (backend == LGH_GLR_SCALAPACK) {
+    int                 nk1, nk2;
+    const double       *l1, *l2;
+    Vec                 rnd;
+
+    PetscCall ((PetscErrorCode) lgh_glr_eigs (glr, &nk1, &l1));
+    PetscCall (VecDuplicate (v, &rnd));
+    {
+      PetscInt            rs, re;
+      PetscScalar        *a;
+      PetscCall (VecGetOwnershipRange (rnd, &rs, &re));
+      PetscCall (VecGetArray (rnd, &a));
+      for (PetscInt i = rs; i < re; i++) a[i - rs] = lgh_randn_at (0x5EEDUL, i, 0);
+      PetscCall (VecRestoreArray (rnd, &a));
+    }
+    PetscCall ((PetscErrorCode) lgh_glr_solve (glr, c, rnd, x));
+    for (int es = 2; es >= 1; es--) {
+      lgh_glr_opts_t      go_el = go;
+      lgh_glr_t          *gel;
+      lgh_glr_report_t    rel;
+      double              worst = 0., rd;
+      char                what[128];
+
+      go_el.eigsolver = 2; go_el.elpa_solver = es; go_el.diag_orth = (es == 2);
+      PetscCall (lgh_glr_compute (B, prior, &go_el, &gel, &rel));
+      snprintf (what, sizeof what, "ELPA %d-stage: kept == pdsyevd's", es);
+      check (rel.kept == rep.kept, what, (double) rel.kept);
+      PetscCall ((PetscErrorCode) lgh_glr_eigs (gel, &nk2, &l2));
+      for (int i = 0; i < nk1 && i < nk2; i++) worst = fmax (worst, fabs (l1[i] - l2[i]) / fabs (l1[i]));
+      snprintf (what, sizeof what, "ELPA %d-stage: treated spectrum == pdsyevd's", es);
+      check (worst < 1e-10, what, worst);
+      PetscCall ((PetscErrorCode) lgh_glr_solve (gel, c, rnd, y));
+      PetscCall (rel_diff (y, x, s1, &rd));
+      snprintf (what, sizeof what, "ELPA %d-stage: solve == pdsyevd's on a random vector", es);
+      check (rd < 1e-8, what, rd);
+      lgh_glr_destroy (gel);
+      if (es == 2) {   /* an extension's re-eigensolve under ELPA */
+        go_el.ell = 30; go_el.diag_orth = 0;
+        PetscCall (lgh_glr_compute (B, prior, &go_el, &gel, &rel));
+        PetscCall (lgh_glr_extend (gel, 10, &rel));
+        PetscCall ((PetscErrorCode) lgh_glr_eigs (gel, &nk2, &l2));
+        check (nk1 == nk2, "ELPA: extend (30 -> 40) kept matches one-shot", (double) nk2);
+        worst = 0.;
+        for (int i = 0; i < nk1 && i < nk2; i++) worst = fmax (worst, fabs (l1[i] - l2[i]) / fabs (l1[i]));
+        check (worst < 1e-10, "ELPA: extend (30 -> 40) spectrum matches one-shot", worst);
+        lgh_glr_destroy (gel);
+      }
+    }
+    {   /* the sub-communicator path: 1 x P forced, ell 10 with nb 8 = two block columns (idle ranks at P > 2) */
+      lgh_glr_opts_t      go_a = go, go_b = go;
+      lgh_glr_t          *ga, *gb;
+      lgh_glr_report_t    ra, rb;
+      double              worst = 0.;
+
+      go_a.ell = 10; go_a.grid2d = 0; go_a.eigsolver = 0;
+      go_b.ell = 10; go_b.grid2d = 0; go_b.eigsolver = 2; go_b.diag_orth = 1;
+      PetscCall (lgh_glr_compute (B, prior, &go_a, &ga, &ra));
+      PetscCall (lgh_glr_compute (B, prior, &go_b, &gb, &rb));
+      check (ra.kept == rb.kept, "ELPA on the owning sub-communicator (1 x P, ell 10): kept == pdsyevd's", (double) rb.kept);
+      PetscCall ((PetscErrorCode) lgh_glr_eigs (ga, &nk1, &l1));
+      PetscCall ((PetscErrorCode) lgh_glr_eigs (gb, &nk2, &l2));
+      for (int i = 0; i < nk1 && i < nk2; i++) worst = fmax (worst, fabs (l1[i] - l2[i]) / fabs (l1[i]));
+      check (worst < 1e-10, "ELPA on the owning sub-communicator: spectrum == pdsyevd's", worst);
+      lgh_glr_destroy (ga); lgh_glr_destroy (gb);
+    }
+    PetscCall (VecDestroy (&rnd));
+  }
+#endif
   if (backend == LGH_GLR_REPLICATED)   /* eigen-residual check */
     check (rep.resid_max < 1e-7 * rep.lam_abs_max, "residual gate",
            rep.resid_max);

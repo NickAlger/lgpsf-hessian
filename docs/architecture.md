@@ -132,12 +132,20 @@ implicit `U` (the object dispatches by representation from then on).
   deflates the new block's power passes against the existing basis -- a
   block-Krylov extension (`glr.h`, `lgh_glr_extend`). Floating-point bit-identity holds
   within a build, not across compilers/flags (see `platform-notes.md`).
-- **Two dense eigensolvers in the ScaLAPACK backend.** `opts.eigsolver = 0` (the
+- **Three dense eigensolvers in the ScaLAPACK backend.** `opts.eigsolver = 0` (the
   default) eigendecomposes `T = sym(QᵀFQ)` with `pdsyevd`; `1` uses `pdsyev`
-  (`pdsytrd` + QR iteration + `pdormtr`, the classic path, slower). The second is an
+  (`pdsytrd` + QR iteration + `pdormtr`, the classic path, slower); `2` uses ELPA
+  (`-DLGH_WITH_ELPA=ON`, `ELPA_ROOT`): `elpa_eigenvectors` on the same block-cyclic
+  `T` (a copy, ELPA destroys its input), `V` back in `Vloc`'s layout, eigenvalues
+  ascending and replicated, ELPA's two-stage solver by default (`opts.elpa_solver`).
+  ELPA refuses a process row or column that owns no block of `T`, so with
+  `opts.grid2d = -1` (the default) it gets the near-square grid, and whenever rows or
+  columns are still empty (`1 x P` with `P > ell / nb`) it runs on the sub-communicator
+  of the owning ones, the idle ranks taking the eigenvalues by a broadcast. `1` is an
   A/B control, not a production choice: a vendor `pdsyevd` may dispatch to its own
   two-stage reduction (MKL 2024.0: `pdsyrdb`), and the kept basis `U = Q V_kept`
-  inherits whatever orthogonality `V` comes back with. The companion diagnostics
+  inherits whatever orthogonality `V` comes back with; `2` is the adoption candidate
+  of 2026-10-18 (an independent implementation with a large user base). The companion diagnostics
   are `opts.diag_orth` (after each eigensolve: the eigenvector columns whose norm is
   off, with their owner process column and a per-owner histogram) and the
   Gershgorin positivity indicator `gersh_*` of `lgh_glr_check_basis` (`glr.h`).

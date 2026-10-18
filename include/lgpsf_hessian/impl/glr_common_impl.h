@@ -523,7 +523,7 @@ lgh_glr_opts_default (void)
   o.backend = LGH_GLR_DEFAULT;
   o.nb = 64;
   o.panel = 64;
-  o.grid2d = 0;
+  o.grid2d = -1;
   o.check = 1;
   o.balance = 0;
   o.balance_row_cost = 1;
@@ -533,6 +533,7 @@ lgh_glr_opts_default (void)
   o.check_extend = 0;
   o.diag_orth = 0;
   o.eigsolver = 0;
+  o.elpa_solver = 2;
   return o;
 }
 
@@ -901,10 +902,21 @@ lgh_glr_compute (Mat B, lgh_prior_t *prior, const lgh_glr_opts_t *opts,
               PETSC_ERR_ARG_OUTOFRANGE,
               "lgh_glr_compute: need 0 < ell (%d) <= N (%d)",
               (int) g->opts.ell, (int) Nglob);
-  PetscCheck (g->opts.eigsolver == 0 || g->opts.eigsolver == 1, g->comm,
+  PetscCheck (g->opts.eigsolver >= 0 && g->opts.eigsolver <= 2, g->comm,
               PETSC_ERR_ARG_OUTOFRANGE,
-              "lgh_glr_compute: eigsolver must be 0 (pdsyevd) or 1 (pdsyev), "
+              "lgh_glr_compute: eigsolver must be 0 (pdsyevd), 1 (pdsyev) or 2 (ELPA), "
               "got %d", g->opts.eigsolver);
+#ifndef LGH_WITH_ELPA
+  PetscCheck (g->opts.eigsolver != 2, g->comm, PETSC_ERR_SUP,
+              "lgh_glr_compute: eigsolver 2 (ELPA) needs a build with LGH_WITH_ELPA");
+#endif
+  PetscCheck (g->opts.elpa_solver == 1 || g->opts.elpa_solver == 2, g->comm,
+              PETSC_ERR_ARG_OUTOFRANGE,
+              "lgh_glr_compute: elpa_solver must be 1 (one-stage) or 2 (two-stage), got %d",
+              g->opts.elpa_solver);
+  PetscCheck (g->opts.eigsolver != 2 || (g->opts.nb > 0 && (g->opts.nb & (g->opts.nb - 1)) == 0),
+              g->comm, PETSC_ERR_ARG_OUTOFRANGE,
+              "lgh_glr_compute: ELPA needs a power-of-two block size nb, got %d", g->opts.nb);
 
 #ifdef LGH_WITH_SCALAPACK
   if (g->opts.backend == LGH_GLR_DEFAULT)
