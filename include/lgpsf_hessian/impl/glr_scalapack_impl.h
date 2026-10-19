@@ -736,7 +736,9 @@ lgh_glrd_pdsyevd (lgh_glr_t *g, double *Tloc)
       err = elpa_setup (h);
       PetscCheck (err == ELPA_OK, PETSC_COMM_SELF, PETSC_ERR_LIB, "lgh_glrd: elpa_setup: %s", elpa_strerr (err));
       LGH_ELPA_SET ("solver", g->opts.elpa_solver == 1 ? ELPA_SOLVER_1STAGE : ELPA_SOLVER_2STAGE);
-      if (g->opts.diag_orth) { int e_ = ELPA_OK; elpa_set_integer (h, "debug", 1, &e_); }   /* ELPA's own messages on a failure */
+      /* ELPA's "debug" option is NOT set: on a 32 x 36 grid it printed ~1e5 benign "Warning in merge_systems: l_rows=0"
+       * lines (every process row without rows in a divide-and-conquer sub-block) and "max_strip = 128" from rank 0 during
+       * the TACC arm of 2026-10-19; a failure is reported through elpa_strerr below anyway.                               */
 #undef LGH_ELPA_SET
       PetscCall (lgh_gt_end (g, LGH_GT_EIG_WORK));
       PetscCall (lgh_gt_begin (g, LGH_GT_EIG));
