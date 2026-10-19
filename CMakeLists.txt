@@ -174,7 +174,9 @@ if(NOT lgpsf_FOUND AND LGH_FETCH_LGPSF)
     # pinned commit (lgpsf main as validated with this repo's test suite;
     # carries the ellipsoid_tree v0.3.0 pin its MPI layer needs); move to
     # a release tag when lgpsf cuts one
-    GIT_TAG        f7478df)   # + JacobiSVD everywhere, the row fit's frame bounds (ProbeFitConfig::frame_ceiling / frame_floor, RowStop::Clamped: this repo's fit_impl.hpp needs them) and assemble_sparse's pair rule; 18/18 tests at 1, 2, 4 ranks, 2026-10-04
+    GIT_TAG        fef583e)   # lgpsf main = tags paper-det-H/I/J (2026-10-09): LadderScope::PerGuess / ::Table, ProbeFitConfig::ladder,
+                              # reject_inadmissible, k_step -- what fit_impl.hpp has used since e6c9380 / 534f3b4 (CI was red from
+                              # 2026-10-09 to 2026-10-19 on the stale pin f7478df: 'lgpsf::LadderScope has not been declared')
   set(LGPSF_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   set(LGPSF_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(lgpsf)
