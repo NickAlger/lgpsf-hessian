@@ -532,7 +532,12 @@ lgh_glr_opts_default (void)
   o.extend_deflate = 0;
   o.check_extend = 0;
   o.diag_orth = 0;
+#ifdef LGH_WITH_ELPA
+  o.eigsolver = 2;   /* ELPA is the default where it is built in (adopted 2026-10-19: MKL's pdsyevd returned non-orthonormal
+                      * eigenvectors at n >= 32000 on 1152 ranks and made the GLR preconditioner indefinite; ELPA did not) */
+#else
   o.eigsolver = 0;
+#endif
   o.elpa_solver = 2;
   return o;
 }

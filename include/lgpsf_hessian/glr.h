@@ -163,9 +163,12 @@ typedef struct lgh_glr_opts
                                        * and columns that own a block of   *
                                        * T when some own none, e.g. 1 x P  *
                                        * with P > ell / nb; nb must be a   *
-                                       * power of two).  2026-10-18: the   *
-                                       * adoption candidate if the 1e-3    *
-                                       * defect is the eigensolver's.      */
+                                       * power of two).  THE DEFAULT where *
+                                       * LGH_WITH_ELPA is defined (adopted *
+                                       * 2026-10-19: MKL pdsyevd's V was   *
+                                       * non-orthonormal at n >= 32000 on  *
+                                       * 1152 ranks, ELPA's 2e-13); 0 is   *
+                                       * the default without ELPA.         */
   int               elpa_solver;      /* eigsolver 2 only: 2 (default) =    *
                                        * ELPA_SOLVER_2STAGE (band reduction *
                                        * + bulge chasing, ELPA's flagship), *

@@ -326,6 +326,12 @@ run_scenario (int spd, lgh_glr_backend_t backend)
       lgh_glr_destroy (gev);
     }
   }
+  /* the default eigensolver: ELPA (2) in an ELPA build, pdsyevd (0) otherwise (2026-10-19) */
+#ifdef LGH_WITH_ELPA
+  check (lgh_glr_opts_default ().eigsolver == 2, "default eigsolver is 2 (ELPA) in an ELPA build", (double) lgh_glr_opts_default ().eigsolver);
+#else
+  check (lgh_glr_opts_default ().eigsolver == 0, "default eigsolver is 0 (pdsyevd) without ELPA", (double) lgh_glr_opts_default ().eigsolver);
+#endif
 #ifdef LGH_WITH_ELPA
   /* opts.eigsolver = 2 (ELPA, two-stage then one-stage) against the pdsyevd build: the same kept
    * count, the same treated spectrum to 1e-10, the same solve to 1e-8; grid2d left at -1, so ELPA
@@ -336,8 +342,13 @@ run_scenario (int spd, lgh_glr_backend_t backend)
     int                 nk1, nk2;
     const double       *l1, *l2;
     Vec                 rnd;
+    lgh_glr_opts_t      go0 = go;        /* the pdsyevd reference, explicit (ELPA is the default of an ELPA build) */
+    lgh_glr_t          *g0;
+    lgh_glr_report_t    rep0;
 
-    PetscCall ((PetscErrorCode) lgh_glr_eigs (glr, &nk1, &l1));
+    go0.eigsolver = 0;
+    PetscCall (lgh_glr_compute (B, prior, &go0, &g0, &rep0));
+    PetscCall ((PetscErrorCode) lgh_glr_eigs (g0, &nk1, &l1));
     PetscCall (VecDuplicate (v, &rnd));
     {
       PetscInt            rs, re;
@@ -347,7 +358,7 @@ run_scenario (int spd, lgh_glr_backend_t backend)
       for (PetscInt i = rs; i < re; i++) a[i - rs] = lgh_randn_at (0x5EEDUL, i, 0);
       PetscCall (VecRestoreArray (rnd, &a));
     }
-    PetscCall ((PetscErrorCode) lgh_glr_solve (glr, c, rnd, x));
+    PetscCall ((PetscErrorCode) lgh_glr_solve (g0, c, rnd, x));
     for (int es = 2; es >= 1; es--) {
       lgh_glr_opts_t      go_el = go;
       lgh_glr_t          *gel;
@@ -358,7 +369,7 @@ run_scenario (int spd, lgh_glr_backend_t backend)
       go_el.eigsolver = 2; go_el.elpa_solver = es; go_el.diag_orth = (es == 2);
       PetscCall (lgh_glr_compute (B, prior, &go_el, &gel, &rel));
       snprintf (what, sizeof what, "ELPA %d-stage: kept == pdsyevd's", es);
-      check (rel.kept == rep.kept, what, (double) rel.kept);
+      check (rel.kept == rep0.kept, what, (double) rel.kept);
       PetscCall ((PetscErrorCode) lgh_glr_eigs (gel, &nk2, &l2));
       for (int i = 0; i < nk1 && i < nk2; i++) worst = fmax (worst, fabs (l1[i] - l2[i]) / fabs (l1[i]));
       snprintf (what, sizeof what, "ELPA %d-stage: treated spectrum == pdsyevd's", es);
@@ -397,6 +408,7 @@ run_scenario (int spd, lgh_glr_backend_t backend)
       check (worst < 1e-10, "ELPA on the owning sub-communicator: spectrum == pdsyevd's", worst);
       lgh_glr_destroy (ga); lgh_glr_destroy (gb);
     }
+    lgh_glr_destroy (g0);
     PetscCall (VecDestroy (&rnd));
   }
 #endif

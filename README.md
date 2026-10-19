@@ -159,6 +159,18 @@ for distribution packages (install `libhypre-dev` alongside `petsc-dev`), and
 packaged PETSc, `-I/usr/include/hypre`) themselves, or define `LGH_NO_HYPRE`.
 Without hypre everything builds and runs as before.
 
+**ELPA (the GLR's dense eigensolver; optional, the default where present; 2026-10-19).**
+`-DLGH_WITH_ELPA=ON` with `ELPA_ROOT=<prefix>` (or pkg-config `elpa`) builds the
+ScaLAPACK backend's `opts.eigsolver = 2`: ELPA's two-stage solver on the same
+block-cyclic `T`, on the near-square process grid (`opts.grid2d = -1`, automatic),
+and makes it the default (`0` = `pdsyevd` without ELPA, and selectable always).
+Non-CMake consumers add `-DLGH_WITH_ELPA -I<prefix>/include/elpa-<version>` and
+`-lelpa` themselves.  Why: on 1152 ranks MKL 2024.0's `pdsyevd` returned
+eigenvectors non-orthonormal by 5e-2 at n >= 32000 (its two-stage dispatch
+regime), which made the GLR preconditioner indefinite; ELPA's are orthonormal to
+2e-13 and the same solve converges (`docs/architecture.md`).  `nb` must be a
+power of two with ELPA.
+
 Why it exists: on a near-singular prior (`-Delta + 1e-5 M` on the Antarctic basal
 mesh) GAMG's default aggressive coarsening leaves ~9% of the preconditioned
 spectrum below 0.7 (bottom 0.11); the hypre hierarchy with the same Chebyshev(2)
